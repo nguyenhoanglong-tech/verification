@@ -36,8 +36,8 @@ class Tier(unittest.TestCase):
         self.assertEqual(self.tiers(f(".github/workflows/verification.yml", 1)), ["T2"])
         self.assertEqual(self.tiers(f("claude/spine/core.py", 1)), ["T2"])
 
-    def test_docs_inside_risk_dir_stay_t0(self):
-        self.assertEqual(self.tiers(f("claude/hooks/checks.md", 5)), ["T0"])
+    def test_risk_wins_over_docs(self):
+        self.assertEqual(self.tiers(f("claude/hooks/checks.md", 5)), ["T2"])
 
     def test_skill_is_tp_only(self):
         self.assertEqual(self.tiers(f("claude/skills/x/SKILL.md")), ["TP"])
@@ -50,8 +50,12 @@ class Tier(unittest.TestCase):
     def test_rename_out_of_risk_path_still_t2(self):
         self.assertEqual(self.tiers(f("tmp/x.sh", 0, prev="claude/hooks/scripts/x.sh")), ["T2"])
 
-    def test_truncated_file_list_is_t2(self):
-        self.assertEqual(self.tiers(f("README.md"), truncated=True), ["T2"])
+    def test_rename_into_a_prompt_name_keeps_the_old_tier(self):
+        self.assertEqual(self.tiers(f("claude/skills/x/SKILL.md", 0, prev="claude/hooks/scripts/x.sh")), ["T2", "TP"])
+        self.assertEqual(self.tiers(f("claude/skills/x/SKILL.md", 0, prev="claude/x.py")), ["T1", "TP"])
+
+    def test_truncated_file_list_owes_every_tier(self):
+        self.assertEqual(self.tiers(f("README.md"), truncated=True), ["T2", "TP"])
 
 
 if __name__ == "__main__":

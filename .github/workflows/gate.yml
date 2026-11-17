@@ -45,6 +45,7 @@ jobs:
       review: ${{ steps.t.outputs.review }}
       blast: ${{ steps.t.outputs.blast }}
       tp: ${{ steps.t.outputs.tp }}
+      prompt_files: ${{ steps.t.outputs.prompt_files }}
       review_model: ${{ steps.t.outputs.review_model }}
       review_level: ${{ steps.t.outputs.review_level }}
       review_effort: ${{ steps.t.outputs.review_effort }}
@@ -215,6 +216,7 @@ jobs:
         uses: ./.verification-engine/engine/claude-job
         with:
           kind: tp
+          prompt_files: ${{ needs.tier.outputs.prompt_files }}
           model: claude-sonnet-5-5
           effort: medium
           anthropic: ${{ needs.tier.outputs.anthropic }}
@@ -255,18 +257,32 @@ jobs:
           cost=$(jq '[.review, .blast, .tp | .outputs.cost // "0" | tonumber] | add' <<<"$NEEDS")
           ran=$(jq -r '[to_entries[] | select(.key != "start" and .value.result == "success") | .key] | join(",")' <<<"$NEEDS")
           tiers=$(tier tiers); enforce=$(tier enforce)
+          # Same-head runs share one verdict: a failure on this head is never replaced by a later pass.
+          runs=$(gh api "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/check-runs?check_name=verification&filter=all&per_page=100" \
+            --jq '[.check_runs[] | select(.app.id == 15368)]')
+          if [ "$(jq '[.[] | select(.conclusion == "failure")] | length' <<<"$runs")" != 0 ]; then
+            ok=false; why+=("an earlier verification run on this head failed")
+          fi
+          # Observe (neutral) only when the tier job said so; an unknown mode fails closed.
           if $ok; then conclusion=success; title="$tiers passed"
-          elif [ "$enforce" = true ]; then conclusion=failure; title="$tiers blocked"
-          else conclusion=neutral; title="$tiers would block (observe)"; fi
+          elif [ "$enforce" = false ] && [ "$(jq -r .tier.result <<<"$NEEDS")" = success ]; then
+            conclusion=neutral; title="$tiers would block (observe)"
+          else conclusion=failure; title="${tiers:-tier unknown} blocked"; fi
           stamp="Verified-by: $( [ "$tiers" = T0 ] && echo none-T0 || echo "$ran") head=$HEAD_SHA sampled=$(tier sampled)"
           details=$(jq -r '[.checks, .review, .blast, .tp | .outputs.summary // empty] | join("\n")' <<<"$NEEDS")
           summary=$(printf '%s\n\ntiers: %s (%s)\ncode lines: %s\nenforce: %s\ncost_usd: %s\nreasons not passed: %s\n\n%s\n\nrun: %s' \
             "$stamp" "$tiers" "$(tier reasons)" "$(tier code_lines)" "$enforce" "$cost" "${why[*]:-none}" "$details" "$RUN_URL")
           echo "$summary"; echo "conclusion=$conclusion"
-          id=$(jq -r '.start.outputs.check_id // empty' <<<"$NEEDS")
-          if [ -n "$id" ]; then target=(-X PATCH "repos/$GITHUB_REPOSITORY/check-runs/$id")
-          else target=(-X POST "repos/$GITHUB_REPOSITORY/check-runs" -f name=verification -f head_sha="$HEAD_SHA"); fi
-          gh api "${target[@]}" \
-            -f status=completed -f conclusion="$conclusion" \
-            -f "output[title]=$title" -f "output[summary]=$summary" --jq '{id, app: .app.id, head_sha, conclusion}'
+          ids=$(jq -r '.[].id' <<<"$runs"; jq -r '.start.outputs.check_id // empty' <<<"$NEEDS")
+          ids=$(sort -u <<<"$ids" | grep . || true)
+          if [ -z "$ids" ]; then
+            gh api -X POST "repos/$GITHUB_REPOSITORY/check-runs" -f name=verification -f head_sha="$HEAD_SHA" \
+              -f status=completed -f conclusion="$conclusion" \
+              -f "output[title]=$title" -f "output[summary]=$summary" --jq '{id, app: .app.id, head_sha, conclusion}'
+          fi
+          for id in $ids; do
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/check-runs/$id" \
+              -f status=completed -f conclusion="$conclusion" \
+              -f "output[title]=$title" -f "output[summary]=$summary" --jq '{id, app: .app.id, head_sha, conclusion}'
+          done
           [ "$conclusion" != failure ]
