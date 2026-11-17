@@ -16,6 +16,22 @@ env:
   BASE_REF: ${{ github.event.pull_request.base.ref }}
   PR_NUMBER: ${{ github.event.pull_request.number }}
 jobs:
+  start:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      checks: write
+    outputs:
+      check_id: ${{ steps.s.outputs.check_id }}
+    steps:
+      - id: s
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          id=$(gh api "repos/$GITHUB_REPOSITORY/check-runs" -f name=verification -f head_sha="$HEAD_SHA" \
+            -f status=in_progress -f "output[title]=running" -f "output[summary]=The verification gate is running on $HEAD_SHA." --jq .id)
+          echo "check_id=$id" >> "$GITHUB_OUTPUT"
+
   tier:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -93,7 +109,10 @@ jobs:
           for i in $(seq 0 $((n - 1))); do
             name=$(jq -r ".[$i].name" <<<"$CHECKS"); cmd=$(jq -r ".[$i].run" <<<"$CHECKS")
             echo "::group::$name: $cmd"
-            if (cd head && env -u GITHUB_TOKEN bash -c "$cmd"); then r=pass; else r=fail; ok=false; fi
+            # Head code runs in a throwaway container with no network and no view of the runner's files,
+            # so it cannot write this job's outputs or leave a process behind; only its exit code counts.
+            rm -rf work && cp -a head work
+            if docker run --rm --network none -v "$PWD/work:/w" -w /w python:3.12-bookworm bash -c "$cmd"; then r=pass; else r=fail; ok=false; fi
             echo "::endgroup::"
             echo "$name=$r"; summary="$summary $name=$r"
           done
@@ -204,7 +223,7 @@ jobs:
 
   gate:
     # The one result the ruleset reads. Posted as a check run named `verification` by GitHub Actions.
-    needs: [tier, head_archive, checks, review, blast, tp]
+    needs: [start, tier, head_archive, checks, review, blast, tp]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -234,7 +253,7 @@ jobs:
           owed blast "$(tier blast)"
           owed tp "$(tier tp)"
           cost=$(jq '[.review, .blast, .tp | .outputs.cost // "0" | tonumber] | add' <<<"$NEEDS")
-          ran=$(jq -r '[to_entries[] | select(.key != "gate" and .value.result == "success") | .key] | join(",")' <<<"$NEEDS")
+          ran=$(jq -r '[to_entries[] | select(.key != "start" and .value.result == "success") | .key] | join(",")' <<<"$NEEDS")
           tiers=$(tier tiers); enforce=$(tier enforce)
           if $ok; then conclusion=success; title="$tiers passed"
           elif [ "$enforce" = true ]; then conclusion=failure; title="$tiers blocked"
@@ -244,7 +263,10 @@ jobs:
           summary=$(printf '%s\n\ntiers: %s (%s)\ncode lines: %s\nenforce: %s\ncost_usd: %s\nreasons not passed: %s\n\n%s\n\nrun: %s' \
             "$stamp" "$tiers" "$(tier reasons)" "$(tier code_lines)" "$enforce" "$cost" "${why[*]:-none}" "$details" "$RUN_URL")
           echo "$summary"; echo "conclusion=$conclusion"
-          gh api "repos/$GITHUB_REPOSITORY/check-runs" -f name=verification -f head_sha="$HEAD_SHA" \
+          id=$(jq -r '.start.outputs.check_id // empty' <<<"$NEEDS")
+          if [ -n "$id" ]; then target=(-X PATCH "repos/$GITHUB_REPOSITORY/check-runs/$id")
+          else target=(-X POST "repos/$GITHUB_REPOSITORY/check-runs" -f name=verification -f head_sha="$HEAD_SHA"); fi
+          gh api "${target[@]}" \
             -f status=completed -f conclusion="$conclusion" \
             -f "output[title]=$title" -f "output[summary]=$summary" --jq '{id, app: .app.id, head_sha, conclusion}'
           [ "$conclusion" != failure ]
