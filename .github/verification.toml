@@ -7,6 +7,7 @@ allowed_bots = []
 federation_rule_id = "fdrl_01MJmjgYfpA9pRGgJjzVcTRH"
 organization_id = "9ada81d6-4027-4577-94eb-ce6f9ffb2446"
 service_account_id = "svac_01VPzMtWbev2gPjnZKhQSw2h"
+workspace_id = "wrkspc_019HbB4u8TUVyYfmbcV6MR7v"
 
 [[check]]
 name = "unit"

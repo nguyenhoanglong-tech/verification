@@ -5,7 +5,7 @@ inputs:
   model: {required: true, description: Claude model id}
   effort: {required: true, description: reasoning effort}
   level: {required: false, default: medium, description: /code-review level}
-  anthropic: {required: true, description: "JSON with federation_rule_id, organization_id, service_account_id"}
+  anthropic: {required: true, description: "JSON with federation_rule_id, organization_id, service_account_id, workspace_id"}
   prompt_files: {required: false, default: "", description: "comma-separated prompt files the tier job found (tp only)"}
   allowed_bots: {required: false, default: "", description: bots allowed to trigger the action}
   github_token: {required: true, description: the workflow's GITHUB_TOKEN}
@@ -78,6 +78,7 @@ runs:
         anthropic_federation_rule_id: ${{ fromJSON(inputs.anthropic).federation_rule_id }}
         anthropic_organization_id: ${{ fromJSON(inputs.anthropic).organization_id }}
         anthropic_service_account_id: ${{ fromJSON(inputs.anthropic).service_account_id }}
+        anthropic_workspace_id: ${{ fromJSON(inputs.anthropic).workspace_id }}
     - id: score
       if: always()
       shell: bash
