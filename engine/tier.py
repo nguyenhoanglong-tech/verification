@@ -125,14 +125,20 @@ def github_main() -> None:
     enforce = config.get("mode", "observe") == "enforce" or base_ref in config.get("enforce_branches", [])
     review = config.get("review", {})
     t2 = "T2" in result.tiers
+    sample = int(config.get("observe_sample", 1))
+    pr = int(os.environ.get("PR_NUMBER", "0"))
+    sampled = enforce or sample <= 1 or pr % sample == 0
+    if not sampled:
+        result.reasons.append(f"observe: Claude checks run on 1 PR in {sample}; this one was not sampled")
     outputs = {
         "tiers": " ".join(result.tiers),
         "code_lines": str(result.code_lines),
         "reasons": "; ".join(result.reasons),
         "enforce": "true" if enforce else "false",
-        "review": "true" if ("T1" in result.tiers or t2) else "false",
-        "blast": "true" if t2 else "false",
-        "tp": "true" if "TP" in result.tiers else "false",
+        "review": "true" if sampled and ("T1" in result.tiers or t2) else "false",
+        "blast": "true" if sampled and t2 else "false",
+        "tp": "true" if sampled and "TP" in result.tiers else "false",
+        "sampled": "true" if sampled else "false",
         "review_model": review.get("t2_model" if t2 else "t1_model", "claude-opus-5-5" if t2 else "claude-sonnet-5-5"),
         "review_level": review.get("t2_level" if t2 else "t1_level", "high" if t2 else "medium"),
         "review_effort": review.get("effort", "medium"),

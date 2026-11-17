@@ -1,7 +1,8 @@
 # .github/verification.toml for chrislongnguyen/dotfiles. The engine reads it from the PR's base SHA.
 mode = "observe"                        # observe | enforce (D10, D27)
 enforce_branches = ["verify/attack-base"]   # the attack suite's guarded base
-allowed_bots = []                       # the D20 App bot, once it exists
+allowed_bots = []
+observe_sample = 10                     # observe mode: Claude checks on 1 PR in 10 (API credit cap)                       # the D20 App bot, once it exists
 
 [anthropic]                             # personal org (D17)
 federation_rule_id = "fdrl_011Xnhp64qZrrs3D8z49fbSJ"
