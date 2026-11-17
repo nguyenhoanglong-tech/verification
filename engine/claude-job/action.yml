@@ -54,6 +54,11 @@ runs:
           echo "args=--model $MODEL --effort $EFFORT --max-budget-usd $BUDGET --add-dir pr-head --allowedTools \"$tools\" --json-schema '$schema'"
           echo "prompt<<PROMPT_EOF"; cat "$RUNNER_TEMP/prompt.md"; echo "PROMPT_EOF"
         } >> "$GITHUB_OUTPUT"
+    - name: OIDC claims the federation rule sees (claims only, never the token)
+      shell: bash
+      run: |
+        t=$(curl -fsS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://api.anthropic.com" | jq -r .value)
+        cut -d. -f2 <<<"$t" | tr '_-' '/+' | base64 -d 2>/dev/null | jq -c '{sub, aud, repository_owner, repository_owner_id, job_workflow_ref, event_name}' || true
     - id: claude
       continue-on-error: true
       uses: anthropics/claude-code-action@cc98b3ae241b0fcfb6a42a2690751afffecb4452
