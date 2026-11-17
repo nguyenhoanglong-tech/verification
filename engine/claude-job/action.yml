@@ -84,7 +84,8 @@ runs:
           jq -r '.findings[] | "- [\(.severity)] \(.file):\(.line // "") \(.summary)"' <<<"$STRUCTURED" > "$RUNNER_TEMP/$KIND-findings.md"
         else
           ok=false
-          summary="$KIND: no structured result (action outcome $OUTCOME)"
+          err=$( [ -s "$EXEC_FILE" ] && jq -r '[.[] | select(.type == "result")][-1].result // ""' "$EXEC_FILE" | head -c 300 | tr '\n' ' ' || true)
+          summary="$KIND: no structured result (action outcome $OUTCOME): $err"
           : > "$RUNNER_TEMP/$KIND-findings.md"
         fi
         echo "$summary cost=$cost head=$HEAD_SHA"
