@@ -1,0 +1,16 @@
+# The engine repo tests itself: PRs into verify/attack-base run the gate from the dev branch (selftest.yml).
+mode = "observe"
+enforce_branches = ["verify/attack-base"]
+allowed_bots = []
+
+[anthropic]
+federation_rule_id = "fdrl_01MJmjgYfpA9pRGgJjzVcTRH"
+organization_id = "9ada81d6-4027-4577-94eb-ce6f9ffb2446"
+service_account_id = "svac_01VPzMtWbev2gPjnZKhQSw2h"
+
+[[check]]
+name = "unit"
+run = "cd sandbox && python3 test_calc.py && cd .. && python3 tests/test_tier.py"
+
+[tiers]
+risk = [".github/**", "engine/**"]

@@ -1,0 +1,21 @@
+# Self-test caller: PRs into verify/attack-base run the gate from the dev branch, so engine changes can be
+# tried before a release SHA is pinned in any real repo. Real repos pin the engine by SHA.
+name: verification
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+    branches: [verify/attack-base]
+permissions: {}
+concurrency:
+  group: verification-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  verification:
+    permissions:
+      contents: read
+      checks: write
+      pull-requests: write
+      id-token: write
+    uses: nguyenhoanglong-tech/verification/.github/workflows/gate.yml@dev
+    with:
+      engine_ref: dev
