@@ -12,7 +12,8 @@ on:
 permissions: {}
 env:
   HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-  BASE_SHA: ${{ github.event.pull_request.base.sha }}
+  # The base branch tip when this run started, not the PR event's recorded base, which can be stale.
+  BASE_SHA: ${{ github.sha }}
   BASE_REF: ${{ github.event.pull_request.base.ref }}
   PR_NUMBER: ${{ github.event.pull_request.number }}
 jobs:
