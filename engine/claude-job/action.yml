@@ -1,0 +1,93 @@
+name: verification claude job
+description: Runs one Claude check (review, blast or tp) on a PR head checked out as data, and scores its structured output.
+inputs:
+  kind: {required: true, description: "review | blast | tp"}
+  model: {required: true, description: Claude model id}
+  effort: {required: true, description: reasoning effort}
+  level: {required: false, default: medium, description: /code-review level}
+  anthropic: {required: true, description: "JSON with federation_rule_id, organization_id, service_account_id"}
+  allowed_bots: {required: false, default: "", description: bots allowed to trigger the action}
+  github_token: {required: true, description: the workflow's GITHUB_TOKEN}
+  budget: {required: false, default: "3", description: max USD for this run}
+outputs:
+  ok: {description: "true when the run produced a structured result with no blocking finding", value: "${{ steps.score.outputs.ok }}"}
+  head: {description: head SHA the check ran on, value: "${{ steps.score.outputs.head }}"}
+  cost: {description: total cost in USD, value: "${{ steps.score.outputs.cost }}"}
+  summary: {description: one-line result, value: "${{ steps.score.outputs.summary }}"}
+runs:
+  using: composite
+  steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.pull_request.head.sha }}
+        path: pr-head
+        fetch-depth: 0
+        persist-credentials: false
+    - id: prep
+      shell: bash
+      env:
+        KIND: ${{ inputs.kind }}
+        MODEL: ${{ inputs.model }}
+        EFFORT: ${{ inputs.effort }}
+        LEVEL: ${{ inputs.level }}
+        BUDGET: ${{ inputs.budget }}
+        PR: ${{ github.event.pull_request.number }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        ENGINE: ${{ github.action_path }}/..
+      run: |
+        git -C pr-head reset -q --soft "$(git -C pr-head merge-base HEAD "$BASE_SHA")"
+        git -C pr-head diff --cached --stat | tail -1
+        prompt_files=$(git -C pr-head diff --cached --name-only | grep -E '(^|/)(SKILL|CLAUDE|AGENTS|PORTABLE)\.md$|^claude/rules/' | paste -sd, - || true)
+        PROMPT_FILES="$prompt_files" python3 - "$ENGINE" > "$RUNNER_TEMP/prompt.md" <<'PY'
+        import os, sys
+        e = sys.argv[1] + "/prompts/"
+        text = open(e + os.environ["KIND"] + ".md").read() + "\n" + open(e + "common.md").read()
+        for k, v in {"PR": os.environ["PR"], "REPO": os.environ["GITHUB_REPOSITORY"], "HEAD_SHA": os.environ["HEAD_SHA"],
+                     "LEVEL": os.environ["LEVEL"], "PROMPT_FILES": os.environ.get("PROMPT_FILES", "")}.items():
+            text = text.replace("{{" + k + "}}", v)
+        print(text)
+        PY
+        schema=$(jq -c . "$ENGINE/schema/$KIND.json")
+        tools='Read Grep Glob Bash(git -C pr-head diff:*) Bash(git -C pr-head log:*) Bash(git -C pr-head show:*) Bash(git -C pr-head status:*) Bash(git -C pr-head ls-files:*)'
+        {
+          echo "args=--model $MODEL --effort $EFFORT --max-budget-usd $BUDGET --add-dir pr-head --allowedTools \"$tools\" --json-schema '$schema'"
+          echo "prompt<<PROMPT_EOF"; cat "$RUNNER_TEMP/prompt.md"; echo "PROMPT_EOF"
+        } >> "$GITHUB_OUTPUT"
+    - id: claude
+      continue-on-error: true
+      uses: anthropics/claude-code-action@cc98b3ae241b0fcfb6a42a2690751afffecb4452
+      with:
+        prompt: ${{ steps.prep.outputs.prompt }}
+        claude_args: ${{ steps.prep.outputs.args }}
+        github_token: ${{ inputs.github_token }}
+        allowed_bots: ${{ inputs.allowed_bots }}
+        anthropic_federation_rule_id: ${{ fromJSON(inputs.anthropic).federation_rule_id }}
+        anthropic_organization_id: ${{ fromJSON(inputs.anthropic).organization_id }}
+        anthropic_service_account_id: ${{ fromJSON(inputs.anthropic).service_account_id }}
+    - id: score
+      if: always()
+      shell: bash
+      env:
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        KIND: ${{ inputs.kind }}
+        OUTCOME: ${{ steps.claude.outcome }}
+        STRUCTURED: ${{ steps.claude.outputs.structured_output }}
+        EXEC_FILE: ${{ steps.claude.outputs.execution_file }}
+      run: |
+        cost=$( [ -s "$EXEC_FILE" ] && jq '[.[] | select(.type == "result")][-1].total_cost_usd // 0' "$EXEC_FILE" || echo 0)
+        if [ -n "$STRUCTURED" ] && jq -e '.findings | type == "array"' <<<"$STRUCTURED" >/dev/null 2>&1; then
+          blocking=$(jq '[.findings[] | select(.severity == "blocking")] | length' <<<"$STRUCTURED")
+          minor=$(jq '[.findings[] | select(.severity == "minor")] | length' <<<"$STRUCTURED")
+          ok=$([ "$blocking" = 0 ] && echo true || echo false)
+          summary="$KIND: $blocking blocking, $minor minor"
+          jq -r '.findings[] | "- [\(.severity)] \(.file):\(.line // "") \(.summary)"' <<<"$STRUCTURED" > "$RUNNER_TEMP/$KIND-findings.md"
+        else
+          ok=false
+          summary="$KIND: no structured result (action outcome $OUTCOME)"
+          : > "$RUNNER_TEMP/$KIND-findings.md"
+        fi
+        echo "$summary cost=$cost head=$HEAD_SHA"
+        cat "$RUNNER_TEMP/$KIND-findings.md"
+        { echo "ok=$ok"; echo "head=$HEAD_SHA"; echo "cost=$cost"; echo "summary=$summary"; } >> "$GITHUB_OUTPUT"
+        { echo "### $summary"; cat "$RUNNER_TEMP/$KIND-findings.md"; } >> "$GITHUB_STEP_SUMMARY"
