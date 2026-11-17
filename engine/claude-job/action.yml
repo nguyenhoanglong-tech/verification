@@ -38,7 +38,7 @@ runs:
       run: |
         git -C pr-head reset -q --soft "$(git -C pr-head merge-base HEAD "$BASE_SHA")"
         git -C pr-head diff --cached --stat | tail -1
-        prompt_files=$(git -C pr-head diff --cached --name-only | grep -E '(^|/)(SKILL|CLAUDE|AGENTS|PORTABLE)\.md$|^claude/rules/' | paste -sd, - || true)
+        prompt_files=$(git -C pr-head diff --cached --name-only | tr -cd '[:alnum:]/._\n-' | grep -E '(^|/)(SKILL|CLAUDE|AGENTS|PORTABLE)\.md$|^claude/rules/' | paste -sd, - || true)
         PROMPT_FILES="$prompt_files" python3 - "$ENGINE" > "$RUNNER_TEMP/prompt.md" <<'PY'
         import os, sys
         e = sys.argv[1] + "/prompts/"
@@ -52,7 +52,8 @@ runs:
         tools='Read Grep Glob Bash(git -C pr-head diff:*) Bash(git -C pr-head log:*) Bash(git -C pr-head show:*) Bash(git -C pr-head status:*) Bash(git -C pr-head ls-files:*)'
         {
           echo "args=--model $MODEL --effort $EFFORT --max-budget-usd $BUDGET --add-dir pr-head --allowedTools \"$tools\" --json-schema '$schema'"
-          echo "prompt<<PROMPT_EOF"; cat "$RUNNER_TEMP/prompt.md"; echo "PROMPT_EOF"
+          d="EOF_$(openssl rand -hex 16)"
+          echo "prompt<<$d"; cat "$RUNNER_TEMP/prompt.md"; echo "$d"
         } >> "$GITHUB_OUTPUT"
     - name: OIDC claims the federation rule sees (claims only, never the token)
       shell: bash

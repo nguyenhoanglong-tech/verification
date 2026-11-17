@@ -144,7 +144,7 @@ def github_main() -> None:
     print(json.dumps({"head": head_sha, "base": base_sha, **outputs}, indent=2))
     with open(os.environ["GITHUB_OUTPUT"], "a") as out:
         for k, v in outputs.items():
-            out.write(f"{k}={v}\n")
+            out.write(f"{k}={' '.join(v.split())}\n")  # file names may hold newlines; one line per output
 
 
 if __name__ == "__main__":
