@@ -28,6 +28,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           id=$(gh api "repos/$GITHUB_REPOSITORY/check-runs" -f name=verification -f head_sha="$HEAD_SHA" \
             -f status=in_progress -f "output[title]=running" -f "output[summary]=The verification gate is running on $HEAD_SHA." --jq .id)
           echo "check_id=$id" >> "$GITHUB_OUTPUT"
@@ -227,6 +228,10 @@ jobs:
     # The one result the ruleset reads. Posted as a check run named `verification` by GitHub Actions.
     needs: [start, tier, head_archive, checks, review, blast, tp]
     if: always()
+    # One gate at a time per head, so each reads the verdicts the one before it wrote.
+    concurrency:
+      group: verification-gate-${{ github.repository }}-${{ github.event.pull_request.head.sha }}
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -237,8 +242,10 @@ jobs:
           NEEDS: ${{ toJSON(needs) }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
         run: |
+          set -uo pipefail
           tier() { jq -r ".tier.outputs.$1 // empty" <<<"$NEEDS"; }
-          ok=true; why=()
+          ok=true; why=(); prior_fail=false
+          [ "$(jq -r .start.result <<<"$NEEDS")" = success ] || { ok=false; why+=("start job $(jq -r .start.result <<<"$NEEDS")"); }
           [ "$(jq -r .tier.result <<<"$NEEDS")" = success ] || { ok=false; why+=("tier job $(jq -r .tier.result <<<"$NEEDS")"); }
           owed() { # job, flag
             local job=$1 flag=$2 res; res=$(jq -r ".$job.result" <<<"$NEEDS")
@@ -258,14 +265,14 @@ jobs:
           ran=$(jq -r '[to_entries[] | select(.key != "start" and .value.result == "success") | .key] | join(",")' <<<"$NEEDS")
           tiers=$(tier tiers); enforce=$(tier enforce)
           # Same-head runs share one verdict: a failure on this head is never replaced by a later pass.
-          runs=$(gh api "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/check-runs?check_name=verification&filter=all&per_page=100" \
-            --jq '[.check_runs[] | select(.app.id == 15368)]')
+          runs=$(gh api --paginate "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/check-runs?check_name=verification&filter=all&per_page=100" \
+            --jq '.check_runs[] | select(.app.id == 15368)' | jq -s .) || { echo "cannot list verification runs"; exit 1; }
           if [ "$(jq '[.[] | select(.conclusion == "failure")] | length' <<<"$runs")" != 0 ]; then
-            ok=false; why+=("an earlier verification run on this head failed")
+            ok=false; prior_fail=true; why+=("an earlier verification run on this head failed")
           fi
-          # Observe (neutral) only when the tier job said so; an unknown mode fails closed.
+          # Observe (neutral) only when the tier job said so and no run on this head failed; anything else fails closed.
           if $ok; then conclusion=success; title="$tiers passed"
-          elif [ "$enforce" = false ] && [ "$(jq -r .tier.result <<<"$NEEDS")" = success ]; then
+          elif ! $prior_fail && [ "$enforce" = false ] && [ "$(jq -r .tier.result <<<"$NEEDS")" = success ]; then
             conclusion=neutral; title="$tiers would block (observe)"
           else conclusion=failure; title="${tiers:-tier unknown} blocked"; fi
           stamp="Verified-by: $( [ "$tiers" = T0 ] && echo none-T0 || echo "$ran") head=$HEAD_SHA sampled=$(tier sampled)"

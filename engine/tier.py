@@ -109,11 +109,10 @@ def load_config(repo: str, base_sha: str) -> dict:
 
 
 def compare_files(repo: str, base_sha: str, head_sha: str) -> tuple[list[dict], bool]:
-    # The compare API lists at most 3000 files across pages; at that cap the list may be cut short.
-    out = subprocess.run(["gh", "api", "--paginate", f"repos/{repo}/compare/{base_sha}...{head_sha}?per_page=100",
-                          "--jq", ".files[] | tojson"], check=True, capture_output=True, text=True).stdout
-    files = [json.loads(line) for line in out.splitlines() if line]
-    return files, len(files) >= 3000
+    # The compare API returns at most 300 files, all on the first page (per_page pages commits, not files).
+    # A list that reaches 300 may be cut short, so the caller owes every tier.
+    files = json.loads(gh_api(f"repos/{repo}/compare/{base_sha}...{head_sha}")).get("files", [])
+    return files, len(files) >= 300
 
 
 def github_main() -> None:
