@@ -229,10 +229,12 @@ jobs:
     # The one result the ruleset reads. Posted as a check run named `verification` by GitHub Actions.
     needs: [start, tier, head_archive, checks, review, blast, tp]
     if: always()
-    # One gate at a time per head, so each reads the verdicts the one before it wrote.
+    # One gate at a time per head, so each reads the verdicts the one before it wrote. queue: max keeps every
+    # waiting gate (up to 100); without it a newer gate cancels the waiting one and that run never posts.
     concurrency:
       group: verification-gate-${{ github.repository }}-${{ github.event.pull_request.head.sha }}
       cancel-in-progress: false
+      queue: max
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -281,7 +283,13 @@ jobs:
           summary=$(printf '%s\n\ntiers: %s (%s)\ncode lines: %s\nenforce: %s\ncost_usd: %s\nreasons not passed: %s\n\n%s\n\nrun: %s' \
             "$stamp" "$tiers" "$(tier reasons)" "$(tier code_lines)" "$enforce" "$cost" "${why[*]:-none}" "$details" "$RUN_URL")
           echo "$summary"; echo "conclusion=$conclusion"
-          ids=$(jq -r '.[].id' <<<"$runs"; jq -r '.start.outputs.check_id // empty' <<<"$NEEDS")
+          # Only a failure is copied onto other runs' checks. A pass touches this run's own check, so a sibling
+          # still in progress keeps blocking until its own gate has judged it.
+          if [ "$conclusion" = failure ]; then
+            ids=$(jq -r '.[].id' <<<"$runs"; jq -r '.start.outputs.check_id // empty' <<<"$NEEDS")
+          else
+            ids=$(jq -r '.start.outputs.check_id // empty' <<<"$NEEDS")
+          fi
           ids=$(sort -u <<<"$ids" | grep . || true)
           if [ -z "$ids" ]; then
             gh api -X POST "repos/$GITHUB_REPOSITORY/check-runs" -f name=verification -f head_sha="$HEAD_SHA" \
