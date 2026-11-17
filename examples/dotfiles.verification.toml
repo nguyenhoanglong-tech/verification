@@ -16,8 +16,8 @@ t2_level = "high"
 
 [tiers]                                 # D7, D22
 t2_lines = 300
-docs = ["**/*.md", "**/*.txt", "**/*.svg", "**/*.mmd", "**/*.png", "LICENSE"]
-prompt = ["**/SKILL.md", "**/CLAUDE.md", "**/AGENTS.md", "claude/rules/**", "**/PORTABLE.md"]
+docs = ["**/*.md", "**/*.txt", "**/*.svg", "**/*.mmd", "**/*.png", "**/*.html", "claude/docs/receipts/**", "LICENSE"]
+prompt = ["**/SKILL.md", "**/CLAUDE.md", "**/AGENTS.md", "claude/rules/**", "**/PORTABLE.md", "claude/agents/*.md"]
 risk = [
   ".github/**",
   "claude/hooks/**",
@@ -28,6 +28,9 @@ risk = [
   "claude/scripts/git-pre-push.sh",
   "claude/scripts/install-git-hooks.sh",
   "claude/scripts/gate-selftest.sh",
+  "claude/scripts/security/**",
+  "claude/scripts/tests/pre-commit-stages-test.sh",
+  "claude/scripts/tests/guards-*",
   "claude/scripts/merge-if-green.sh",
   "claude/scripts/state-checks.py",
   "claude/scripts/sync-skill-loaders.sh",
@@ -38,5 +41,5 @@ risk = [
   "claude/skills/deep-fucking-research/scripts/dfr_codex_runner.mjs",
   "tools/grok-permission-reviewer/proxy.py",
   "claude/optchat/**",
-  "**/*.tla",
+  "**/*.tla",                            # models are risk on purpose: they prove the gates
 ]
