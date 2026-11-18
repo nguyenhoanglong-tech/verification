@@ -1,5 +1,5 @@
 # The engine repo tests itself: PRs into verify/attack-base run the gate from the dev branch (selftest.yml).
-reviews_per_day = 0
+live_checks = "owed"
 mode = "shadow"
 enforce_branches = ["verify/attack-base"]
 allowed_bots = []
@@ -12,7 +12,7 @@ workspace_id = "wrkspc_018nwehRHTcTJ5ihWRdjWnVy"
 
 [[check]]
 name = "unit"
-run = "python3 -c pass"
+run = "cd sandbox && python3 test_calc.py && cd .. && python3 tests/test_tier.py"
 
 [tiers]
 risk = [".github/**", "engine/**"]
