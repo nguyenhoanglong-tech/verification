@@ -69,6 +69,7 @@ jobs:
         # pull_request_target and the merge commit under pull_request. Not the PR event's base, which can be stale.
         run: |
           set -euo pipefail
+          case $BASE_REF in *[!A-Za-z0-9._/-]*) echo "::error::base ref name is not plain enough to look up: $BASE_REF"; exit 1;; esac
           base_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$BASE_REF" --jq .object.sha)
           echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
           BASE_SHA=$base_sha python3 engine-src/engine/tier.py github

@@ -7,6 +7,8 @@ set -euo pipefail
 repo=${SELFTEST_REPO:-nguyenhoanglong-tech/verification}
 cmd=${1:-} branch=${2:-} code=${3:-}
 [ -n "$branch" ] && { [ "$cmd" = start ] || [ "$cmd" = stop ]; } || { sed -n '3,5p' "$0" >&2; exit 2; }
+# Plain names only: they go into API paths and a workflow branch filter unescaped.
+case $branch in *[!A-Za-z0-9._/-]*) echo "branch name must use only A-Z a-z 0-9 . _ / -" >&2; exit 2;; esac
 base=verify/selftest/$branch head=selftest-pr/$branch
 
 tip() { gh api "repos/$repo/git/ref/heads/$1" --jq .object.sha; }
@@ -21,7 +23,7 @@ put() { # branch path message content
 raw() { gh api "repos/$repo/contents/$2?ref=$1" -H "Accept: application/vnd.github.raw"; }
 
 if [ "$cmd" = stop ]; then
-  for pr in $(gh pr list -R "$repo" --head "$head" --state open --json number --jq '.[].number'); do
+  for pr in $(gh pr list -R "$repo" --head "$head" --base "$base" --state open --json number --jq '.[].number'); do
     gh pr close "$pr" -R "$repo" --comment "Self-test finished."
   done
   for ref in "$head" "$base"; do
