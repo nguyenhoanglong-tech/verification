@@ -41,7 +41,7 @@ def failure_kind(text: str) -> str:
 def last_json(text: str):
     """The last JSON value in a CLI or model output: a ```json block, else the last line that parses."""
     blocks = re.findall(r"```(?:json)?\s*\n(.*?)\n```", text or "", re.S)
-    for chunk in reversed(blocks + (text or "").strip().splitlines()):
+    for chunk in [*reversed(blocks), *reversed((text or "").strip().splitlines())]:
         try:
             return json.loads(chunk)
         except ValueError:
@@ -50,12 +50,9 @@ def last_json(text: str):
 
 
 def bugs_findings(result: dict, head_dir: str) -> list[dict]:
-    """/code-review returns a JSON array (or the structured output, when the model used it). A finding with no
-    valid severity is a P0: D8's review base counts every bug-hunt finding."""
-    out = result.get("structured_output")
-    items = out.get("findings") if isinstance(out, dict) else last_json(result.get("result", ""))
-    if isinstance(items, dict):
-        items = items.get("findings")
+    """/code-review returns a JSON array in its result text. A finding with no valid severity is a P0: D8's review
+    base counts every bug-hunt finding."""
+    items = last_json(result.get("result", ""))
     if not isinstance(items, list):
         raise ValueError("no findings list in the Bugs call's output")
     findings = []
@@ -186,21 +183,19 @@ def main() -> dict:
         return out
     spec_text = json.loads(e.get("SPEC_TEXT") or '""')
     items = done_items(spec_text)
-    standards = e.get("STANDARDS", "CODING_STANDARDS.md")
+    standards = str(Path(e.get("STANDARDS", "CODING_STANDARDS.md")).resolve())
     common = ["--model", e["MODEL"], "--effort", e["EFFORT"], "--max-budget-usd", e.get("BUDGET_USD", "3"),
               "--tools", "Read", "--allowedTools", f"Read(/{data}/**)",
               "--disallowedTools", "Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch,Task,Agent", f"Read(/{secret}/**)",
               "--permission-mode", "dontAsk", "--output-format", "json"]
-    bugs_args = list(common)
-    if Path(standards).is_file():
-        bugs_args += ["--append-system-prompt-file", standards]
-    bugs_args += ["--json-schema", (ENGINE / "schema/bugs.json").read_text()]
     fill = lambda t: (t.replace("{{BASE_SHA}}", e["BASE_SHA"]).replace("{{DIFF}}", str(data / "diff.patch"))
                       .replace("{{HEAD}}", str(data / "head")).replace("{{STANDARDS}}", standards)
                       .replace("{{SPEC}}", spec_text)
                       .replace("{{ITEMS}}", "\n".join(f"{n}. {i}" for n, i in enumerate(items, 1)) or
                                "The section has no list: give one row per requirement it states, n counting from 1."))
-    calls = [("bugs", bugs_args, f"/code-review {e.get('LEVEL', 'medium')} {data / 'diff.patch'}\n\n"
+    # /code-review runs as a forked agent. Only this prompt reaches it: a system prompt flag does not, and a
+    # --json-schema result never comes back from the fork, so its findings arrive as a JSON array in the result text.
+    calls = [("bugs", common, f"/code-review {e.get('LEVEL', 'medium')} {data / 'diff.patch'}\n\n"
               + fill((ENGINE / "prompts/bugs.md").read_text()))]
     if spec_text:
         calls.append(("spec", common + ["--json-schema", (ENGINE / "schema/spec.json").read_text()],
