@@ -7,6 +7,3 @@ def safe_div(a, b):
         raise ZeroDivisionError("b must not be zero")
     return a / b
 # selftest probe
-
-def add(a, b):
-    return a - b
