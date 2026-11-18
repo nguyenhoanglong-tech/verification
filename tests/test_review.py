@@ -118,6 +118,49 @@ class SpecBudget(unittest.TestCase):
         self.assertEqual((out["cost_usd"], out["spec"], out["error"]), (1.5, None, None))
 
 
+class BugsCall(unittest.TestCase):
+    """/code-review runs as a forked agent. On CLI 2.1.326 the fork gets the StructuredOutput tool from --json-schema
+    but its payload never reaches the result, and --append-system-prompt-file never reaches the fork at all."""
+
+    def run_main(self, cwd):
+        calls = {}
+
+        def claude(args, prompt, token_file, home):
+            name = "spec" if "Done-when" in prompt else "bugs"
+            calls[name] = (args, prompt)
+            spec = {"answer": "Yes", "items": [{"item": "a", "status": "Yes"}]}
+            return 0, json.dumps({"is_error": False, "result": "```json\n[]\n```", "total_cost_usd": 0.1,
+                                  **({"structured_output": spec} if name == "spec" else {})}), ""
+        old = os.getcwd()
+        os.chdir(cwd)
+        try:
+            with mock.patch.dict(os.environ, {
+                    "RUNNER_TEMP": cwd, "HEAD_DIR": cwd, "BASE_SHA": "b", "ANTHROPIC": "{}", "MODEL": "m",
+                    "EFFORT": "medium", "SPEC_TEXT": json.dumps("## Done when\n- a\n"), "PACE": "{}"}), \
+                    mock.patch.object(review, "prepare"), mock.patch.object(review, "exchange", return_value=""), \
+                    mock.patch.object(review, "spec_budget", return_value=""), \
+                    mock.patch.object(review, "claude", claude):
+                fakes.run(review.main)
+        finally:
+            os.chdir(old)
+        return calls
+
+    def test_bugs_call_returns_its_findings_as_text(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "CODING_STANDARDS.md").write_text("R1 rule\n")
+            calls = self.run_main(d)
+        bugs_args, spec_args = calls["bugs"][0], calls["spec"][0]
+        self.assertNotIn("--json-schema", bugs_args)
+        self.assertNotIn("--append-system-prompt-file", bugs_args)
+        self.assertIn("--json-schema", spec_args)
+
+    def test_bugs_prompt_names_the_standards_file_by_absolute_path(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "CODING_STANDARDS.md").write_text("R1 rule\n")
+            prompt = self.run_main(d)["bugs"][1]
+            self.assertIn(f"Read {Path(d).resolve() / 'CODING_STANDARDS.md'},", prompt)
+
+
 class Prepare(unittest.TestCase):
     """Fix 11: a head file that is not UTF-8 does not crash the review."""
 
@@ -148,9 +191,10 @@ class Bugs(unittest.TestCase):
         self.assertEqual([(f["file"], f["line"], f["severity"]) for f in got], [("a.py", 4, "P0"), ("b.py", None, "P0")])
         self.assertEqual(got[0]["failure"], "age 18 -> False")
 
-    def test_structured_output_wins(self):
-        out = {"findings": [{"severity": "P1", "file": "a.py", "line": 1, "summary": "s", "failure_scenario": "f"}]}
-        self.assertEqual(bugs_findings({"structured_output": out, "result": "[]"}, HEAD)[0]["severity"], "P1")
+    def test_fenced_array_with_one_finding_per_line(self):
+        text = ('```json\n[\n{"file": "a.py", "line": 1, "summary": "s1", "severity": "P1"},\n'
+                '{"file": "b.py", "line": 2, "summary": "s2", "severity": "P0"}\n]\n```\nDone.')
+        self.assertEqual([f["file"] for f in bugs_findings({"result": text}, HEAD)], ["a.py", "b.py"])
 
     def test_empty_and_unparseable(self):
         self.assertEqual(bugs_findings({"result": "No findings.\n[]"}, HEAD), [])
