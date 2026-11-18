@@ -16,8 +16,8 @@ The review (`engine/claude-job`) runs `claude --bare -p` twice at most: `/code-r
 Spec call when the PR closes an issue whose done-when section existed when the PR opened. The working
 directory is the base; the head's files and diff are copied out of it and read as data.
 
-The caller grants `contents: read`, `checks: write`, `issues: read` (the Spec switch reads the issues a PR
-closes), `pull-requests: write` and `id-token: write`. It sets `runner` from the
+The caller grants `actions: read` (the budget reads the caller's own runs this month), `contents: read`,
+`checks: write`, `issues: read` (the Spec switch reads the issues a PR closes), `pull-requests: write` and `id-token: write`. It sets `runner` from the
 `VERIFICATION_RUNNER` repo variable and holds one concurrency group per PR with `cancel-in-progress: true`.
 
 Tests: `python3 -m unittest discover -s tests`.

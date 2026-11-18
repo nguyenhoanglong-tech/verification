@@ -130,17 +130,35 @@ def settings(config: dict, base_ref: str) -> dict:
 
 
 DONE_WHEN = re.compile(r"^(#{1,6})\s+.*\b(done[ -]when|acceptance criteria)\b", re.I | re.M)
+DONE_WHEN_BOLD = re.compile(r"^\*\*\s*(?:done[ -]when|acceptance criteria)\s*:?\s*\*\*\s*:?[ \t]*$", re.I | re.M)
+ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(?:\[[ xX]\]\s+)?")
 
 
 def done_when(body: str) -> str:
-    """The done-when or acceptance-criteria section of an issue body, heading included; empty when there is none."""
-    m = DONE_WHEN.search(body or "")
+    """The done-when or acceptance-criteria section of an issue body, heading included; empty when there is none.
+    The heading is a Markdown heading, or a bold line followed by a list (the section is that list)."""
+    body = (body or "").replace("\r\n", "\n")
+    m = DONE_WHEN.search(body)
+    if m:
+        level = len(m.group(1))
+        rest = body[m.end():]
+        nxt = re.search(r"^#{1,%d}\s" % level, rest, re.M)
+        return (body[m.start():m.end()] + (rest[:nxt.start()] if nxt else rest)).strip()
+    m = DONE_WHEN_BOLD.search(body)
     if not m:
         return ""
-    level = len(m.group(1))
-    rest = body[m.end():]
-    nxt = re.search(r"^#{1,%d}\s" % level, rest, re.M)
-    return (body[m.start():m.end()] + (rest[:nxt.start()] if nxt else rest)).strip()
+    lines = []
+    for line in body[m.end():].lstrip("\n").split("\n"):
+        if ITEM.match(line) or (lines and (not line.strip() or line[:1] in " \t")):
+            lines.append(line)
+        else:
+            break
+    return (m.group(0) + "\n" + "\n".join(lines)).strip() if any(ITEM.match(l) for l in lines) else ""
+
+
+def done_items(spec_text: str) -> list[str]:
+    """The list items of the done-when sections, in order: the rows the Spec table owes."""
+    return [ITEM.sub("", line).strip() for line in (spec_text or "").split("\n") if ITEM.match(line) and ITEM.sub("", line).strip()]
 
 
 def body_at(issue: dict, when: str) -> str:
@@ -175,7 +193,7 @@ def closing_issues(repo: str, pr: int) -> tuple[str, list[dict]]:
 
 
 def load_config(repo: str, base_sha: str) -> dict:
-    # No fallback: a config that cannot be read fails this job, and the gate fails closed on it.
+    # No fallback: a config that cannot be read is an ERROR verdict.
     return tomllib.loads(github.api(f"repos/{repo}/contents/.github/verification.toml?ref={base_sha}", raw=True))
 
 
@@ -196,16 +214,8 @@ def write_outputs(outputs: dict) -> None:
             out.write(f"{k}={' '.join(v.split())}\n")  # file names may hold newlines; one line per output
 
 
-def github_main() -> None:
-    repo, base_sha, head_sha = os.environ["GITHUB_REPOSITORY"], os.environ["BASE_SHA"], os.environ["HEAD_SHA"]
-    print(f"base {base_sha}")
-    config = load_config(repo, base_sha)
-    try:
-        s = settings(config, os.environ.get("BASE_REF", ""))
-    except ConfigError as e:
-        print(f"::error::{e}")
-        write_outputs({"config_error": str(e)})
-        sys.exit(1)
+def tier_outputs(repo: str, base_sha: str, head_sha: str, base_ref: str, config: dict) -> dict:
+    s = settings(config, base_ref)
     files, truncated = compare_files(repo, base_sha, head_sha)
     result = classify(files, config.get("tiers", {}), truncated)
     t2 = "T2" in result.tiers
@@ -217,15 +227,21 @@ def github_main() -> None:
     if code and not review:
         skip = "machine only"
     if review:
-        today, month = verdict.budget_base(github.recent_records(repo), datetime.now(timezone.utc))
-        allowed = verdict.budget_allows(today, month, s["reviews_per_day"], s["budget_month_usd"])
-        budget["skipped"] = not allowed
-        print(f"budget: {today} paid reviews today of {s['reviews_per_day']}, ${month:.2f} this month of ${s['budget_month_usd']:.2f}")
-        if not allowed:
+        now = datetime.now(timezone.utc)
+        try:
+            today, month = verdict.budget_base(github.month_records(repo, os.environ.get("GITHUB_WORKFLOW_REF", ""), now), now)
+        except Exception as x:  # fail closed: no paid call on a budget nobody could read
+            print(f"::warning::budget read failed, so the paid review is skipped: {x}")
+            budget.update(skipped=True, read_error=f"budget read failed: {x}"[:300])
+        else:
+            budget.update(reviews_today=today, month_usd=month,
+                          skipped=not verdict.budget_allows(today, month, s["reviews_per_day"], s["budget_month_usd"]))
+            print(f"budget: {today} paid reviews today of {s['reviews_per_day']}, ${month:.2f} this month of ${s['budget_month_usd']:.2f}")
+        if budget["skipped"]:
             review, skip = False, verdict.BUDGET_SKIPPED
         else:
             spec = switch(*closing_issues(repo, int(os.environ["PR_NUMBER"])))
-    outputs = {
+    return {
         "base_sha": base_sha,
         "mode": s["mode"],
         "tiers": " ".join(result.tiers),
@@ -238,14 +254,31 @@ def github_main() -> None:
         "budget": json.dumps(budget),
         "standards": re.sub(r"[^A-Za-z0-9/._-]", "", s["standards"]),
         "review_model": review_cfg.get("t2_model" if t2 else "t1_model", "claude-opus-5-5"),
-        "review_level": review_cfg.get("t2_level" if t2 else "t1_level", "high" if t2 else "medium"),
+        "review_level": review_cfg.get("t2_level" if t2 else "t1_level", "medium"),
         "review_effort": review_cfg.get("effort", "medium"),
         # name:command pairs, each base64, so the checks job (docker CLI image, no jq) can read them.
         "checks": " ".join(f"{b64(c['name'])}:{b64(c['run'])}" for c in config.get("check", [])),
         "has_checks": "true" if config.get("check") else "false",
         "anthropic": json.dumps(config.get("anthropic", {})),
     }
-    print(json.dumps({"head": head_sha, **outputs}, indent=2))
+
+
+def github_main() -> None:
+    """Exits 0 on every handled error, with the error in the `error` output: the gate posts ERROR, neutral in shadow
+    trial, and this job stays green so nothing blocks."""
+    repo, base_sha, head_sha = os.environ["GITHUB_REPOSITORY"], os.environ["BASE_SHA"], os.environ["HEAD_SHA"]
+    base_ref = os.environ.get("BASE_REF", "")
+    print(f"base {base_sha}")
+    config = None
+    try:
+        config = load_config(repo, base_sha)
+        outputs = tier_outputs(repo, base_sha, head_sha, base_ref, config)
+    except Exception as e:
+        message = str(e) if isinstance(e, ConfigError) else f"tier job: {type(e).__name__}: {e}"
+        print(f"::error::{message}")
+        outputs = {"base_sha": base_sha, "mode": verdict.fallback_mode(config, base_ref), "error": message[:400],
+                   "has_checks": "false", "review": "false", "budget": "{}"}
+    verdict.log_data(json.dumps({"head": head_sha, **outputs}, indent=2))
     write_outputs(outputs)
 
 

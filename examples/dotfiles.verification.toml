@@ -15,7 +15,7 @@ workspace_id = "wrkspc_018nwehRHTcTJ5ihWRdjWnVy"
 t1_model = "claude-opus-5-5"
 t1_level = "medium"
 t2_model = "claude-opus-5-5"
-t2_level = "high"
+t2_level = "medium"
 
 [tiers]                                 # D7, D22
 t2_lines = 300

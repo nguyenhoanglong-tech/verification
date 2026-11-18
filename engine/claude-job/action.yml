@@ -9,6 +9,7 @@ inputs:
   spec_text: {required: false, default: '""', description: "JSON string: the done-when sections the Spec call checks; empty means no Spec call"}
   standards: {required: false, default: CODING_STANDARDS.md, description: the coding standards file at base}
   budget: {required: false, default: "3", description: max USD per call}
+  pace: {required: false, default: "{}", description: "JSON: the tier job's budget (reviews_per_day, budget_month_usd); the Spec call reads the budget again against it"}
   subscription_fallback: {required: false, default: "false", description: "D18: retry on a credit error with the subscription token. Off until built."}
   claude_code_oauth_token: {required: false, default: "", description: "D18: the subscription token for that retry"}
 outputs:
@@ -45,6 +46,8 @@ runs:
         SPEC_TEXT: ${{ inputs.spec_text }}
         STANDARDS: ${{ inputs.standards }}
         BUDGET_USD: ${{ inputs.budget }}
+        PACE: ${{ inputs.pace }}
+        GH_TOKEN: ${{ github.token }}
       run: python3 "$GITHUB_ACTION_PATH/review.py"
     # D18: the subscription fallback goes here. It stays off: the input defaults to false and the retry is not built.
     - name: subscription fallback on a credit error (D18, off)

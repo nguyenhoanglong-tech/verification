@@ -66,6 +66,7 @@ jobs:
     container: python:3.12-bookworm@sha256:4209fae09a3e20afd863e528bfddc235da5fd5977983e1996cd54cc9a72e6267
     timeout-minutes: 5
     permissions:
+      actions: read
       contents: read
       checks: read
       issues: read
@@ -73,7 +74,7 @@ jobs:
     outputs:
       base_sha: ${{ steps.t.outputs.base_sha }}
       mode: ${{ steps.t.outputs.mode }}
-      config_error: ${{ steps.t.outputs.config_error }}
+      error: ${{ steps.t.outputs.error }}
       tiers: ${{ steps.t.outputs.tiers }}
       code_lines: ${{ steps.t.outputs.code_lines }}
       reasons: ${{ steps.t.outputs.reasons }}
@@ -157,7 +158,11 @@ jobs:
             echo "::group::$name: $cmd"
             cid=$(docker create --network none -w /w "$IMAGE" bash -c "$cmd")
             docker cp head/. "$cid:/w"
+            # Head output must not reach the command parser: a mask command in it would drop this job's outputs.
+            stop=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+            echo "::stop-commands::$stop"
             if docker start -a "$cid"; then r=pass; else r=fail; fi
+            echo "::$stop::"
             docker rm -f "$cid" >/dev/null
             echo "::endgroup::"
             echo "$name=$r"
@@ -172,6 +177,8 @@ jobs:
     container: python:3.12-bookworm@sha256:4209fae09a3e20afd863e528bfddc235da5fd5977983e1996cd54cc9a72e6267
     timeout-minutes: 40
     permissions:
+      actions: read
+      checks: read
       contents: read
       id-token: write
     outputs:
@@ -201,6 +208,7 @@ jobs:
           base_sha: ${{ needs.tier.outputs.base_sha }}
           spec_text: ${{ needs.tier.outputs.spec_text }}
           standards: ${{ needs.tier.outputs.standards }}
+          pace: ${{ needs.tier.outputs.budget }}
 
   gate:
     # The one result the ruleset reads. One gate at a time per head, so each reads the verdicts the one before it
@@ -215,7 +223,9 @@ jobs:
     container: python:3.12-bookworm@sha256:4209fae09a3e20afd863e528bfddc235da5fd5977983e1996cd54cc9a72e6267
     timeout-minutes: 5
     permissions:
+      actions: read
       checks: write
+      contents: read
       pull-requests: read
     steps:
       - run: echo "base ${{ needs.tier.outputs.base_sha }}"

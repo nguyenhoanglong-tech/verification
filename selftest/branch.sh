@@ -52,6 +52,7 @@ concurrency:
 jobs:
   verification:
     permissions:
+      actions: read
       contents: read
       checks: write
       issues: read

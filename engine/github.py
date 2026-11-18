@@ -1,7 +1,9 @@
 """The few GitHub API calls the engine makes, over urllib, so jobs need no gh or jq in their container."""
 import json
 import os
+import urllib.error
 import urllib.request
+from datetime import datetime, timedelta
 
 from verdict import ACTIONS_APP, parse_text
 
@@ -36,27 +38,48 @@ def verification_runs(repo: str, sha: str) -> list[dict]:
         page += 1
 
 
-RECENT = """query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) {
-  pullRequests(first: 20, orderBy: {field: UPDATED_AT, direction: DESC}) { nodes { commits(last: 10) { nodes { commit {
-    checkSuites(first: 5, filterBy: {appId: %d}) { nodes { checkRuns(first: 10, filterBy: {checkName: "verification"}) {
-      nodes { completedAt text } } } } } } } } } } }""" % ACTIONS_APP
+# A gate run posts its record within this long of its Actions run starting: start, tier, review and gate time out at
+# 5 + 5 + 40 + 5 minutes, and the gate can queue behind other gates on its head.
+SPAN = timedelta(hours=6)
 
 
-def recent_records(repo: str) -> list[tuple[str, dict]]:
-    """(completed_at, record) from the gate runs on the last 10 commits of the 20 most recently updated PRs.
+def when(stamp: str) -> datetime:
+    return datetime.fromisoformat(stamp.replace("Z", "+00:00"))
 
-    Each record carries the running totals, so the newest one is enough (verdict.budget_base). Earlier commits count
-    because a PR pushed again keeps the totals its earlier heads paid for. The newest gate run is on a recently
-    pushed PR, and a push updates the PR. Two gate jobs finishing in the same seconds can each miss the other's
-    cost; the org's Console spend limit is the hard cap (D21).
+
+def month_records(repo: str, workflow_ref: str, now: datetime) -> list[tuple[str, dict]]:
+    """(completed_at, record) from the gate runs of this caller workflow this month (D21's budget base).
+
+    Read from the caller's Actions runs, not from pull requests, so a head force-pushed away or a closed PR still
+    counts. Each record carries the running totals, so the newest one is enough (verdict.budget_base): the walk goes
+    newest run first and stops at a run that started SPAN before the newest record it holds. Any failure raises, and
+    the caller skips the paid review (fail closed). Two gate jobs finishing in the same seconds can each miss the
+    other's cost; the org's Console spend limit is the hard cap (D21).
     """
-    owner, name = repo.split("/")
-    out = []
-    for pr in graphql(RECENT, owner=owner, name=name)["repository"]["pullRequests"]["nodes"]:
-        for c in pr["commits"]["nodes"]:
-            for suite in c["commit"]["checkSuites"]["nodes"]:
-                for run in suite["checkRuns"]["nodes"]:
-                    record = parse_text(run.get("text"))
-                    if record and run.get("completedAt"):
-                        out.append((run["completedAt"], record))
-    return out
+    path = workflow_ref.split("@", 1)[0].split("/", 2)[-1]
+    if not path.startswith(".github/workflows/"):
+        raise RuntimeError(f"cannot name the caller workflow from GITHUB_WORKFLOW_REF={workflow_ref!r}")
+    workflow = path.rsplit("/", 1)[1]
+    out, seen, newest, page = [], set(), None, 1
+    while True:
+        got = api(f"repos/{repo}/actions/workflows/{workflow}/runs?created=%3E%3D{now:%Y-%m}-01&per_page=100&page={page}")
+        for run in got["workflow_runs"]:
+            if newest and when(run["created_at"]) < newest - SPAN:
+                return out
+            if run["head_sha"] in seen:
+                continue
+            seen.add(run["head_sha"])
+            try:
+                checks = verification_runs(repo, run["head_sha"])
+            except urllib.error.HTTPError as e:
+                if e.code in (404, 422):  # the commit is gone, and its check runs with it
+                    continue
+                raise
+            for check in checks:
+                record = parse_text((check.get("output") or {}).get("text"))
+                if record and check.get("completed_at"):
+                    out.append((check["completed_at"], record))
+                    newest = max(newest or when(check["completed_at"]), when(check["completed_at"]))
+        if len(got["workflow_runs"]) < 100:
+            return out
+        page += 1
