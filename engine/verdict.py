@@ -289,7 +289,11 @@ def own_run() -> dict:
 
 
 def write_check(github, repo: str, head_sha: str, own_id: int | None, body: dict) -> None:
-    """This run's own check run, and no other: a run never overwrites another run's record."""
+    """This run's own check run, and no other: a run never overwrites another run's record. A gate job re-run alone
+    keeps the start job's check_id, whose check already holds the earlier attempt's record, so a finished check gets
+    a new one."""
+    if own_id and github.api(f"repos/{repo}/check-runs/{own_id}").get("status") == "completed":
+        own_id = None
     if own_id:
         github.api(f"repos/{repo}/check-runs/{own_id}", "PATCH", body)
     else:

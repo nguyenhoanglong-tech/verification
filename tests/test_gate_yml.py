@@ -47,3 +47,29 @@ class Permissions(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StartJob(unittest.TestCase):
+    """Fix 1: a fault in the start job (a 5xx on the base ref read) ends the job green; the gate posts the error."""
+
+    def script(self) -> str:
+        text = (ROOT / ".github/workflows/gate.yml").read_text()
+        start = text.split("\n  start:\n", 1)[1].split("\n  tier:\n", 1)[0]
+        body = start.split("python3 - <<'PY'\n", 1)[1].split("\n          PY", 1)[0]
+        return "\n".join(line.removeprefix("          ") for line in body.split("\n"))
+
+    def test_a_base_ref_fault_exits_0_with_no_check_id(self):
+        import os
+        import sys
+        import tempfile
+        from unittest import mock
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import fakes
+        fake = fakes.GitHub(fail={"GET git/ref/heads/": [fakes.http_error(503)]})
+        with tempfile.NamedTemporaryFile("r") as out, fakes.installed(fake, GITHUB_OUTPUT=out.name), \
+                mock.patch.object(sys, "path", [str(ROOT / "engine"), *sys.path]):
+            code, log = fakes.run(exec, self.script().replace('"engine-src/engine"', repr(str(ROOT / "engine"))), {})
+            written = open(out.name).read()
+        self.assertEqual(code, 0, log)
+        self.assertNotIn("check_id=", written)
+        self.assertIn("::error::", log)

@@ -1,6 +1,7 @@
 """The few GitHub API calls the engine makes, over urllib, so jobs need no gh or jq in their container."""
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta
@@ -47,6 +48,13 @@ def when(stamp: str) -> datetime:
     return datetime.fromisoformat(stamp.replace("Z", "+00:00"))
 
 
+def run_head(run: dict) -> str:
+    """The PR head a gate run judged. Under pull_request_target a run's head_sha is the base tip, so the caller names
+    the head in its run-name ("verification <sha>"); under pull_request head_sha is the head."""
+    named = re.search(r"\b[0-9a-f]{40}\b", run.get("display_title") or "")
+    return named.group(0) if named else run["head_sha"]
+
+
 def month_records(repo: str, workflow_ref: str, now: datetime) -> list[tuple[str, dict]]:
     """(completed_at, record) from the gate runs of this caller workflow this month (D21's budget base).
 
@@ -60,17 +68,20 @@ def month_records(repo: str, workflow_ref: str, now: datetime) -> list[tuple[str
     if not path.startswith(".github/workflows/"):
         raise RuntimeError(f"cannot name the caller workflow from GITHUB_WORKFLOW_REF={workflow_ref!r}")
     workflow = path.rsplit("/", 1)[1]
+    # A run started up to SPAN before the month posts its record, and its spend, inside the month.
+    since = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0) - SPAN
     out, seen, newest, page = [], set(), None, 1
     while True:
-        got = api(f"repos/{repo}/actions/workflows/{workflow}/runs?created=%3E%3D{now:%Y-%m}-01&per_page=100&page={page}")
+        got = api(f"repos/{repo}/actions/workflows/{workflow}/runs?created=%3E%3D{since:%Y-%m-%dT%H:%M:%SZ}&per_page=100&page={page}")
         for run in got["workflow_runs"]:
             if newest and when(run["created_at"]) < newest - SPAN:
                 return out
-            if run["head_sha"] in seen:
+            sha = run_head(run)
+            if sha in seen:
                 continue
-            seen.add(run["head_sha"])
+            seen.add(sha)
             try:
-                checks = verification_runs(repo, run["head_sha"])
+                checks = verification_runs(repo, sha)
             except urllib.error.HTTPError as e:
                 if e.code in (404, 422):  # the commit is gone, and its check runs with it
                     continue

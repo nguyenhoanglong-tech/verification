@@ -147,8 +147,26 @@ class MonthRecords(unittest.TestCase):
             got = fakes.github.month_records("o/r", fakes.ENV["GITHUB_WORKFLOW_REF"], Budget.NOW)
         self.assertEqual(budget_base(got, Budget.NOW), (3, 30.0))
         paths = [p for _, p, _ in fake.calls]
-        self.assertIn("repos/o/r/actions/workflows/caller.yml/runs?created=%3E%3D2026-11-01&per_page=100&page=1", paths)
+        self.assertIn("repos/o/r/actions/workflows/caller.yml/runs?created=%3E%3D2026-10-31T18:00:00Z&per_page=100&page=1", paths)
         self.assertFalse(any("commits/old/" in p for p in paths), "runs older than the span are not read")
+
+    def test_a_pull_request_target_run_is_read_on_the_head_its_run_name_gives(self):
+        """Under pull_request_target a run's head_sha is the base tip; the caller's run-name carries the PR head."""
+        head = "a" * 40
+        fake = fakes.GitHub(workflow_runs=[{"head_sha": "base", "display_title": f"verification {head}",
+                                            "created_at": "2026-11-18T12:00:00Z"}],
+                            checks={head: [fakes.check(1, self.paid(4, 40.0), "2026-11-18T12:20:00Z")]})
+        with fakes.installed(fake):
+            got = fakes.github.month_records("o/r", fakes.ENV["GITHUB_WORKFLOW_REF"], Budget.NOW)
+        self.assertEqual(budget_base(got, Budget.NOW), (4, 40.0))
+
+    def test_a_run_started_before_the_month_still_counts(self):
+        """A run created at 23:55 on the last day posts its record (and its spend) after midnight."""
+        fake = fakes.GitHub(workflow_runs=[{"head_sha": "late", "created_at": "2026-10-31T23:55:00Z"}],
+                            checks={"late": [fakes.check(1, self.paid(1, 2.0), "2026-11-01T00:05:00Z")]})
+        with fakes.installed(fake):
+            got = fakes.github.month_records("o/r", fakes.ENV["GITHUB_WORKFLOW_REF"], datetime(2026, 11, 1, 1, 0, tzinfo=timezone.utc))
+        self.assertEqual(budget_base(got, datetime(2026, 11, 1, 1, 0, tzinfo=timezone.utc)), (1, 2.0))
 
     def test_an_unreadable_workflow_ref_raises(self):
         with self.assertRaises(RuntimeError):
@@ -278,6 +296,13 @@ class Post(unittest.TestCase):
         self.assertEqual([p for _, p, _ in writes], ["repos/o/r/check-runs/7"])
         record = parse_text(writes[0][2]["output"]["text"])
         self.assertEqual((record["verdict"], record["findings"]), ("FAIL", []))
+
+    def test_a_rerun_gate_job_never_patches_a_finished_check(self):
+        """Re-running only the gate job keeps the start job's check_id; that check already holds attempt 1's record."""
+        first, _ = run(review={"findings": [bug("P0")], "spec": None, "cost_usd": 2.5})
+        fake = fakes.GitHub(checks={"h": [fakes.check(7, first)]})
+        _, _, writes = self.post(fake, self.needs())
+        self.assertEqual([(m, p) for m, p, _ in writes], [("POST", "repos/o/r/check-runs")])
 
     def test_output_over_the_limit_is_trimmed_and_still_parses(self):
         findings = [{**bug("P0"), "summary": "s" * 150, "failure": "f" * 300} for _ in range(2000)]

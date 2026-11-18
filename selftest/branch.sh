@@ -41,6 +41,7 @@ gh api "repos/$repo/git/refs" -f "ref=refs/heads/$base" -f "sha=$(tip verify/att
 # runs the gate from the named branch. pull_request_target would read only the default branch (D24).
 put "$base" .github/workflows/selftest-branch.yml "selftest: call gate.yml@$branch" "# Written by selftest/branch.sh. PRs into $base run the gate from engine branch $branch.
 name: verification
+run-name: verification \${{ github.event.pull_request.head.sha }}
 on:
   pull_request:
     types: [opened, synchronize, reopened]

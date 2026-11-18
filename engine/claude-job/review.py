@@ -85,7 +85,7 @@ def outcome(proc_rc: int, stdout: str, stderr: str) -> tuple[dict | None, str]:
     """(CLI result, failure text). Failure text is empty when the call ran and returned a result."""
     result = last_json(stdout)
     if not isinstance(result, dict):
-        return None, f"no result from the CLI (exit {proc_rc}): {stderr[-500:]}"
+        return None, f"no result from the CLI (exit {proc_rc}): {stdout[-300:]} {stderr[-500:]}"
     if result.get("is_error") or proc_rc != 0:
         return result, f"{result.get('subtype', '')} {result.get('result', '')} {stderr[-300:]}".strip()
     # /code-review runs as a forked skill: an API error inside it comes back as result text with is_error false

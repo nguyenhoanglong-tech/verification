@@ -50,15 +50,20 @@ jobs:
           repo, base_ref = os.environ["GITHUB_REPOSITORY"], os.environ["BASE_REF"]
           # The base branch tip when this run started, resolved once here; every later job takes it from this output.
           # Not github.sha: that is the default-branch tip under pull_request_target and the merge commit under
-          # pull_request. Not the PR event's base, which can be stale.
-          if not base_ref or not all(c.isalnum() or c in "._/-" for c in base_ref):
-              sys.exit(f"::error::base ref name is not plain enough to look up: {base_ref}")
-          base_sha = github.api(f"repos/{repo}/git/ref/heads/{base_ref}")["object"]["sha"]
-          print(f"base {base_sha}")
-          run = github.api(f"repos/{os.environ['GITHUB_REPOSITORY']}/check-runs", "POST", {
-              "name": "verification", "head_sha": os.environ["HEAD_SHA"], "status": "in_progress",
-              "output": {"title": "running", "summary": f"The verification gate is running on {os.environ['HEAD_SHA']}."}})
-          open(os.environ["GITHUB_OUTPUT"], "a").write(f"check_id={run['id']}\nbase_sha={base_sha}\n")
+          # pull_request. Not the PR event's base, which can be stale. A fault here ends the job green with no
+          # outputs: the tier job then reports the error and the gate posts it (neutral in shadow), never a red job.
+          try:
+              if not base_ref or not all(c.isalnum() or c in "._/-" for c in base_ref):
+                  raise ValueError(f"base ref name is not plain enough to look up: {base_ref}")
+              base_sha = github.api(f"repos/{repo}/git/ref/heads/{base_ref}")["object"]["sha"]
+              print(f"base {base_sha}")
+              run = github.api(f"repos/{repo}/check-runs", "POST", {
+                  "name": "verification", "head_sha": os.environ["HEAD_SHA"], "status": "in_progress",
+                  "output": {"title": "running", "summary": f"The verification gate is running on {os.environ['HEAD_SHA']}."}})
+          except Exception as x:
+              print(f"::error::start: {type(x).__name__}: {x}")
+          else:
+              open(os.environ["GITHUB_OUTPUT"], "a").write(f"check_id={run['id']}\nbase_sha={base_sha}\n")
           PY
 
   tier:

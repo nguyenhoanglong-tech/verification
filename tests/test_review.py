@@ -33,6 +33,8 @@ class Failures(unittest.TestCase):
 
     def test_outcome(self):
         self.assertEqual(outcome(1, "", "boom")[1][:22], "no result from the CLI")
+        plain = "API Error: 400 You have reached your specified API usage limits. You will regain access on 2026-12-01."
+        self.assertEqual(failure_kind(outcome(1, plain, "")[1]), "budget", "the CLI's plain error text is read too")
         result, failure = outcome(0, json.dumps({"is_error": True, "subtype": "success", "result": "API Error: 400"}), "")
         self.assertIn("API Error: 400", failure)
         self.assertEqual(outcome(0, json.dumps({"is_error": False, "result": "[]"}), "")[1], "")

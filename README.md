@@ -4,6 +4,9 @@ The engine behind the merge gate described in chrislongnguyen/dotfiles `claude/d
 
 A repo opts in with a thin `pull_request_target` caller on its default branch that calls
 `.github/workflows/gate.yml` pinned by commit SHA, plus `.github/verification.toml` (see `examples/`).
+The caller sets `run-name: verification ${{ github.event.pull_request.head.sha }}` and grants `actions: read`:
+under `pull_request_target` a run's own head SHA is the base tip, so the budget read finds each run's records
+through the head SHA in its name.
 The gate computes the tiers a PR owes from its diff (`engine/tier.py`), runs the owed checks with the
 PR head checked out as data, and posts one check run named `verification` from GitHub Actions.
 

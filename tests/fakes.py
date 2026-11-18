@@ -1,6 +1,7 @@
 """A stand-in for the GitHub API, so post(), github_main() and the review run end to end in a test."""
 import io
 import os
+import re
 import sys
 import urllib.error
 from contextlib import contextmanager, redirect_stdout
@@ -45,6 +46,10 @@ class GitHub:
             return {"files": self.files}
         if "/actions/workflows/" in path:
             return {"workflow_runs": self.workflow_runs}
+        if method == "GET" and re.fullmatch(r"repos/[^/]+/[^/]+/check-runs/\d+", path):
+            own = int(path.rsplit("/", 1)[1])
+            return next((c for runs in self.checks.values() for c in runs if c["id"] == own),
+                        {"id": own, "status": "in_progress"})
         if "/check-runs?" in path:
             return {"check_runs": self.checks.get(path.split("/commits/")[1].split("/")[0], [])}
         if path == "graphql":
