@@ -9,11 +9,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - name: OIDC claims (claims only, never the token)
         run: |
           t=$(curl -fsS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://api.anthropic.com" | jq -r .value)
           python3 -c 'import sys,json,base64; p=sys.argv[1].split(".")[1]; c=json.loads(base64.urlsafe_b64decode(p+"="*(-len(p)%4))); print("CLAIMS", json.dumps({k:c.get(k) for k in ["event_name","repository_owner_id","repository_id","actor_id","job_workflow_ref","workflow_ref","ref","aud"]}))' "$t"
-      - uses: anthropics/claude-code-action@cc98b3ae241b0fcfb6a42a2690751afffecb4452
+      - id: claude
+        continue-on-error: true
+        uses: anthropics/claude-code-action@cc98b3ae241b0fcfb6a42a2690751afffecb4452
         with:
           prompt: "Reply with the single word ok."
           claude_args: "--max-budget-usd 0.05 --max-turns 1"
@@ -22,3 +27,11 @@ jobs:
           anthropic_organization_id: 9661d981-ce74-4832-bd6f-92048d9aea93
           anthropic_service_account_id: svac_01Vrgh4uDhqvqr6iLQsaxMyZ
           anthropic_workspace_id: wrkspc_018nwehRHTcTJ5ihWRdjWnVy
+      - name: Exchange result (the run's result text, never the token)
+        if: always()
+        env:
+          EXEC_FILE: ${{ steps.claude.outputs.execution_file }}
+          OUTCOME: ${{ steps.claude.outcome }}
+        run: |
+          echo "OUTCOME $OUTCOME"
+          [ -s "$EXEC_FILE" ] && jq -c '[.[] | select(.type == "result")][-1] | {is_error, total_cost_usd, result}' "$EXEC_FILE" | sed 's/^/RESULT /' || echo "RESULT none"
