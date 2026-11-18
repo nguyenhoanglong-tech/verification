@@ -19,6 +19,9 @@ import sys
 import tempfile
 import time
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "engine"))
+from verdict import parse_text  # noqa: E402
+
 ACTIONS_APP = 15368
 CALC = "verify-attack/calc.py"
 
@@ -87,7 +90,7 @@ ATTACKS = {
     "GATE": dict(title="PR edits the gate caller (judged by the old gate as T2)", expect="block", tiers="T2",
                  files={".github/workflows/verification.yml": lambda o: o.replace("cancel-in-progress: true", "cancel-in-progress: false") + "\n# tidy\n",
                         CALC: lambda o: o + BREAK}),
-    "CANCEL": dict(title="T2 PR whose run is cancelled before blast radius finishes", expect="block", tiers="T2",
+    "CANCEL": dict(title="T2 PR whose run is cancelled before the review finishes", expect="block", tiers="T2",
                    files={".github/verify-attack-touch.txt": "risk path touch\n", CALC: lambda o: o + CLEAN.replace("sub", "sub3")},
                    after=["cancel"]),
 }
@@ -146,6 +149,7 @@ def snapshot(repo, pr, label):
     return {"label": label, "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "pr": pv,
             "check_runs": [{"name": r["name"], "conclusion": r["conclusion"], "status": r["status"], "head_sha": r["head_sha"],
                             "app_id": r["app"]["id"], "title": (r.get("output") or {}).get("title"),
+                            "text": (r.get("output") or {}).get("text"),
                             "summary": (r.get("output") or {}).get("summary"), "url": r["html_url"]} for r in runs],
             "statuses": [{"context": s["context"], "state": s["state"], "creator": s["creator"]["login"]} for s in statuses]}
 
@@ -177,9 +181,9 @@ def run_attack(repo, base, name, spec, stamp):
             for _ in range(60):
                 jobs = [j for r in api(f"repos/{repo}/actions/runs?head_sha={sha}")["workflow_runs"]
                         for j in api(f"repos/{repo}/actions/runs/{r['id']}/jobs")["jobs"]]
-                blast = [j for j in jobs if j["name"].endswith("/ blast") and j["status"] == "in_progress"]
-                if blast:
-                    cancelled = blast[0]["run_id"]
+                review = [j for j in jobs if j["name"].endswith("/ review") and j["status"] == "in_progress"]
+                if review:
+                    cancelled = review[0]["run_id"]
                     gh("run", "cancel", str(cancelled), "-R", repo, check=False)
                     break
                 time.sleep(10)
@@ -239,8 +243,8 @@ def judge(rec):
     else:
         if merged:
             return False, "merged although the attack should be refused"
-        if spec.get("review_blocks") and not any("review:" in (g["summary"] or "") and " 0 blocking" not in (g["summary"] or "")
-                                                 for g in gates):
+        if spec.get("review_blocks") and not any(f["call"] == "bugs" and f["severity"] == "P0"
+                                                 for g in gates for f in (parse_text(g.get("text")) or {}).get("findings", [])):
             return False, "the review itself did not block"
         if "tiers" in spec and gates and not (gates[0]["title"] or "").startswith(spec["tiers"] + " "):
             return False, f"expected tiers {spec['tiers']}, got {gates[0]['title']}"

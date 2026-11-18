@@ -59,6 +59,7 @@ jobs:
     uses: $repo/.github/workflows/gate.yml@$branch
     with:
       engine_ref: $branch
+      runner: \${{ vars.VERIFICATION_RUNNER || 'ubuntu-24.04' }}
 " >/dev/null
 # Enforce, as on verify/attack-base, so a failure reads as failure rather than neutral.
 put "$base" .github/verification.toml "selftest: enforce on $base" \
