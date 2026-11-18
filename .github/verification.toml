@@ -1,7 +1,6 @@
 # The engine repo tests itself: PRs into verify/attack-base run the gate from the dev branch (selftest.yml).
 mode = "observe"
 enforce_branches = ["verify/attack-base"]
-allowed_bots = []
 
 [anthropic]
 federation_rule_id = "fdrl_01WTdkUmqUXTurXtkDaerJwR"

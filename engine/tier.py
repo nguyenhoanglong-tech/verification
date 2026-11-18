@@ -145,7 +145,6 @@ def github_main() -> None:
         "checks": json.dumps(config.get("check", [])),
         "has_checks": "true" if config.get("check") else "false",
         "anthropic": json.dumps(config.get("anthropic", {})),
-        "allowed_bots": ",".join(config.get("allowed_bots", [])),
     }
     print(json.dumps({"head": head_sha, "base": base_sha, **outputs}, indent=2))
     with open(os.environ["GITHUB_OUTPUT"], "a") as out:
