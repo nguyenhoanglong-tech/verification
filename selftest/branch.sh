@@ -23,7 +23,8 @@ put() { # branch path message content
 raw() { gh api "repos/$repo/contents/$2?ref=$1" -H "Accept: application/vnd.github.raw"; }
 
 if [ "$cmd" = stop ]; then
-  for pr in $(gh pr list -R "$repo" --head "$head" --base "$base" --state open --json number --jq '.[].number'); do
+  for pr in $(gh pr list -R "$repo" --head "$head" --base "$base" --state open --json number,headRepositoryOwner \
+      --jq ".[] | select(.headRepositoryOwner.login == \"${repo%%/*}\") | .number"); do
     gh pr close "$pr" -R "$repo" --comment "Self-test finished."
   done
   for ref in "$head" "$base"; do
@@ -32,6 +33,8 @@ if [ "$cmd" = stop ]; then
   exit 0
 fi
 
+# The caller names the engine as @$branch, which GitHub resolves to a tag first if one shares the name.
+if gh api "repos/$repo/git/ref/tags/$branch" >/dev/null 2>&1; then echo "a tag named $branch exists; rename the branch" >&2; exit 2; fi
 echo "engine branch $branch at $(tip "$branch")"
 gh api "repos/$repo/git/refs" -f "ref=refs/heads/$base" -f "sha=$(tip verify/attack-base)" --jq .object.sha >/dev/null
 # GitHub reads pull_request workflows from the PR's merge commit, so this caller, committed to the base,
