@@ -49,25 +49,34 @@ def last_json(text: str):
     return None
 
 
-FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+FENCE = re.compile(r"^( {0,3})(`{3,}|~{3,})(.*)$")
+CONTAINER = re.compile(r"^ {0,3}([-+*]([ \t]|$)|\d{1,9}[.)]([ \t]|$)|>)")
 
 
 def final_block(text: str) -> tuple[str, str] | None:
     """(info string, content) of the fenced code block that ends text, found by CommonMark's fence rules: a fence
     is 3+ backticks or tildes indented at most 3 spaces; it closes on a fence of the same character, at least as
-    long, with nothing after it. None when text does not end with a closed fenced block."""
-    lines = (text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
-    while lines and not lines[-1].strip():
+    long, followed only by spaces or tabs; content lines lose up to the opener's indent. None when text does not
+    end with a closed fenced block. Lists, block quotes and HTML blocks are not parsed: outside a fence, a line that
+    could start an HTML block ("<") makes the reply an ERROR, and a list or quote does too once any fence line is
+    indented."""
+    lines = (text or "").replace("\r\n", "\n").replace("\r", "\n").replace("\0", "\ufffd").split("\n")
+    while lines and not lines[-1].strip(" \t"):
         lines.pop()
-    opener, last = None, None
+    opener, last, container, indented = None, None, False, False
     for i, line in enumerate(lines):
         m = FENCE.match(line)
         if opener is None:
-            if m and not (m[1][0] == "`" and "`" in m[2]):
-                opener = (m[1], m[2].strip(), i)
-        elif m and m[1][0] == opener[0][0] and len(m[1]) >= len(opener[0]) and not m[2].strip():
-            last, opener = (opener[1], "\n".join(lines[opener[2] + 1:i]), i), None
-    if opener is not None or last is None or last[2] != len(lines) - 1:
+            if m and not (m[2][0] == "`" and "`" in m[3]):
+                opener, indented = (m[2], m[3].strip(), i, len(m[1])), indented or bool(m[1])
+            elif re.match(r" {0,3}<", line):
+                return None
+            elif CONTAINER.match(line):
+                container = True
+        elif m and m[2][0] == opener[0][0] and len(m[2]) >= len(opener[0]) and not m[3].strip(" \t"):
+            body = [re.sub(f"^ {{0,{opener[3]}}}", "", x) for x in lines[opener[2] + 1:i]]
+            last, opener, indented = (opener[1], "\n".join(body), i), None, indented or bool(m[1])
+    if opener is not None or last is None or last[2] != len(lines) - 1 or (container and indented):
         return None
     return last[0], last[1]
 

@@ -289,6 +289,26 @@ class Bugs(unittest.TestCase):
         text = ('```json findings\n[{"file": "a.py", "line": 3, "summary": "s", "severity": "P1"}]\n`````')
         self.assertEqual([f["line"] for f in bugs_findings({"result": text}, HEAD)], [3])
 
+    def test_closing_fence_followed_by_a_no_break_space_does_not_close(self):
+        with self.assertRaises(ValueError):
+            bugs_findings({"result": "```json\n[]\n```\xa0"}, HEAD)
+
+    def test_nul_and_opener_indent_follow_commonmark(self):
+        self.assertEqual(review.final_block(" ```json\n []\n```"), ("json", "[]"))
+        text = '```json\n[{"file": "a.py", "line": 1, "summary": "a\x00b", "severity": "P1"}]\n```'
+        self.assertEqual([f["summary"] for f in bugs_findings({"result": text}, HEAD)], ["a\ufffdb"])
+
+    def test_list_quote_or_html_with_an_indented_fence_is_an_error(self):
+        for text in ('<!--\n```json\n[]\n```', '<div>\n\n```json\n[]\n```', '- item\n  ~~~json\n[]\n~~~',
+                     '> q\n```json\n[]\n  ```'):
+            with self.assertRaises(ValueError, msg=text):
+                bugs_findings({"result": text}, HEAD)
+
+    def test_review_with_a_bullet_list_then_the_block_at_column_0_is_read(self):
+        text = ('- **P0** a.py:1 off by one\n> quoted line\n\n```json\n'
+                '[{"file": "a.py", "line": 1, "summary": "<b>", "severity": "P0"}]\n```')
+        self.assertEqual([f["file"] for f in bugs_findings({"result": text}, HEAD)], ["a.py"])
+
     def test_finding_without_a_file_is_malformed(self):
         for item in ({"summary": "example"}, {"summary": "s", "file": ""}, {"summary": "s", "file": HEAD + "/"}):
             with self.assertRaises(ValueError, msg=item):
