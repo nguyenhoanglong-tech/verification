@@ -94,4 +94,6 @@ def outside_stop_commands(log: str, needle: str) -> list[str]:
             token = None
         elif needle in line and token is None:
             out.append(line)
+    if token is not None:
+        out.append(f"block never closed: {token}")
     return out

@@ -50,17 +50,16 @@ def last_json(text: str):
 
 
 def findings_list(text: str) -> list | None:
-    """The findings array in /code-review's reply: the last ```json block that holds a list, else the last line that
-    parses to one. An untagged fence or a JSON object is never the findings."""
-    blocks = re.findall(r"```json[ \t]*\n(.*?)\n```", text or "", re.S)
-    for group in (blocks, (text or "").strip().splitlines()):
-        for chunk in reversed(group):
-            try:
-                value = json.loads(chunk)
-            except ValueError:
-                continue
-            if isinstance(value, list):
-                return value
+    """The findings array in /code-review's reply: the last ```json block that holds a list. Nothing outside a
+    ```json block is read, so a reply that breaks the required format is an ERROR, never a guess."""
+    blocks = re.findall(r"```json[ \t]*\n(.*?)\n[ \t]*```", (text or "").replace("\r\n", "\n"), re.S)
+    for chunk in reversed(blocks):
+        try:
+            value = json.loads(chunk)
+        except ValueError:
+            continue
+        if isinstance(value, list):
+            return value
     return None
 
 

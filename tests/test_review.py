@@ -101,7 +101,7 @@ class SpecBudget(unittest.TestCase):
     def test_spec_call_skipped_when_the_pace_is_reached_after_the_bugs_call(self):
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         records = [(now, {"budget": {"reviews_today": 5, "month_usd": 10.0}})]
-        bugs = json.dumps({"is_error": False, "result": "[]", "structured_output": {"findings": []}, "total_cost_usd": 1.5})
+        bugs = json.dumps({"is_error": False, "result": "```json\n[]\n```", "total_cost_usd": 1.5})
         calls = []
 
         def claude(args, prompt, token_file, home):
@@ -175,6 +175,7 @@ class BugsCall(unittest.TestCase):
         self.assertTrue(prompt.startswith("/code-review medium "), prompt[:40])
         self.assertIn("exactly one fenced ```json block", prompt)
         self.assertIn("`[]` when there are none", prompt)
+        self.assertIn("The block holds a JSON array of your findings", prompt)
         for field in ("severity", "file", "line", "summary", "failure_scenario"):
             self.assertIn(f'"{field}"', prompt)
 
@@ -186,7 +187,7 @@ class BugsCall(unittest.TestCase):
                          [("a.py", 5, "P0", "off by one")])
 
     def test_record_keeps_the_spec_result_when_both_calls_run(self):
-        text = f'Shape:\n```json\n{{"file": "x", "line": 1}}\n```\n{json.dumps([self.FINDING])}'
+        text = f'Shape:\n```json\n{{"file": "x", "line": 1}}\n```\n```json\n{json.dumps([self.FINDING])}\n```'
         _, out, _ = self.run_in_tmp(text)
         self.assertIsNone(out["error"])
         self.assertEqual([f["file"] for f in out["findings"]], ["a.py"])
@@ -242,10 +243,22 @@ class Bugs(unittest.TestCase):
                 '{"file": "b.py", "line": 2, "summary": "s2", "severity": "P0"}\n]\n```\nDone.')
         self.assertEqual([f["file"] for f in bugs_findings({"result": text}, HEAD)], ["a.py", "b.py"])
 
-    def test_fenced_object_then_findings_array_on_its_own_line(self):
+    def test_fenced_object_then_fenced_findings_array(self):
         text = ('Each finding looks like:\n```json\n{"file": "x.py", "line": 1}\n```\n'
-                '[{"file": "a.py", "line": 3, "summary": "s", "severity": "P1"}]')
+                '```json\n[{"file": "a.py", "line": 3, "summary": "s", "severity": "P1"}]\n```')
         self.assertEqual([(f["file"], f["line"]) for f in bugs_findings({"result": text}, HEAD)], [("a.py", 3)])
+
+    def test_crlf_fenced_array_over_several_lines(self):
+        text = ('Findings:\r\n```json\r\n[\r\n{"file": "a.py", "line": 7, "summary": "s", "severity": "P0"}\r\n]\r\n```'
+                '\r\n')
+        self.assertEqual([(f["file"], f["line"]) for f in bugs_findings({"result": text}, HEAD)], [("a.py", 7)])
+
+    def test_json_outside_a_json_fence_is_never_a_finding(self):
+        for text in ('```text\n[{"file": "x.py", "line": 1, "summary": "example"}]\n```',
+                     '[{"file": "a.py", "line": 3, "summary": "s", "severity": "P1"}]',
+                     'No findings.\n[]'):
+            with self.assertRaises(ValueError, msg=text):
+                bugs_findings({"result": text}, HEAD)
 
     def test_untagged_empty_fence_does_not_hide_the_findings(self):
         text = ('```json\n[{"file": "a.py", "line": 5, "summary": "s", "severity": "P0"}]\n```\n'
@@ -258,7 +271,7 @@ class Bugs(unittest.TestCase):
                 bugs_findings({"result": f"```json\n{json.dumps([item])}\n```"}, HEAD)
 
     def test_empty_and_unparseable(self):
-        self.assertEqual(bugs_findings({"result": "No findings.\n[]"}, HEAD), [])
+        self.assertEqual(bugs_findings({"result": "No findings.\n```json\n[]\n```"}, HEAD), [])
         with self.assertRaises(ValueError):
             bugs_findings({"result": "I could not review this."}, HEAD)
 
