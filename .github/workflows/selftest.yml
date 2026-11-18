@@ -12,10 +12,13 @@ concurrency:
 jobs:
   verification:
     permissions:
+      actions: read
       contents: read
       checks: write
+      issues: read
       pull-requests: write
       id-token: write
     uses: nguyenhoanglong-tech/verification/.github/workflows/gate.yml@dev
     with:
       engine_ref: dev
+      runner: ${{ vars.VERIFICATION_RUNNER || 'ubuntu-24.04' }}

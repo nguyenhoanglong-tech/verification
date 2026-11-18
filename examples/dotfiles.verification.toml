@@ -1,8 +1,9 @@
 # .github/verification.toml for chrislongnguyen/dotfiles. The engine reads it from the PR's base SHA.
-mode = "observe"                        # observe | enforce (D10, D27)
+mode = "shadow"                         # shadow | enforce (D10, D27)
 enforce_branches = ["verify/attack-base"]   # the attack suite's guarded base
-allowed_bots = []
-observe_sample = 10                     # observe mode: Claude checks on 1 PR in 10 (API credit cap)                       # the D20 App bot, once it exists
+live_checks = "owed"                    # machine | owed: what a base that is not enforced runs (D27)
+reviews_per_day = 5                     # paid reviews per UTC day; 0 turns paid reviews off (D21)
+budget_month_usd = 100                  # the gate's own review spend per calendar month (D21)
 
 [anthropic]                             # personal org (D17)
 federation_rule_id = "fdrl_011Xnhp64qZrrs3D8z49fbSJ"
@@ -10,11 +11,11 @@ organization_id = "9661d981-ce74-4832-bd6f-92048d9aea93"
 service_account_id = "svac_01Vrgh4uDhqvqr6iLQsaxMyZ"
 workspace_id = "wrkspc_018nwehRHTcTJ5ihWRdjWnVy"
 
-[review]                                # D8
-t1_model = "claude-sonnet-5-5"
+[review]                                # D8; standards = "CODING_STANDARDS.md" by default
+t1_model = "claude-opus-5-5"
 t1_level = "medium"
 t2_model = "claude-opus-5-5"
-t2_level = "high"
+t2_level = "medium"
 
 [tiers]                                 # D7, D22
 t2_lines = 300
