@@ -22,7 +22,7 @@ selftest/branch.sh start my-branch               # docs-only probe (T0); add --c
 gh run list -R nguyenhoanglong-tech/verification --branch selftest-pr/my-branch --workflow selftest-branch.yml
 # the gate job log prints: Uses: nguyenhoanglong-tech/verification/.github/workflows/gate.yml@refs/heads/my-branch (<sha>)
 selftest/branch.sh stop my-branch                # closes the PR, deletes selftest-pr/my-branch and verify/selftest/my-branch
-git push origin --delete my-branch               # if the branch was only for the test
+gh api -X DELETE repos/nguyenhoanglong-tech/verification/git/refs/heads/my-branch   # if it was only for the test; the local pre-push hook refuses unmerged deletes
 ```
 
 To test more commits, push them to `my-branch` and push any change to `selftest-pr/my-branch`; each new
