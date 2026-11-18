@@ -39,9 +39,9 @@ def failure_kind(text: str) -> str:
 
 
 def last_json(text: str):
-    """The last JSON value in a CLI or model output: a ```json block, else the last line that parses."""
+    """The last JSON value in the CLI's output: the last line or ```json block that parses."""
     blocks = re.findall(r"```(?:json)?\s*\n(.*?)\n```", text or "", re.S)
-    for chunk in [*reversed(blocks), *reversed((text or "").strip().splitlines())]:
+    for chunk in reversed(blocks + (text or "").strip().splitlines()):
         try:
             return json.loads(chunk)
         except ValueError:
@@ -49,17 +49,32 @@ def last_json(text: str):
     return None
 
 
+def findings_list(text: str) -> list | None:
+    """The findings array in /code-review's reply: the last ```json block that holds a list, else the last line that
+    parses to one. An untagged fence or a JSON object is never the findings."""
+    blocks = re.findall(r"```json[ \t]*\n(.*?)\n```", text or "", re.S)
+    for group in (blocks, (text or "").strip().splitlines()):
+        for chunk in reversed(group):
+            try:
+                value = json.loads(chunk)
+            except ValueError:
+                continue
+            if isinstance(value, list):
+                return value
+    return None
+
+
 def bugs_findings(result: dict, head_dir: str) -> list[dict]:
     """/code-review returns a JSON array in its result text. A finding with no valid severity is a P0: D8's review
     base counts every bug-hunt finding."""
-    items = last_json(result.get("result", ""))
+    items = findings_list(result.get("result", ""))
     if not isinstance(items, list):
         raise ValueError("no findings list in the Bugs call's output")
     findings = []
     for x in items:
-        if not isinstance(x, dict) or not x.get("summary"):
+        path = str(x.get("file") or "").removeprefix(head_dir.rstrip("/") + "/") if isinstance(x, dict) else ""
+        if not path or not x.get("summary"):
             raise ValueError(f"malformed finding: {str(x)[:200]}")
-        path = str(x.get("file", "")).removeprefix(head_dir.rstrip("/") + "/")
         line = x.get("line")
         if x.get("severity") not in SEVERITIES:
             log_data(f"bugs: a finding had no valid severity ({x.get('severity')!r}); counted as P0")
