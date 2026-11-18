@@ -1,1 +1,1 @@
-Self-test probe for selftest/b1.
+Self-test probe, second push.
