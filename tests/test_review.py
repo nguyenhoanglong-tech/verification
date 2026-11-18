@@ -77,6 +77,20 @@ class Logging(unittest.TestCase):
         self.assertEqual(fakes.outside_stop_commands(log, "ISSUE-TEXT"), [])
         self.assertIn("ISSUE-TEXT", log)
 
+    def test_unparseable_output_is_logged_inside_stop_commands(self):
+        cli = json.dumps({"is_error": False, "subtype": "success", "num_turns": 0, "local_command": "code_review",
+                          "result": "MODEL-TEXT\n::error::x", "structured_output": None, "total_cost_usd": 0.13})
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {
+                "RUNNER_TEMP": tmp, "HEAD_DIR": tmp, "BASE_SHA": "b", "ANTHROPIC": "{}", "MODEL": "m",
+                "EFFORT": "medium"}), \
+                mock.patch.object(review, "prepare"), mock.patch.object(review, "exchange", return_value=""), \
+                mock.patch.object(review, "claude", lambda *a: (0, cli, "")):
+            out, log = fakes.run(review.main)
+        self.assertIn("unparseable output", out["error"])
+        self.assertIn("MODEL-TEXT", log)
+        self.assertIn('"local_command": "code_review"', log)
+        self.assertEqual(fakes.outside_stop_commands(log, "MODEL-TEXT"), [])
+
 
 class SpecBudget(unittest.TestCase):
     """Fix 7: the budget is read again right before the Spec call."""

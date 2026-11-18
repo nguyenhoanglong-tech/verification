@@ -229,6 +229,9 @@ def main() -> dict:
             else:
                 out["spec"] = {**spec_table(result), "sent": items}
         except ValueError as x:
+            fields = {k: result.get(k) for k in ("subtype", "num_turns", "local_command", "permission_denials",
+                                                 "structured_output")}
+            log_data(f"{name} call output: {json.dumps(fields)}\n{str(result.get('result', ''))[-4000:]}")
             out["error"] = f"{name} call: unparseable output: {x}"
             return out
     return out
