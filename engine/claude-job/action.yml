@@ -5,6 +5,7 @@ inputs:
   model: {required: true, description: Claude model id}
   effort: {required: true, description: reasoning effort}
   level: {required: false, default: medium, description: /code-review level}
+  base_sha: {required: true, description: the base branch tip the tier job diffed against}
   anthropic: {required: true, description: "JSON with federation_rule_id, organization_id, service_account_id, workspace_id"}
   prompt_files: {required: false, default: "", description: "comma-separated prompt files the tier job found (tp only)"}
   allowed_bots: {required: false, default: "", description: bots allowed to trigger the action}
@@ -34,7 +35,7 @@ runs:
         BUDGET: ${{ inputs.budget }}
         PR: ${{ github.event.pull_request.number }}
         HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        BASE_SHA: ${{ github.sha }}
+        BASE_SHA: ${{ inputs.base_sha }}
         ENGINE: ${{ github.action_path }}/..
         PROMPT_FILES: ${{ inputs.prompt_files }}
       run: |

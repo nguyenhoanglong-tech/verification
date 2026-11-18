@@ -12,8 +12,6 @@ on:
 permissions: {}
 env:
   HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-  # The base branch tip when this run started, not the PR event's recorded base, which can be stale.
-  BASE_SHA: ${{ github.sha }}
   BASE_REF: ${{ github.event.pull_request.base.ref }}
   PR_NUMBER: ${{ github.event.pull_request.number }}
 jobs:
@@ -40,6 +38,7 @@ jobs:
     permissions:
       contents: read
     outputs:
+      base_sha: ${{ steps.t.outputs.base_sha }}
       tiers: ${{ steps.t.outputs.tiers }}
       code_lines: ${{ steps.t.outputs.code_lines }}
       reasons: ${{ steps.t.outputs.reasons }}
@@ -66,7 +65,13 @@ jobs:
       - id: t
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 engine-src/engine/tier.py github
+        # The base branch tip when this run started. Not github.sha: that is the default-branch tip under
+        # pull_request_target and the merge commit under pull_request. Not the PR event's base, which can be stale.
+        run: |
+          set -euo pipefail
+          base_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$BASE_REF" --jq .object.sha)
+          echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
+          BASE_SHA=$base_sha python3 engine-src/engine/tier.py github
 
   head_archive:
     needs: tier
@@ -153,6 +158,7 @@ jobs:
           effort: ${{ needs.tier.outputs.review_effort }}
           level: ${{ needs.tier.outputs.review_level }}
           anthropic: ${{ needs.tier.outputs.anthropic }}
+          base_sha: ${{ needs.tier.outputs.base_sha }}
           allowed_bots: ${{ needs.tier.outputs.allowed_bots }}
           github_token: ${{ github.token }}
 
@@ -187,6 +193,7 @@ jobs:
           model: ${{ needs.tier.outputs.review_model }}
           effort: ${{ needs.tier.outputs.review_effort }}
           anthropic: ${{ needs.tier.outputs.anthropic }}
+          base_sha: ${{ needs.tier.outputs.base_sha }}
           allowed_bots: ${{ needs.tier.outputs.allowed_bots }}
           github_token: ${{ github.token }}
 
@@ -222,6 +229,7 @@ jobs:
           model: claude-sonnet-5-5
           effort: medium
           anthropic: ${{ needs.tier.outputs.anthropic }}
+          base_sha: ${{ needs.tier.outputs.base_sha }}
           allowed_bots: ${{ needs.tier.outputs.allowed_bots }}
           github_token: ${{ github.token }}
 
