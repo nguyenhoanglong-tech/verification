@@ -5,7 +5,8 @@ inputs:
   model: {required: true, description: Claude model id}
   effort: {required: true, description: reasoning effort}
   level: {required: false, default: medium, description: /code-review level}
-  anthropic: {required: true, description: "JSON with federation_rule_id, organization_id, service_account_id"}
+  anthropic: {required: true, description: "JSON with federation_rule_id, organization_id, service_account_id, workspace_id"}
+  prompt_files: {required: false, default: "", description: "comma-separated prompt files the tier job found (tp only)"}
   allowed_bots: {required: false, default: "", description: bots allowed to trigger the action}
   github_token: {required: true, description: the workflow's GITHUB_TOKEN}
   budget: {required: false, default: "3", description: max USD for this run}
@@ -33,13 +34,17 @@ runs:
         BUDGET: ${{ inputs.budget }}
         PR: ${{ github.event.pull_request.number }}
         HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        BASE_SHA: ${{ github.sha }}
         ENGINE: ${{ github.action_path }}/..
+        PROMPT_FILES: ${{ inputs.prompt_files }}
       run: |
+        echo "head=$(git -C pr-head rev-parse HEAD)" >> "$GITHUB_OUTPUT"
         git -C pr-head reset -q --soft "$(git -C pr-head merge-base HEAD "$BASE_SHA")"
         git -C pr-head diff --cached --stat | tail -1
-        prompt_files=$(git -C pr-head diff --cached --name-only | grep -E '(^|/)(SKILL|CLAUDE|AGENTS|PORTABLE)\.md$|^claude/rules/' | paste -sd, - || true)
-        PROMPT_FILES="$prompt_files" python3 - "$ENGINE" > "$RUNNER_TEMP/prompt.md" <<'PY'
+        # The files the result must say it read: every changed file, or for tp every prompt file.
+        if [ "$KIND" = tp ]; then tr , '\n' <<<"$PROMPT_FILES"; else git -C pr-head diff --cached --name-only; fi \
+          | grep . | sort -u > "$RUNNER_TEMP/$KIND-owed.txt" || true
+        python3 - "$ENGINE" > "$RUNNER_TEMP/prompt.md" <<'PY'
         import os, sys
         e = sys.argv[1] + "/prompts/"
         text = open(e + os.environ["KIND"] + ".md").read() + "\n" + open(e + "common.md").read()
@@ -49,11 +54,19 @@ runs:
         print(text)
         PY
         schema=$(jq -c . "$ENGINE/schema/$KIND.json")
-        tools='Read Grep Glob Bash(git -C pr-head diff:*) Bash(git -C pr-head log:*) Bash(git -C pr-head show:*) Bash(git -C pr-head status:*) Bash(git -C pr-head ls-files:*)'
+        # Comma-separated: the action splits --allowedTools on commas. dontAsk denies every tool not listed,
+        # so instructions planted in the diff cannot get anything run beyond reads and git queries.
+        tools='Read,Grep,Glob,Bash(git -C pr-head diff:*),Bash(git -C pr-head log:*),Bash(git -C pr-head show:*),Bash(git -C pr-head status:*),Bash(git -C pr-head ls-files:*)'
         {
-          echo "args=--model $MODEL --effort $EFFORT --max-budget-usd $BUDGET --add-dir pr-head --allowedTools \"$tools\" --json-schema '$schema'"
-          echo "prompt<<PROMPT_EOF"; cat "$RUNNER_TEMP/prompt.md"; echo "PROMPT_EOF"
+          echo "args=--model $MODEL --effort $EFFORT --max-budget-usd $BUDGET --add-dir pr-head --permission-mode dontAsk --allowedTools \"$tools\" --disallowedTools \"Edit,Write,NotebookEdit,WebFetch,WebSearch,Task\" --json-schema '$schema'"
+          d="EOF_$(openssl rand -hex 16)"
+          echo "prompt<<$d"; cat "$RUNNER_TEMP/prompt.md"; echo "$d"
         } >> "$GITHUB_OUTPUT"
+    - name: OIDC claims the federation rule sees (claims only, never the token)
+      shell: bash
+      run: |
+        t=$(curl -fsS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://api.anthropic.com" | jq -r .value)
+        cut -d. -f2 <<<"$t" | tr '_-' '/+' | base64 -d 2>/dev/null | jq -c '{sub, aud, repository_owner, repository_owner_id, job_workflow_ref, event_name}' || true
     - id: claude
       continue-on-error: true
       uses: anthropics/claude-code-action@cc98b3ae241b0fcfb6a42a2690751afffecb4452
@@ -65,26 +78,31 @@ runs:
         anthropic_federation_rule_id: ${{ fromJSON(inputs.anthropic).federation_rule_id }}
         anthropic_organization_id: ${{ fromJSON(inputs.anthropic).organization_id }}
         anthropic_service_account_id: ${{ fromJSON(inputs.anthropic).service_account_id }}
+        anthropic_workspace_id: ${{ fromJSON(inputs.anthropic).workspace_id }}
     - id: score
       if: always()
       shell: bash
       env:
-        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        HEAD_SHA: ${{ steps.prep.outputs.head }}
         KIND: ${{ inputs.kind }}
         OUTCOME: ${{ steps.claude.outcome }}
         STRUCTURED: ${{ steps.claude.outputs.structured_output }}
         EXEC_FILE: ${{ steps.claude.outputs.execution_file }}
       run: |
         cost=$( [ -s "$EXEC_FILE" ] && jq '[.[] | select(.type == "result")][-1].total_cost_usd // 0' "$EXEC_FILE" || echo 0)
-        if [ -n "$STRUCTURED" ] && jq -e '.findings | type == "array"' <<<"$STRUCTURED" >/dev/null 2>&1; then
+        # A pass needs a successful run, a structured result, and that result naming every owed file as read.
+        if [ "$OUTCOME" = success ] && [ -n "$STRUCTURED" ] \
+           && jq -e '(.findings | type == "array") and (.files_reviewed | type == "array")' <<<"$STRUCTURED" >/dev/null 2>&1; then
           blocking=$(jq '[.findings[] | select(.severity == "blocking")] | length' <<<"$STRUCTURED")
           minor=$(jq '[.findings[] | select(.severity == "minor")] | length' <<<"$STRUCTURED")
-          ok=$([ "$blocking" = 0 ] && echo true || echo false)
-          summary="$KIND: $blocking blocking, $minor minor"
+          unread=$(jq -r '.files_reviewed[]' <<<"$STRUCTURED" | sort -u | comm -23 "$RUNNER_TEMP/$KIND-owed.txt" - | wc -l | tr -d ' ')
+          ok=$([ "$blocking" = 0 ] && [ "$unread" = 0 ] && [ -s "$RUNNER_TEMP/$KIND-owed.txt" ] && echo true || echo false)
+          summary="$KIND: $blocking blocking, $minor minor, $unread owed files not reported read"
           jq -r '.findings[] | "- [\(.severity)] \(.file):\(.line // "") \(.summary)"' <<<"$STRUCTURED" > "$RUNNER_TEMP/$KIND-findings.md"
         else
           ok=false
-          summary="$KIND: no structured result (action outcome $OUTCOME)"
+          err=$( [ -s "$EXEC_FILE" ] && jq -r '[.[] | select(.type == "result")][-1].result // ""' "$EXEC_FILE" | head -c 300 | tr '\n' ' ' || true)
+          summary="$KIND: no structured result (action outcome $OUTCOME): $err"
           : > "$RUNNER_TEMP/$KIND-findings.md"
         fi
         echo "$summary cost=$cost head=$HEAD_SHA"

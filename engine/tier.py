@@ -54,6 +54,7 @@ class Result:
     tiers: list[str]
     code_lines: int
     reasons: list[str] = field(default_factory=list)
+    prompt_files: list[str] = field(default_factory=list)
 
 
 def classify(files: list[dict], rules: dict, truncated: bool = False) -> Result:
@@ -62,14 +63,14 @@ def classify(files: list[dict], rules: dict, truncated: bool = False) -> Result:
     for f in files:
         names = [f["filename"]] + ([f["previous_filename"]] if f.get("previous_filename") else [])
         lines = int(f.get("additions", 0)) + int(f.get("deletions", 0))
-        if any(matches(n, rules["prompt"]) for n in names):
+        prompt = any(matches(n, rules["prompt"]) for n in names)
+        risk = any(matches(n, rules["risk"]) for n in names)
+        if prompt:
             prompt_files.append(f["filename"])
-        elif all(matches(n, rules["docs"]) for n in names):
-            continue
-        elif any(matches(n, rules["risk"]) for n in names):
+        if risk:
             risk_files.append(f["filename"])
             code_lines += lines
-        else:
+        elif any(not matches(n, rules["prompt"]) and not matches(n, rules["docs"]) for n in names):
             code_files.append(f["filename"])
             code_lines += lines
 
@@ -86,13 +87,13 @@ def classify(files: list[dict], rules: dict, truncated: bool = False) -> Result:
     elif code_files:
         tiers.append("T1")
         reasons.append(f"{code_lines} code lines in {len(code_files)} files")
-    if prompt_files:
+    if prompt_files or truncated:
         tiers.append("TP")
-        reasons.append("prompt files: " + ", ".join(prompt_files[:5]))
+        reasons.append("prompt files: " + ", ".join(prompt_files[:5]) if prompt_files else "file list truncated: TP owed")
     if not tiers:
         tiers.append("T0")
         reasons.append("docs only")
-    return Result(tiers, code_lines, reasons)
+    return Result(tiers, code_lines, reasons, prompt_files)
 
 
 def gh_api(path: str, raw: bool = False) -> str:
@@ -103,16 +104,14 @@ def gh_api(path: str, raw: bool = False) -> str:
 
 
 def load_config(repo: str, base_sha: str) -> dict:
-    try:
-        text = gh_api(f"repos/{repo}/contents/.github/verification.toml?ref={base_sha}", raw=True)
-    except subprocess.CalledProcessError:
-        return {}
-    return tomllib.loads(text)
+    # No fallback: a config that cannot be read fails this job, and the gate fails closed on it.
+    return tomllib.loads(gh_api(f"repos/{repo}/contents/.github/verification.toml?ref={base_sha}", raw=True))
 
 
 def compare_files(repo: str, base_sha: str, head_sha: str) -> tuple[list[dict], bool]:
-    data = json.loads(gh_api(f"repos/{repo}/compare/{base_sha}...{head_sha}?per_page=300"))
-    files = data.get("files", [])
+    # The compare API returns at most 300 files, all on the first page (per_page pages commits, not files).
+    # A list that reaches 300 may be cut short, so the caller owes every tier.
+    files = json.loads(gh_api(f"repos/{repo}/compare/{base_sha}...{head_sha}")).get("files", [])
     return files, len(files) >= 300
 
 
@@ -125,14 +124,21 @@ def github_main() -> None:
     enforce = config.get("mode", "observe") == "enforce" or base_ref in config.get("enforce_branches", [])
     review = config.get("review", {})
     t2 = "T2" in result.tiers
+    sample = int(config.get("observe_sample", 1))
+    pr = int(os.environ.get("PR_NUMBER", "0"))
+    sampled = enforce or sample <= 1 or pr % sample == 0
+    if not sampled:
+        result.reasons.append(f"observe: Claude checks run on 1 PR in {sample}; this one was not sampled")
     outputs = {
         "tiers": " ".join(result.tiers),
         "code_lines": str(result.code_lines),
         "reasons": "; ".join(result.reasons),
         "enforce": "true" if enforce else "false",
-        "review": "true" if ("T1" in result.tiers or t2) else "false",
-        "blast": "true" if t2 else "false",
-        "tp": "true" if "TP" in result.tiers else "false",
+        "review": "true" if sampled and ("T1" in result.tiers or t2) else "false",
+        "blast": "true" if sampled and t2 else "false",
+        "tp": "true" if sampled and "TP" in result.tiers else "false",
+        "prompt_files": ",".join(re.sub(r"[^A-Za-z0-9/._-]", "", p) for p in result.prompt_files),
+        "sampled": "true" if sampled else "false",
         "review_model": review.get("t2_model" if t2 else "t1_model", "claude-opus-5-5" if t2 else "claude-sonnet-5-5"),
         "review_level": review.get("t2_level" if t2 else "t1_level", "high" if t2 else "medium"),
         "review_effort": review.get("effort", "medium"),
@@ -144,7 +150,7 @@ def github_main() -> None:
     print(json.dumps({"head": head_sha, "base": base_sha, **outputs}, indent=2))
     with open(os.environ["GITHUB_OUTPUT"], "a") as out:
         for k, v in outputs.items():
-            out.write(f"{k}={v}\n")
+            out.write(f"{k}={' '.join(v.split())}\n")  # file names may hold newlines; one line per output
 
 
 if __name__ == "__main__":

@@ -12,9 +12,28 @@ on:
 permissions: {}
 env:
   HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-  BASE_SHA: ${{ github.event.pull_request.base.sha }}
+  # The base branch tip when this run started, not the PR event's recorded base, which can be stale.
+  BASE_SHA: ${{ github.sha }}
   BASE_REF: ${{ github.event.pull_request.base.ref }}
+  PR_NUMBER: ${{ github.event.pull_request.number }}
 jobs:
+  start:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      checks: write
+    outputs:
+      check_id: ${{ steps.s.outputs.check_id }}
+    steps:
+      - id: s
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          id=$(gh api "repos/$GITHUB_REPOSITORY/check-runs" -f name=verification -f head_sha="$HEAD_SHA" \
+            -f status=in_progress -f "output[title]=running" -f "output[summary]=The verification gate is running on $HEAD_SHA." --jq .id)
+          echo "check_id=$id" >> "$GITHUB_OUTPUT"
+
   tier:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -28,6 +47,7 @@ jobs:
       review: ${{ steps.t.outputs.review }}
       blast: ${{ steps.t.outputs.blast }}
       tp: ${{ steps.t.outputs.tp }}
+      prompt_files: ${{ steps.t.outputs.prompt_files }}
       review_model: ${{ steps.t.outputs.review_model }}
       review_level: ${{ steps.t.outputs.review_level }}
       review_effort: ${{ steps.t.outputs.review_effort }}
@@ -35,6 +55,7 @@ jobs:
       has_checks: ${{ steps.t.outputs.has_checks }}
       anthropic: ${{ steps.t.outputs.anthropic }}
       allowed_bots: ${{ steps.t.outputs.allowed_bots }}
+      sampled: ${{ steps.t.outputs.sampled }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -91,7 +112,10 @@ jobs:
           for i in $(seq 0 $((n - 1))); do
             name=$(jq -r ".[$i].name" <<<"$CHECKS"); cmd=$(jq -r ".[$i].run" <<<"$CHECKS")
             echo "::group::$name: $cmd"
-            if (cd head && env -u GITHUB_TOKEN bash -c "$cmd"); then r=pass; else r=fail; ok=false; fi
+            # Head code runs in a throwaway container with no network and no view of the runner's files,
+            # so it cannot write this job's outputs or leave a process behind; only its exit code counts.
+            rm -rf work && cp -a head work
+            if docker run --rm --network none -v "$PWD/work:/w" -w /w python:3.12-bookworm bash -c "$cmd"; then r=pass; else r=fail; ok=false; fi
             echo "::endgroup::"
             echo "$name=$r"; summary="$summary $name=$r"
           done
@@ -194,6 +218,7 @@ jobs:
         uses: ./.verification-engine/engine/claude-job
         with:
           kind: tp
+          prompt_files: ${{ needs.tier.outputs.prompt_files }}
           model: claude-sonnet-5-5
           effort: medium
           anthropic: ${{ needs.tier.outputs.anthropic }}
@@ -202,8 +227,14 @@ jobs:
 
   gate:
     # The one result the ruleset reads. Posted as a check run named `verification` by GitHub Actions.
-    needs: [tier, head_archive, checks, review, blast, tp]
+    needs: [start, tier, head_archive, checks, review, blast, tp]
     if: always()
+    # One gate at a time per head, so each reads the verdicts the one before it wrote. queue: max keeps every
+    # waiting gate (up to 100); without it a newer gate cancels the waiting one and that run never posts.
+    concurrency:
+      group: verification-gate-${{ github.repository }}-${{ github.event.pull_request.head.sha }}
+      cancel-in-progress: false
+      queue: max
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -214,8 +245,10 @@ jobs:
           NEEDS: ${{ toJSON(needs) }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
         run: |
+          set -uo pipefail
           tier() { jq -r ".tier.outputs.$1 // empty" <<<"$NEEDS"; }
-          ok=true; why=()
+          ok=true; why=(); prior_fail=false
+          [ "$(jq -r .start.result <<<"$NEEDS")" = success ] || { ok=false; why+=("start job $(jq -r .start.result <<<"$NEEDS")"); }
           [ "$(jq -r .tier.result <<<"$NEEDS")" = success ] || { ok=false; why+=("tier job $(jq -r .tier.result <<<"$NEEDS")"); }
           owed() { # job, flag
             local job=$1 flag=$2 res; res=$(jq -r ".$job.result" <<<"$NEEDS")
@@ -232,17 +265,40 @@ jobs:
           owed blast "$(tier blast)"
           owed tp "$(tier tp)"
           cost=$(jq '[.review, .blast, .tp | .outputs.cost // "0" | tonumber] | add' <<<"$NEEDS")
-          ran=$(jq -r '[to_entries[] | select(.key != "gate" and .value.result == "success") | .key] | join(",")' <<<"$NEEDS")
+          ran=$(jq -r '[to_entries[] | select(.key != "start" and .value.result == "success") | .key] | join(",")' <<<"$NEEDS")
           tiers=$(tier tiers); enforce=$(tier enforce)
+          # Same-head runs share one verdict: a failure on this head is never replaced by a later pass.
+          runs=$(gh api --paginate "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/check-runs?check_name=verification&filter=all&per_page=100" \
+            --jq '.check_runs[] | select(.app.id == 15368)' | jq -s .) || { echo "cannot list verification runs"; exit 1; }
+          if [ "$(jq '[.[] | select(.conclusion == "failure")] | length' <<<"$runs")" != 0 ]; then
+            ok=false; prior_fail=true; why+=("an earlier verification run on this head failed")
+          fi
+          # Observe (neutral) only when the tier job said so and no run on this head failed; anything else fails closed.
           if $ok; then conclusion=success; title="$tiers passed"
-          elif [ "$enforce" = true ]; then conclusion=failure; title="$tiers blocked"
-          else conclusion=neutral; title="$tiers would block (observe)"; fi
-          stamp="Verified-by: $( [ "$tiers" = T0 ] && echo none-T0 || echo "$ran") head=$HEAD_SHA"
+          elif ! $prior_fail && [ "$enforce" = false ] && [ "$(jq -r .tier.result <<<"$NEEDS")" = success ]; then
+            conclusion=neutral; title="$tiers would block (observe)"
+          else conclusion=failure; title="${tiers:-tier unknown} blocked"; fi
+          stamp="Verified-by: $( [ "$tiers" = T0 ] && echo none-T0 || echo "$ran") head=$HEAD_SHA sampled=$(tier sampled)"
           details=$(jq -r '[.checks, .review, .blast, .tp | .outputs.summary // empty] | join("\n")' <<<"$NEEDS")
           summary=$(printf '%s\n\ntiers: %s (%s)\ncode lines: %s\nenforce: %s\ncost_usd: %s\nreasons not passed: %s\n\n%s\n\nrun: %s' \
             "$stamp" "$tiers" "$(tier reasons)" "$(tier code_lines)" "$enforce" "$cost" "${why[*]:-none}" "$details" "$RUN_URL")
           echo "$summary"; echo "conclusion=$conclusion"
-          gh api "repos/$GITHUB_REPOSITORY/check-runs" -f name=verification -f head_sha="$HEAD_SHA" \
-            -f status=completed -f conclusion="$conclusion" \
-            -f "output[title]=$title" -f "output[summary]=$summary" --jq '{id, app: .app.id, head_sha, conclusion}'
+          # Only a failure is copied onto other runs' checks. A pass touches this run's own check, so a sibling
+          # still in progress keeps blocking until its own gate has judged it.
+          if [ "$conclusion" = failure ]; then
+            ids=$(jq -r '.[].id' <<<"$runs"; jq -r '.start.outputs.check_id // empty' <<<"$NEEDS")
+          else
+            ids=$(jq -r '.start.outputs.check_id // empty' <<<"$NEEDS")
+          fi
+          ids=$(sort -u <<<"$ids" | grep . || true)
+          if [ -z "$ids" ]; then
+            gh api -X POST "repos/$GITHUB_REPOSITORY/check-runs" -f name=verification -f head_sha="$HEAD_SHA" \
+              -f status=completed -f conclusion="$conclusion" \
+              -f "output[title]=$title" -f "output[summary]=$summary" --jq '{id, app: .app.id, head_sha, conclusion}'
+          fi
+          for id in $ids; do
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/check-runs/$id" \
+              -f status=completed -f conclusion="$conclusion" \
+              -f "output[title]=$title" -f "output[summary]=$summary" --jq '{id, app: .app.id, head_sha, conclusion}'
+          done
           [ "$conclusion" != failure ]

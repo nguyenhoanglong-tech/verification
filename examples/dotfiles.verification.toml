@@ -1,12 +1,14 @@
 # .github/verification.toml for chrislongnguyen/dotfiles. The engine reads it from the PR's base SHA.
 mode = "observe"                        # observe | enforce (D10, D27)
 enforce_branches = ["verify/attack-base"]   # the attack suite's guarded base
-allowed_bots = []                       # the D20 App bot, once it exists
+allowed_bots = []
+observe_sample = 10                     # observe mode: Claude checks on 1 PR in 10 (API credit cap)                       # the D20 App bot, once it exists
 
 [anthropic]                             # personal org (D17)
 federation_rule_id = "fdrl_011Xnhp64qZrrs3D8z49fbSJ"
 organization_id = "9661d981-ce74-4832-bd6f-92048d9aea93"
 service_account_id = "svac_01Vrgh4uDhqvqr6iLQsaxMyZ"
+workspace_id = "wrkspc_018nwehRHTcTJ5ihWRdjWnVy"
 
 [review]                                # D8
 t1_model = "claude-sonnet-5-5"
@@ -16,8 +18,8 @@ t2_level = "high"
 
 [tiers]                                 # D7, D22
 t2_lines = 300
-docs = ["**/*.md", "**/*.txt", "**/*.svg", "**/*.mmd", "**/*.png", "LICENSE"]
-prompt = ["**/SKILL.md", "**/CLAUDE.md", "**/AGENTS.md", "claude/rules/**", "**/PORTABLE.md"]
+docs = ["**/*.md", "**/*.txt", "**/*.svg", "**/*.mmd", "**/*.png", "**/*.html", "claude/docs/receipts/**", "LICENSE"]
+prompt = ["**/SKILL.md", "**/CLAUDE.md", "**/AGENTS.md", "claude/rules/**", "**/PORTABLE.md", "claude/agents/*.md"]
 risk = [
   ".github/**",
   "claude/hooks/**",
@@ -28,6 +30,9 @@ risk = [
   "claude/scripts/git-pre-push.sh",
   "claude/scripts/install-git-hooks.sh",
   "claude/scripts/gate-selftest.sh",
+  "claude/scripts/security/**",
+  "claude/scripts/tests/pre-commit-stages-test.sh",
+  "claude/scripts/tests/guards-*",
   "claude/scripts/merge-if-green.sh",
   "claude/scripts/state-checks.py",
   "claude/scripts/sync-skill-loaders.sh",
@@ -38,5 +43,5 @@ risk = [
   "claude/skills/deep-fucking-research/scripts/dfr_codex_runner.mjs",
   "tools/grok-permission-reviewer/proxy.py",
   "claude/optchat/**",
-  "**/*.tla",
+  "**/*.tla",                            # models are risk on purpose: they prove the gates
 ]

@@ -15,3 +15,4 @@ run = "cd sandbox && python3 test_calc.py && cd .. && python3 tests/test_tier.py
 
 [tiers]
 risk = [".github/**", "engine/**"]
+prompt = ["**/SKILL.md", "**/CLAUDE.md", "**/AGENTS.md", ".claude/rules/**", "engine/prompts/**"]
