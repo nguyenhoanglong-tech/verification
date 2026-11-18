@@ -1,6 +1,6 @@
 # The engine repo tests itself: PRs into verify/attack-base run the gate from the dev branch (selftest.yml).
 live_checks = "machine"
-mode = "obs""erve"
+mode = "observe"
 enforce_branches = ["verify/attack-base"]
 allowed_bots = []
 
