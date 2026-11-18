@@ -282,6 +282,12 @@ def base_config(github, repo: str, ref: str) -> dict | None:
         return None
 
 
+def own_run() -> dict:
+    """This gate run's Actions run, for the re-run job: it reads these fields, never a link in the summary."""
+    return {"run_id": int(os.environ.get("GITHUB_RUN_ID") or 0) or None,
+            "run_attempt": int(os.environ.get("GITHUB_RUN_ATTEMPT") or 0) or None}
+
+
 def write_check(github, repo: str, head_sha: str, own_id: int | None, body: dict) -> None:
     """This run's own check run, and no other: a run never overwrites another run's record."""
     if own_id:
@@ -308,7 +314,7 @@ def judge(github, needs: dict, repo: str, head_sha: str, run_url: str, own_id: i
             today, month = budget.get("reviews_today"), budget.get("month_usd")
         if month is not None:
             budget.update(reviews_today=int(today) + (1 if cost else 0), month_usd=round(float(month) + cost, 4))
-    record = decide(head_sha=head_sha, errors=errors, prior=prior_verdicts(runs, own_id), **inputs)
+    record = {**decide(head_sha=head_sha, errors=errors, prior=prior_verdicts(runs, own_id), **inputs), **own_run()}
     out = needs.get("tier", {}).get("outputs") or {}
     skip = out.get("skip") or (BUDGET_SKIPPED if record["budget"].get("skipped") else "")
     fitted, text = fit(record)
@@ -341,6 +347,7 @@ def post() -> int:
     failed = decide(head_sha=head_sha, base_sha=start.get("base_sha", ""), tiers=(record or {}).get("tier", ""), mode=mode,
                     switch_spec=False, machine=[], review={"cost_usd": (record or {}).get("cost_usd", 0)},
                     budget=(record or {}).get("budget", {}), errors=[reason], prior=[])
+    failed.update(own_run())
     body = {"status": "completed", "conclusion": conclusion(failed),
             "output": {"title": failed["title"], "text": render_text(failed), "summary": f"verdict: ERROR\nerror: {reason}\n\nrun: {run_url}"}}
     write_check(github, repo, head_sha, own_id, body)

@@ -12,7 +12,8 @@ import github  # noqa: E402
 from verdict import ACTIONS_APP, render_text  # noqa: E402
 
 ENV = {"GITHUB_REPOSITORY": "o/r", "HEAD_SHA": "h", "BASE_SHA": "b", "BASE_REF": "dev", "PR_NUMBER": "1",
-       "RUN_URL": "https://example.invalid/run", "GITHUB_WORKFLOW_REF": "o/r/.github/workflows/caller.yml@refs/heads/main"}
+       "RUN_URL": "https://example.invalid/run", "GITHUB_RUN_ID": "4242", "GITHUB_RUN_ATTEMPT": "2",
+       "GITHUB_WORKFLOW_REF": "o/r/.github/workflows/caller.yml@refs/heads/main"}
 
 
 def http_error(code: int) -> urllib.error.HTTPError:

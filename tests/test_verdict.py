@@ -289,6 +289,20 @@ class Post(unittest.TestCase):
         record = parse_text(output["text"])
         self.assertEqual((record["verdict"], record["cost_usd"], record.get("trimmed")), ("FAIL", 1.2345, True))
 
+    def test_record_names_its_own_run(self):
+        """Fix 14: the re-run job reads run_id and run_attempt from the record, even a trimmed one."""
+        findings = [{**bug("P0"), "summary": "s" * 150, "failure": "f" * 300} for _ in range(2000)]
+        for review in (None, {"findings": findings, "spec": None, "cost_usd": 1, "error": None, "budget_refused": False}):
+            _, _, writes = self.post(fakes.GitHub(), self.needs(review=review))
+            record = parse_text(writes[0][2]["output"]["text"])
+            self.assertEqual((record["run_id"], record["run_attempt"]), (4242, 2))
+            self.assertIn("https://example.invalid/run", writes[0][2]["output"]["summary"])
+
+    def test_error_record_names_its_own_run_too(self):
+        _, _, writes = self.post(fakes.GitHub(fail={"PATCH check-runs/7": [fakes.http_error(422)]}), self.needs())
+        record = parse_text(writes[-1][2]["output"]["text"])
+        self.assertEqual((record["verdict"], record["run_id"], record["run_attempt"]), ("ERROR", 4242, 2))
+
     def test_a_failed_update_still_ends_the_check(self):
         fake = fakes.GitHub(fail={"PATCH check-runs/7": [fakes.http_error(422)]})
         code, _, writes = self.post(fake, self.needs())
