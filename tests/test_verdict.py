@@ -125,6 +125,23 @@ class Budget(unittest.TestCase):
         self.assertTrue(budget_allows(4, 99.9, 5, 100))
 
 
+class RecentRecords(unittest.TestCase):
+    def test_a_record_on_an_earlier_commit_of_a_pr_counts(self):
+        import github
+        paid, _ = run(review={"findings": [], "spec": None, "cost_usd": 2.0})
+        paid["budget"] = {**BUDGET, "reviews_today": 1, "month_usd": 2.0}
+        commit = lambda text: {"commit": {"checkSuites": {"nodes": [{"checkRuns": {"nodes": [
+            {"completedAt": "2026-11-18T10:00:00Z", "text": text}]}}]}}}
+        data = {"repository": {"pullRequests": {"nodes": [{"commits": {"nodes": [commit(render_text(paid)), commit(None)]}}]}}}
+        real = github.graphql
+        github.graphql = lambda query, **v: data
+        try:
+            got = github.recent_records("o/r")
+        finally:
+            github.graphql = real
+        self.assertEqual(budget_base(got, Budget.NOW), (1, 2.0))
+
+
 class Needs(unittest.TestCase):
     def needs(self, review_result, review_flag="true"):
         tier = {"base_sha": "b", "mode": "shadow", "tiers": "T1", "has_checks": "true", "review": review_flag,

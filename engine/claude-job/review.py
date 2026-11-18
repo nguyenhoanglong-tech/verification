@@ -123,7 +123,9 @@ def prepare(head: Path, base_sha: str, data: Path) -> None:
     (data / "diff.patch").write_text(diff)
     stat = subprocess.run(git + ["diff", "--shortstat", merge_base, "HEAD"], capture_output=True, text=True).stdout.strip()
     print(f"diff {merge_base[:12]}..HEAD: {stat}")
-    shutil.copytree(head, data / "head", ignore=shutil.ignore_patterns(".git"), symlinks=True)
+    # Symlinks are left out: a head link could point the reviewer's Read at a runner file. The diff still shows them.
+    shutil.copytree(head, data / "head", symlinks=True,
+                    ignore=lambda d, names: [n for n in names if n == ".git" or os.path.islink(os.path.join(d, n))])
     shutil.rmtree(head)
 
 

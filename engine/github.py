@@ -36,17 +36,27 @@ def verification_runs(repo: str, sha: str) -> list[dict]:
         page += 1
 
 
-def recent_records(repo: str, prs: int = 20) -> list[tuple[str, dict]]:
-    """(completed_at, record) from the gate runs on the heads of the most recently updated PRs.
+RECENT = """query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) {
+  pullRequests(first: 20, orderBy: {field: UPDATED_AT, direction: DESC}) { nodes { commits(last: 10) { nodes { commit {
+    checkSuites(first: 5, filterBy: {appId: %d}) { nodes { checkRuns(first: 10, filterBy: {checkName: "verification"}) {
+      nodes { completedAt text } } } } } } } } } } }""" % ACTIONS_APP
 
-    Each record carries the running totals, so the newest one is enough (verdict.budget_base). The newest gate run is
-    on a recently pushed PR, and a push updates the PR, so 20 PRs reach it. Two gate jobs finishing in the same seconds
-    can each miss the other's cost; the org's Console spend limit is the hard cap (D21).
+
+def recent_records(repo: str) -> list[tuple[str, dict]]:
+    """(completed_at, record) from the gate runs on the last 10 commits of the 20 most recently updated PRs.
+
+    Each record carries the running totals, so the newest one is enough (verdict.budget_base). Earlier commits count
+    because a PR pushed again keeps the totals its earlier heads paid for. The newest gate run is on a recently
+    pushed PR, and a push updates the PR. Two gate jobs finishing in the same seconds can each miss the other's
+    cost; the org's Console spend limit is the hard cap (D21).
     """
+    owner, name = repo.split("/")
     out = []
-    for pr in api(f"repos/{repo}/pulls?state=all&sort=updated&direction=desc&per_page={prs}"):
-        for run in verification_runs(repo, pr["head"]["sha"]):
-            record = parse_text((run.get("output") or {}).get("text"))
-            if record and run.get("completed_at"):
-                out.append((run["completed_at"], record))
+    for pr in graphql(RECENT, owner=owner, name=name)["repository"]["pullRequests"]["nodes"]:
+        for c in pr["commits"]["nodes"]:
+            for suite in c["commit"]["checkSuites"]["nodes"]:
+                for run in suite["checkRuns"]["nodes"]:
+                    record = parse_text(run.get("text"))
+                    if record and run.get("completedAt"):
+                        out.append((run["completedAt"], record))
     return out
