@@ -110,6 +110,10 @@ class Budget(unittest.TestCase):
         records = [("2026-11-18T10:00:00Z", self.rec(2, 30.0)), ("2026-11-18T12:00:00Z", self.rec(3, 33.5))]
         self.assertEqual(budget_base(records, self.NOW), (3, 33.5))
 
+    def test_a_record_without_totals_does_not_reset_them(self):
+        records = [("2026-11-18T10:00:00Z", self.rec(2, 30.0)), ("2026-11-18T12:00:00Z", {"budget": {}})]
+        self.assertEqual(budget_base(records, self.NOW), (2, 30.0))
+
     def test_day_and_month_reset(self):
         self.assertEqual(budget_base([("2026-11-17T23:00:00Z", self.rec(5, 40.0))], self.NOW), (0, 40.0))
         self.assertEqual(budget_base([("2026-10-31T23:00:00Z", self.rec(5, 99.0))], self.NOW), (0, 0.0))

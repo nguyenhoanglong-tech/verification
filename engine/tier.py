@@ -211,15 +211,15 @@ def github_main() -> None:
     t2 = "T2" in result.tiers
     code = t2 or "T1" in result.tiers
     review_cfg = config.get("review", {})
-    skip, spec, budget = "", "", {}
+    skip, spec = "", ""
+    budget = {"reviews_per_day": s["reviews_per_day"], "budget_month_usd": s["budget_month_usd"], "skipped": False}
     review = code and s["live_checks"] == "owed"
     if code and not review:
         skip = "machine only"
     if review:
         today, month = verdict.budget_base(github.recent_records(repo), datetime.now(timezone.utc))
         allowed = verdict.budget_allows(today, month, s["reviews_per_day"], s["budget_month_usd"])
-        budget = {"reviews_today": today, "month_usd": month, "reviews_per_day": s["reviews_per_day"],
-                  "budget_month_usd": s["budget_month_usd"], "skipped": not allowed}
+        budget["skipped"] = not allowed
         print(f"budget: {today} paid reviews today of {s['reviews_per_day']}, ${month:.2f} this month of ${s['budget_month_usd']:.2f}")
         if not allowed:
             review, skip = False, verdict.BUDGET_SKIPPED

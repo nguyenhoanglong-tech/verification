@@ -51,7 +51,7 @@ def budget_base(dated_records: list[tuple[str, dict]], now: datetime) -> tuple[i
     newest = None
     for at, record in dated_records:
         when = datetime.fromisoformat(at.replace("Z", "+00:00"))
-        if (when.year, when.month) == (now.year, now.month) and isinstance(record.get("budget"), dict):
+        if (when.year, when.month) == (now.year, now.month) and "month_usd" in (record.get("budget") or {}):
             if newest is None or when > newest[0]:
                 newest = (when, record["budget"])
     if newest is None:
