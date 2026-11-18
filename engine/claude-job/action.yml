@@ -73,7 +73,7 @@ runs:
         umask 077
         d="$RUNNER_TEMP/anthropic-$KIND"; mkdir -p "$d"
         jwt=$(curl -fsS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-          "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://api.anthropic.com" | jq -r .value)
+          "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://api.anthropic.com" | jq -er .value)
         echo "::add-mask::$jwt"
         echo "OIDC claims the federation rule sees (claims only, never the token):"
         cut -d. -f2 <<<"$jwt" | tr '_-' '/+' | base64 -d 2>/dev/null \
@@ -115,11 +115,14 @@ runs:
         # both x-api-key and Authorization: Bearer, which is how a federated token is accepted.
         settings=$(jq -cn --arg f "$D/token" '{apiKeyHelper: ("cat " + ($f | @sh))}')
         # Read only: no Bash, no writes, no web, no subagents, no skills. dontAsk denies anything not allowed, so
-        # instructions planted in the diff cannot get anything run.
-        "$HOME/.local/bin/claude" --bare -p --no-session-persistence --settings "$settings" \
+        # instructions planted in the diff cannot get anything run. Read has no allow rule, so it reaches only the
+        # workspace and pr-head; the token directory is denied by name as well. The OIDC request variables are
+        # dropped so the CLI cannot mint another token.
+        env -u ACTIONS_ID_TOKEN_REQUEST_TOKEN -u ACTIONS_ID_TOKEN_REQUEST_URL -u ACTIONS_RUNTIME_TOKEN \
+          "$HOME/.local/bin/claude" --bare -p --no-session-persistence --settings "$settings" \
           --model "$MODEL" --effort "$EFFORT" --max-budget-usd "$BUDGET" \
-          --tools Read,Grep,Glob --allowedTools Read,Grep,Glob \
-          --disallowedTools Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch,Task,Agent,Skill \
+          --tools Read,Grep,Glob \
+          --disallowedTools Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch,Task,Agent,Skill "Read(/$D/**)" \
           --permission-mode dontAsk --output-format json --json-schema "$(jq -c . "$ENGINE/schema/$KIND.json")" \
           --add-dir pr-head \
           < "$RUNNER_TEMP/$KIND-prompt.md" > "$RUNNER_TEMP/$KIND-result.json" 2> "$RUNNER_TEMP/$KIND-stderr.txt" \
@@ -140,12 +143,13 @@ runs:
         verdict=$(jq -r .verdict <<<"$r"); cost=$(jq -r .cost <<<"$r"); summary=$(jq -r .summary <<<"$r")
         jq -r .findings_md <<<"$r" > "$RUNNER_TEMP/$KIND-findings.md"
         echo "$summary cost=$cost head=$HEAD_SHA"
-        cat "$RUNNER_TEMP/$KIND-findings.md"
+        # The findings are model text: workflow commands in them must not run.
+        stop=$(openssl rand -hex 16); echo "::stop-commands::$stop"; cat "$RUNNER_TEMP/$KIND-findings.md"; echo "::$stop::"
         { echo "ok=$([ "$verdict" = PASS ] && echo true || echo false)"; echo "verdict=$verdict"; echo "head=$HEAD_SHA"
           echo "cost=$cost"; echo "summary=$summary"; } >> "$GITHUB_OUTPUT"
         { echo "### $summary"; cat "$RUNNER_TEMP/$KIND-findings.md"; } >> "$GITHUB_STEP_SUMMARY"
     - if: always()
       shell: bash
       env:
-        D: ${{ steps.token.outputs.dir }}
-      run: '[ -z "$D" ] || rm -rf "$D"'
+        KIND: ${{ inputs.kind }}
+      run: rm -rf "$RUNNER_TEMP/anthropic-$KIND"

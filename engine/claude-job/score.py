@@ -50,7 +50,8 @@ def score(kind, result, owed, exchange_error="", stderr=""):
     else:
         verdict = "PASS"
     summary = f"{kind}: {blocking} blocking, {minor} minor, {unread} owed files not reported read, verdict {verdict}"
-    md = "".join(f"- [{x.get('severity')}] {x.get('file')}:{x.get('line', '')} {x.get('summary')}\n" for x in findings)
+    md = "".join(one_line(f"- [{x.get('severity')}] {x.get('file')}:{x.get('line', '')} {x.get('summary')}", 1000) + "\n"
+                 for x in findings)
     return verdict, cost, summary, md
 
 
