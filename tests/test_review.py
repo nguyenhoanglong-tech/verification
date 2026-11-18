@@ -78,8 +78,9 @@ class Logging(unittest.TestCase):
         self.assertIn("ISSUE-TEXT", log)
 
     def test_unparseable_output_is_logged_inside_stop_commands(self):
+        lines = ["MODEL-TEXT", "::error file=a.py::MODEL-LINE-2", "::set-output name=x::MODEL-LINE-3"]
         cli = json.dumps({"is_error": False, "subtype": "success", "num_turns": 0, "local_command": "code_review",
-                          "result": "MODEL-TEXT\n::error::x", "structured_output": None, "total_cost_usd": 0.13})
+                          "result": "\n".join(lines), "structured_output": None, "total_cost_usd": 0.13})
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {
                 "RUNNER_TEMP": tmp, "HEAD_DIR": tmp, "BASE_SHA": "b", "ANTHROPIC": "{}", "MODEL": "m",
                 "EFFORT": "medium"}), \
@@ -89,7 +90,9 @@ class Logging(unittest.TestCase):
         self.assertIn("unparseable output", out["error"])
         self.assertIn("MODEL-TEXT", log)
         self.assertIn('"local_command": "code_review"', log)
-        self.assertEqual(fakes.outside_stop_commands(log, "MODEL-TEXT"), [])
+        for line in lines:
+            self.assertIn(line, log)
+            self.assertEqual(fakes.outside_stop_commands(log, line), [], line)
 
 
 class SpecBudget(unittest.TestCase):
@@ -122,15 +125,18 @@ class BugsCall(unittest.TestCase):
     """/code-review runs as a forked agent. On CLI 2.1.326 the fork gets the StructuredOutput tool from --json-schema
     but its payload never reaches the result, and --append-system-prompt-file never reaches the fork at all."""
 
-    def run_main(self, cwd):
+    FINDING = {"severity": "P0", "file": "a.py", "line": 5, "summary": "off by one", "failure_scenario": "n=0 fails"}
+
+    def run_main(self, cwd, bugs_text="```json\n[]\n```"):
+        """(calls, the engine's returned record, log) for one run with a Bugs result text and a passing Spec result."""
         calls = {}
 
         def claude(args, prompt, token_file, home):
             name = "spec" if "Done-when" in prompt else "bugs"
             calls[name] = (args, prompt)
             spec = {"answer": "Yes", "items": [{"item": "a", "status": "Yes"}]}
-            return 0, json.dumps({"is_error": False, "result": "```json\n[]\n```", "total_cost_usd": 0.1,
-                                  **({"structured_output": spec} if name == "spec" else {})}), ""
+            return 0, json.dumps({"is_error": False, "result": bugs_text if name == "bugs" else "done",
+                                  "total_cost_usd": 0.1, **({"structured_output": spec} if name == "spec" else {})}), ""
         old = os.getcwd()
         os.chdir(cwd)
         try:
@@ -140,15 +146,19 @@ class BugsCall(unittest.TestCase):
                     mock.patch.object(review, "prepare"), mock.patch.object(review, "exchange", return_value=""), \
                     mock.patch.object(review, "spec_budget", return_value=""), \
                     mock.patch.object(review, "claude", claude):
-                fakes.run(review.main)
+                out, log = fakes.run(review.main)
         finally:
             os.chdir(old)
-        return calls
+        return calls, out, log
+
+    def run_in_tmp(self, bugs_text):
+        with tempfile.TemporaryDirectory() as d:
+            return self.run_main(d, bugs_text)
 
     def test_bugs_call_returns_its_findings_as_text(self):
         with tempfile.TemporaryDirectory() as d:
             (Path(d) / "CODING_STANDARDS.md").write_text("R1 rule\n")
-            calls = self.run_main(d)
+            calls = self.run_main(d)[0]
         bugs_args, spec_args = calls["bugs"][0], calls["spec"][0]
         self.assertNotIn("--json-schema", bugs_args)
         self.assertNotIn("--append-system-prompt-file", bugs_args)
@@ -157,8 +167,44 @@ class BugsCall(unittest.TestCase):
     def test_bugs_prompt_names_the_standards_file_by_absolute_path(self):
         with tempfile.TemporaryDirectory() as d:
             (Path(d) / "CODING_STANDARDS.md").write_text("R1 rule\n")
-            prompt = self.run_main(d)["bugs"][1]
+            prompt = self.run_main(d)[0]["bugs"][1]
             self.assertIn(f"Read {Path(d).resolve() / 'CODING_STANDARDS.md'},", prompt)
+
+    def test_bugs_prompt_requires_one_fenced_json_findings_array(self):
+        prompt = self.run_in_tmp("```json\n[]\n```")[0]["bugs"][1]
+        self.assertTrue(prompt.startswith("/code-review medium "), prompt[:40])
+        self.assertIn("exactly one fenced ```json block", prompt)
+        self.assertIn("`[]` when there are none", prompt)
+        for field in ("severity", "file", "line", "summary", "failure_scenario"):
+            self.assertIn(f'"{field}"', prompt)
+
+    def test_record_holds_the_findings_of_a_fenced_array(self):
+        text = f"Two notes.\n```json\n{json.dumps([self.FINDING])}\n```\nAn empty list prints as:\n```\n[]\n```"
+        _, out, _ = self.run_in_tmp(text)
+        self.assertIsNone(out["error"])
+        self.assertEqual([(f["file"], f["line"], f["severity"], f["summary"]) for f in out["findings"]],
+                         [("a.py", 5, "P0", "off by one")])
+
+    def test_record_keeps_the_spec_result_when_both_calls_run(self):
+        text = f'Shape:\n```json\n{{"file": "x", "line": 1}}\n```\n{json.dumps([self.FINDING])}'
+        _, out, _ = self.run_in_tmp(text)
+        self.assertIsNone(out["error"])
+        self.assertEqual([f["file"] for f in out["findings"]], ["a.py"])
+        self.assertEqual((out["spec"]["answer"], out["spec"]["items"][0]["status"]), ("Yes", "Yes"))
+        self.assertAlmostEqual(out["cost_usd"], 0.2)
+
+    def test_prose_output_is_an_error_with_the_result_logged(self):
+        _, out, log = self.run_in_tmp("PROSE-ONLY: the diff looks fine to me.")
+        self.assertTrue((out["error"] or "").startswith("bugs call: unparseable output"), out["error"])
+        self.assertEqual((out["findings"], out["spec"]), ([], None))
+        self.assertIn("PROSE-ONLY", log)
+        self.assertEqual(fakes.outside_stop_commands(log, "PROSE-ONLY"), [])
+
+    def test_finding_with_no_file_is_an_error_with_the_result_logged(self):
+        _, out, log = self.run_in_tmp('```json\n[{"summary": "EXAMPLE-ONLY"}]\n```')
+        self.assertTrue((out["error"] or "").startswith("bugs call: unparseable output"), out["error"])
+        self.assertEqual(out["findings"], [])
+        self.assertIn("EXAMPLE-ONLY", log)
 
 
 class Prepare(unittest.TestCase):
@@ -195,6 +241,21 @@ class Bugs(unittest.TestCase):
         text = ('```json\n[\n{"file": "a.py", "line": 1, "summary": "s1", "severity": "P1"},\n'
                 '{"file": "b.py", "line": 2, "summary": "s2", "severity": "P0"}\n]\n```\nDone.')
         self.assertEqual([f["file"] for f in bugs_findings({"result": text}, HEAD)], ["a.py", "b.py"])
+
+    def test_fenced_object_then_findings_array_on_its_own_line(self):
+        text = ('Each finding looks like:\n```json\n{"file": "x.py", "line": 1}\n```\n'
+                '[{"file": "a.py", "line": 3, "summary": "s", "severity": "P1"}]')
+        self.assertEqual([(f["file"], f["line"]) for f in bugs_findings({"result": text}, HEAD)], [("a.py", 3)])
+
+    def test_untagged_empty_fence_does_not_hide_the_findings(self):
+        text = ('```json\n[{"file": "a.py", "line": 5, "summary": "s", "severity": "P0"}]\n```\n'
+                'With no findings the output is:\n```\n[]\n```')
+        self.assertEqual([f["file"] for f in bugs_findings({"result": text}, HEAD)], ["a.py"])
+
+    def test_finding_without_a_file_is_malformed(self):
+        for item in ({"summary": "example"}, {"summary": "s", "file": ""}, {"summary": "s", "file": HEAD + "/"}):
+            with self.assertRaises(ValueError, msg=item):
+                bugs_findings({"result": f"```json\n{json.dumps([item])}\n```"}, HEAD)
 
     def test_empty_and_unparseable(self):
         self.assertEqual(bugs_findings({"result": "No findings.\n[]"}, HEAD), [])
