@@ -276,6 +276,19 @@ class Bugs(unittest.TestCase):
         with self.assertRaises(ValueError):
             bugs_findings({"result": text}, HEAD)
 
+    def test_closing_fence_indented_up_to_three_spaces_is_read(self):
+        text = 'Findings:\n```json\n[{"file": "a.py", "line": 2, "summary": "s", "severity": "P0"}]\n  ```\n'
+        self.assertEqual([f["file"] for f in bugs_findings({"result": text}, HEAD)], ["a.py"])
+
+    def test_json_lines_inside_a_final_text_block_are_never_findings(self):
+        text = ('```text\n```json\nprose\n```json\n[{"file": "x.py", "line": 1, "summary": "example"}]\n```')
+        with self.assertRaises(ValueError):
+            bugs_findings({"result": text}, HEAD)
+
+    def test_longer_fence_and_info_words_follow_commonmark(self):
+        text = ('```json findings\n[{"file": "a.py", "line": 3, "summary": "s", "severity": "P1"}]\n`````')
+        self.assertEqual([f["line"] for f in bugs_findings({"result": text}, HEAD)], [3])
+
     def test_finding_without_a_file_is_malformed(self):
         for item in ({"summary": "example"}, {"summary": "s", "file": ""}, {"summary": "s", "file": HEAD + "/"}):
             with self.assertRaises(ValueError, msg=item):

@@ -49,20 +49,37 @@ def last_json(text: str):
     return None
 
 
-def findings_list(text: str) -> list | None:
-    """The findings array that ends /code-review's reply. The reply must end with a ```json block: its last
-    non-blank line closes the block, and the nearest fence line above it opens it with ```json. Fences count only
-    at the start of a line. Anything else is an ERROR, never a guess."""
-    lines = [line.rstrip() for line in (text or "").replace("\r\n", "\n").split("\n")]
-    while lines and not lines[-1]:
+FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+
+
+def final_block(text: str) -> tuple[str, str] | None:
+    """(info string, content) of the fenced code block that ends text, found by CommonMark's fence rules: a fence
+    is 3+ backticks or tildes indented at most 3 spaces; it closes on a fence of the same character, at least as
+    long, with nothing after it. None when text does not end with a closed fenced block."""
+    lines = (text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    while lines and not lines[-1].strip():
         lines.pop()
-    if len(lines) < 2 or lines[-1] != "```":
+    opener, last = None, None
+    for i, line in enumerate(lines):
+        m = FENCE.match(line)
+        if opener is None:
+            if m and not (m[1][0] == "`" and "`" in m[2]):
+                opener = (m[1], m[2].strip(), i)
+        elif m and m[1][0] == opener[0][0] and len(m[1]) >= len(opener[0]) and not m[2].strip():
+            last, opener = (opener[1], "\n".join(lines[opener[2] + 1:i]), i), None
+    if opener is not None or last is None or last[2] != len(lines) - 1:
         return None
-    opener = next((i for i in range(len(lines) - 2, -1, -1) if lines[i].startswith("```")), None)
-    if opener is None or lines[opener] != "```json":
+    return last[0], last[1]
+
+
+def findings_list(text: str) -> list | None:
+    """The findings array in the ```json block that must end /code-review's reply. Anything else is an ERROR,
+    never a guess."""
+    block = final_block(text)
+    if block is None or block[0].split()[:1] != ["json"]:
         return None
     try:
-        value = json.loads("\n".join(lines[opener + 1:-1]))
+        value = json.loads(block[1])
     except ValueError:
         return None
     return value if isinstance(value, list) else None
