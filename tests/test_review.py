@@ -293,6 +293,12 @@ class Bugs(unittest.TestCase):
         with self.assertRaises(ValueError):
             bugs_findings({"result": "```json\n[]\n```\xa0"}, HEAD)
 
+    def test_info_string_is_split_on_spaces_and_tabs_only(self):
+        for info in ("\x1cjson", "json\x1c", "\x85json", "\u2003json", "json\xa0"):
+            with self.assertRaises(ValueError, msg=repr(info)):
+                bugs_findings({"result": f"```{info}\n[]\n```"}, HEAD)
+        self.assertEqual(bugs_findings({"result": "``` json\tfindings \n[]\n```"}, HEAD), [])
+
     def test_nul_and_opener_indent_follow_commonmark(self):
         self.assertEqual(review.final_block(" ```json\n []\n```"), ("json", "[]"))
         text = '```json\n[{"file": "a.py", "line": 1, "summary": "a\x00b", "severity": "P1"}]\n```'

@@ -68,7 +68,7 @@ def final_block(text: str) -> tuple[str, str] | None:
         m = FENCE.match(line)
         if opener is None:
             if m and not (m[2][0] == "`" and "`" in m[3]):
-                opener, indented = (m[2], m[3].strip(), i, len(m[1])), indented or bool(m[1])
+                opener, indented = (m[2], m[3].strip(" \t"), i, len(m[1])), indented or bool(m[1])
             elif re.match(r" {0,3}<", line):
                 return None
             elif CONTAINER.match(line):
@@ -85,7 +85,7 @@ def findings_list(text: str) -> list | None:
     """The findings array in the ```json block that must end /code-review's reply. Anything else is an ERROR,
     never a guess."""
     block = final_block(text)
-    if block is None or block[0].split()[:1] != ["json"]:
+    if block is None or not re.match(r"json([ \t]|$)", block[0]):
         return None
     try:
         value = json.loads(block[1])
