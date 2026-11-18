@@ -54,6 +54,7 @@ jobs:
     permissions:
       contents: read
       checks: write
+      issues: read
       pull-requests: write
       id-token: write
     uses: $repo/.github/workflows/gate.yml@$branch

@@ -68,6 +68,7 @@ jobs:
     permissions:
       contents: read
       checks: read
+      issues: read
       pull-requests: read
     outputs:
       base_sha: ${{ steps.t.outputs.base_sha }}
