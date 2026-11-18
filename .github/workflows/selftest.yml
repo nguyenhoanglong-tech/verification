@@ -15,6 +15,7 @@ jobs:
       contents: read
       checks: write
       issues: read
+      actions: read
       pull-requests: write
       id-token: write
     uses: nguyenhoanglong-tech/verification/.github/workflows/gate.yml@dev
