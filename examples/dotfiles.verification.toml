@@ -8,6 +8,7 @@ observe_sample = 10                     # observe mode: Claude checks on 1 PR in
 federation_rule_id = "fdrl_011Xnhp64qZrrs3D8z49fbSJ"
 organization_id = "9661d981-ce74-4832-bd6f-92048d9aea93"
 service_account_id = "svac_01Vrgh4uDhqvqr6iLQsaxMyZ"
+workspace_id = "wrkspc_018nwehRHTcTJ5ihWRdjWnVy"
 
 [review]                                # D8
 t1_model = "claude-sonnet-5-5"
