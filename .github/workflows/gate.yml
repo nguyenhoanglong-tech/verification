@@ -54,7 +54,6 @@ jobs:
       checks: ${{ steps.t.outputs.checks }}
       has_checks: ${{ steps.t.outputs.has_checks }}
       anthropic: ${{ steps.t.outputs.anthropic }}
-      allowed_bots: ${{ steps.t.outputs.allowed_bots }}
       sampled: ${{ steps.t.outputs.sampled }}
     steps:
       - uses: actions/checkout@v6
@@ -128,7 +127,6 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
-      pull-requests: write
       id-token: write
     outputs:
       ok: ${{ steps.c.outputs.ok }}
@@ -153,8 +151,6 @@ jobs:
           effort: ${{ needs.tier.outputs.review_effort }}
           level: ${{ needs.tier.outputs.review_level }}
           anthropic: ${{ needs.tier.outputs.anthropic }}
-          allowed_bots: ${{ needs.tier.outputs.allowed_bots }}
-          github_token: ${{ github.token }}
 
   blast:
     needs: tier
@@ -163,7 +159,6 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
-      pull-requests: write
       id-token: write
     outputs:
       ok: ${{ steps.c.outputs.ok }}
@@ -187,8 +182,6 @@ jobs:
           model: ${{ needs.tier.outputs.review_model }}
           effort: ${{ needs.tier.outputs.review_effort }}
           anthropic: ${{ needs.tier.outputs.anthropic }}
-          allowed_bots: ${{ needs.tier.outputs.allowed_bots }}
-          github_token: ${{ github.token }}
 
   tp:
     needs: tier
@@ -197,7 +190,6 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
-      pull-requests: write
       id-token: write
     outputs:
       ok: ${{ steps.c.outputs.ok }}
@@ -222,8 +214,6 @@ jobs:
           model: claude-sonnet-5-5
           effort: medium
           anthropic: ${{ needs.tier.outputs.anthropic }}
-          allowed_bots: ${{ needs.tier.outputs.allowed_bots }}
-          github_token: ${{ github.token }}
 
   gate:
     # The one result the ruleset reads. Posted as a check run named `verification` by GitHub Actions.

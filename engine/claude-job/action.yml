@@ -1,5 +1,5 @@
 name: verification claude job
-description: Runs one Claude check (review, blast or tp) on a PR head checked out as data, and scores its structured output.
+description: Runs one Claude check (review, blast or tp) with the Claude Code CLI on a PR head checked out as data, and scores its structured output.
 inputs:
   kind: {required: true, description: "review | blast | tp"}
   model: {required: true, description: Claude model id}
@@ -7,11 +7,10 @@ inputs:
   level: {required: false, default: medium, description: /code-review level}
   anthropic: {required: true, description: "JSON with federation_rule_id, organization_id, service_account_id, workspace_id"}
   prompt_files: {required: false, default: "", description: "comma-separated prompt files the tier job found (tp only)"}
-  allowed_bots: {required: false, default: "", description: bots allowed to trigger the action}
-  github_token: {required: true, description: the workflow's GITHUB_TOKEN}
   budget: {required: false, default: "3", description: max USD for this run}
 outputs:
-  ok: {description: "true when the run produced a structured result with no blocking finding", value: "${{ steps.score.outputs.ok }}"}
+  ok: {description: "true only when the verdict is PASS", value: "${{ steps.score.outputs.ok }}"}
+  verdict: {description: "PASS, FAIL (a blocking finding) or ERROR (credit, auth or no usable result; may re-run)", value: "${{ steps.score.outputs.verdict }}"}
   head: {description: head SHA the check ran on, value: "${{ steps.score.outputs.head }}"}
   cost: {description: total cost in USD, value: "${{ steps.score.outputs.cost }}"}
   summary: {description: one-line result, value: "${{ steps.score.outputs.summary }}"}
@@ -28,10 +27,7 @@ runs:
       shell: bash
       env:
         KIND: ${{ inputs.kind }}
-        MODEL: ${{ inputs.model }}
-        EFFORT: ${{ inputs.effort }}
         LEVEL: ${{ inputs.level }}
-        BUDGET: ${{ inputs.budget }}
         PR: ${{ github.event.pull_request.number }}
         HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         BASE_SHA: ${{ github.sha }}
@@ -41,10 +37,14 @@ runs:
         echo "head=$(git -C pr-head rev-parse HEAD)" >> "$GITHUB_OUTPUT"
         git -C pr-head reset -q --soft "$(git -C pr-head merge-base HEAD "$BASE_SHA")"
         git -C pr-head diff --cached --stat | tail -1
+        # The model gets Read only, so the diff and its file list are written where it can read them.
+        mkdir -p .verification-ctx
+        git -C pr-head diff --cached > .verification-ctx/diff.patch
+        git -C pr-head diff --cached --name-only > .verification-ctx/files.txt
         # The files the result must say it read: every changed file, or for tp every prompt file.
-        if [ "$KIND" = tp ]; then tr , '\n' <<<"$PROMPT_FILES"; else git -C pr-head diff --cached --name-only; fi \
+        if [ "$KIND" = tp ]; then tr , '\n' <<<"$PROMPT_FILES"; else cat .verification-ctx/files.txt; fi \
           | grep . | sort -u > "$RUNNER_TEMP/$KIND-owed.txt" || true
-        python3 - "$ENGINE" > "$RUNNER_TEMP/prompt.md" <<'PY'
+        python3 - "$ENGINE" > "$RUNNER_TEMP/$KIND-prompt.md" <<'PY'
         import os, sys
         e = sys.argv[1] + "/prompts/"
         text = open(e + os.environ["KIND"] + ".md").read() + "\n" + open(e + "common.md").read()
@@ -53,59 +53,103 @@ runs:
             text = text.replace("{{" + k + "}}", v)
         print(text)
         PY
-        schema=$(jq -c . "$ENGINE/schema/$KIND.json")
-        # Comma-separated: the action splits --allowedTools on commas. dontAsk denies every tool not listed,
-        # so instructions planted in the diff cannot get anything run beyond reads and git queries.
-        tools='Read,Grep,Glob,Bash(git -C pr-head diff:*),Bash(git -C pr-head log:*),Bash(git -C pr-head show:*),Bash(git -C pr-head status:*),Bash(git -C pr-head ls-files:*)'
-        {
-          echo "args=--model $MODEL --effort $EFFORT --max-budget-usd $BUDGET --add-dir pr-head --permission-mode dontAsk --allowedTools \"$tools\" --disallowedTools \"Edit,Write,NotebookEdit,WebFetch,WebSearch,Task\" --json-schema '$schema'"
-          d="EOF_$(openssl rand -hex 16)"
-          echo "prompt<<$d"; cat "$RUNNER_TEMP/prompt.md"; echo "$d"
-        } >> "$GITHUB_OUTPUT"
-    - name: OIDC claims the federation rule sees (claims only, never the token)
+    - name: Install Claude Code
       shell: bash
+      env:
+        CLAUDE_CODE_VERSION: "2.1.326"
       run: |
-        t=$(curl -fsS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://api.anthropic.com" | jq -r .value)
-        cut -d. -f2 <<<"$t" | tr '_-' '/+' | base64 -d 2>/dev/null | jq -c '{sub, aud, repository_owner, repository_owner_id, job_workflow_ref, event_name}' || true
+        for i in 1 2 3; do curl -fsSL https://claude.ai/install.sh | bash -s -- "$CLAUDE_CODE_VERSION" && break; sleep 5; done
+        test "$("$HOME/.local/bin/claude" --version | cut -d' ' -f1)" = "$CLAUDE_CODE_VERSION"
+    # Workload identity federation (D17, D26): one GitHub OIDC token, exchanged once for a short-lived Anthropic token
+    # under the caller's federation rule. The OIDC token is single-use, so the claims are printed from the same one.
+    - id: token
+      shell: bash
+      env:
+        ANTHROPIC: ${{ inputs.anthropic }}
+        KIND: ${{ inputs.kind }}
+        EXCHANGE_BETAS: oauth-2025-04-20,oidc-federation-2026-04-01  # gitleaks:allow (public beta header names)
+      run: |
+        set -euo pipefail
+        umask 077
+        d="$RUNNER_TEMP/anthropic-$KIND"; mkdir -p "$d"
+        jwt=$(curl -fsS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+          "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://api.anthropic.com" | jq -er .value)
+        echo "::add-mask::$jwt"
+        echo "OIDC claims the federation rule sees (claims only, never the token):"
+        cut -d. -f2 <<<"$jwt" | tr '_-' '/+' | base64 -d 2>/dev/null \
+          | jq -c '{sub, aud, repository_owner, repository_owner_id, repository_id, actor_id, job_workflow_ref, event_name}' || true
+        rule=$(jq -r '.federation_rule_id // ""' <<<"$ANTHROPIC")
+        echo "Workload identity federation configured (rule: $rule, exchanged by the claude-job token step)"
+        jq -Rn --argjson a "$ANTHROPIC" '{grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer", assertion: input,
+            federation_rule_id: $a.federation_rule_id, organization_id: $a.organization_id}
+          + ($a | with_entries(select(.key == "service_account_id" or .key == "workspace_id") | select(.value != "")))' \
+          <<<"$jwt" > "$d/request.json"
+        unset jwt
+        code=$(curl -sS -o "$d/response.json" -w '%{http_code}' -X POST https://api.anthropic.com/v1/oauth/token \
+          -H 'Content-Type: application/json' -H "anthropic-beta: $EXCHANGE_BETAS" \
+          --data-binary "@$d/request.json") || code=000
+        rm -f "$d/request.json"
+        token=$(jq -r '.access_token // ""' "$d/response.json" 2>/dev/null || true)
+        if [ "$code" = 200 ] && [ -n "$token" ]; then
+          echo "::add-mask::$token"
+          printf '%s' "$token" > "$d/token"
+          echo "token exchange: ok, expires_in=$(jq -r '.expires_in // "?"' "$d/response.json")"
+        else
+          echo "Token exchange failed with status $code: $(jq -c '.error // .' "$d/response.json" 2>/dev/null | head -c 400)" \
+            | tee "$d/exchange-error.txt"
+        fi
+        rm -f "$d/response.json"
+        echo "dir=$d" >> "$GITHUB_OUTPUT"
     - id: claude
-      continue-on-error: true
-      uses: anthropics/claude-code-action@cc98b3ae241b0fcfb6a42a2690751afffecb4452
-      with:
-        prompt: ${{ steps.prep.outputs.prompt }}
-        claude_args: ${{ steps.prep.outputs.args }}
-        github_token: ${{ inputs.github_token }}
-        allowed_bots: ${{ inputs.allowed_bots }}
-        anthropic_federation_rule_id: ${{ fromJSON(inputs.anthropic).federation_rule_id }}
-        anthropic_organization_id: ${{ fromJSON(inputs.anthropic).organization_id }}
-        anthropic_service_account_id: ${{ fromJSON(inputs.anthropic).service_account_id }}
-        anthropic_workspace_id: ${{ fromJSON(inputs.anthropic).workspace_id }}
+      shell: bash
+      env:
+        KIND: ${{ inputs.kind }}
+        MODEL: ${{ inputs.model }}
+        EFFORT: ${{ inputs.effort }}
+        BUDGET: ${{ inputs.budget }}
+        ENGINE: ${{ github.action_path }}/..
+        D: ${{ steps.token.outputs.dir }}
+      run: |
+        [ -s "$D/token" ] || { echo "no token: the CLI is not run"; exit 0; }
+        # --bare reads Anthropic auth only from ANTHROPIC_API_KEY or apiKeyHelper. The helper's value is sent as
+        # both x-api-key and Authorization: Bearer, which is how a federated token is accepted.
+        settings=$(jq -cn --arg f "$D/token" '{apiKeyHelper: ("cat " + ($f | @sh))}')
+        # Read only: no Bash, no writes, no web, no subagents, no skills. dontAsk denies anything not allowed, so
+        # instructions planted in the diff cannot get anything run. Read has no allow rule, so it reaches only the
+        # workspace and pr-head; the token directory is denied by name as well. The OIDC request variables are
+        # dropped so the CLI cannot mint another token.
+        env -u ACTIONS_ID_TOKEN_REQUEST_TOKEN -u ACTIONS_ID_TOKEN_REQUEST_URL -u ACTIONS_RUNTIME_TOKEN \
+          "$HOME/.local/bin/claude" --bare -p --no-session-persistence --settings "$settings" \
+          --model "$MODEL" --effort "$EFFORT" --max-budget-usd "$BUDGET" \
+          --tools Read,Grep,Glob \
+          --disallowedTools Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch,Task,Agent,Skill "Read(/$D/**)" \
+          --permission-mode dontAsk --output-format json --json-schema "$(jq -c . "$ENGINE/schema/$KIND.json")" \
+          --add-dir pr-head \
+          < "$RUNNER_TEMP/$KIND-prompt.md" > "$RUNNER_TEMP/$KIND-result.json" 2> "$RUNNER_TEMP/$KIND-stderr.txt" \
+          || echo "claude exited $?"
+        tail -c 2000 "$RUNNER_TEMP/$KIND-stderr.txt"
     - id: score
       if: always()
       shell: bash
       env:
         HEAD_SHA: ${{ steps.prep.outputs.head }}
         KIND: ${{ inputs.kind }}
-        OUTCOME: ${{ steps.claude.outcome }}
-        STRUCTURED: ${{ steps.claude.outputs.structured_output }}
-        EXEC_FILE: ${{ steps.claude.outputs.execution_file }}
+        D: ${{ steps.token.outputs.dir }}
+        SCORE: ${{ github.action_path }}/score.py
       run: |
-        cost=$( [ -s "$EXEC_FILE" ] && jq '[.[] | select(.type == "result")][-1].total_cost_usd // 0' "$EXEC_FILE" || echo 0)
-        # A pass needs a successful run, a structured result, and that result naming every owed file as read.
-        if [ "$OUTCOME" = success ] && [ -n "$STRUCTURED" ] \
-           && jq -e '(.findings | type == "array") and (.files_reviewed | type == "array")' <<<"$STRUCTURED" >/dev/null 2>&1; then
-          blocking=$(jq '[.findings[] | select(.severity == "blocking")] | length' <<<"$STRUCTURED")
-          minor=$(jq '[.findings[] | select(.severity == "minor")] | length' <<<"$STRUCTURED")
-          unread=$(jq -r '.files_reviewed[]' <<<"$STRUCTURED" | sort -u | comm -23 "$RUNNER_TEMP/$KIND-owed.txt" - | wc -l | tr -d ' ')
-          ok=$([ "$blocking" = 0 ] && [ "$unread" = 0 ] && [ -s "$RUNNER_TEMP/$KIND-owed.txt" ] && echo true || echo false)
-          summary="$KIND: $blocking blocking, $minor minor, $unread owed files not reported read"
-          jq -r '.findings[] | "- [\(.severity)] \(.file):\(.line // "") \(.summary)"' <<<"$STRUCTURED" > "$RUNNER_TEMP/$KIND-findings.md"
-        else
-          ok=false
-          err=$( [ -s "$EXEC_FILE" ] && jq -r '[.[] | select(.type == "result")][-1].result // ""' "$EXEC_FILE" | head -c 300 | tr '\n' ' ' || true)
-          summary="$KIND: no structured result (action outcome $OUTCOME): $err"
-          : > "$RUNNER_TEMP/$KIND-findings.md"
-        fi
+        r=$(python3 "$SCORE" "$KIND" "$RUNNER_TEMP/$KIND-result.json" "$RUNNER_TEMP/$KIND-stderr.txt" \
+          "$RUNNER_TEMP/$KIND-owed.txt" "${D:-/nonexistent}/exchange-error.txt") \
+          || r='{"verdict":"ERROR","cost":0,"summary":"'"$KIND"': ERROR, the scorer failed","findings_md":""}'
+        verdict=$(jq -r .verdict <<<"$r"); cost=$(jq -r .cost <<<"$r"); summary=$(jq -r .summary <<<"$r")
+        jq -r .findings_md <<<"$r" > "$RUNNER_TEMP/$KIND-findings.md"
         echo "$summary cost=$cost head=$HEAD_SHA"
-        cat "$RUNNER_TEMP/$KIND-findings.md"
-        { echo "ok=$ok"; echo "head=$HEAD_SHA"; echo "cost=$cost"; echo "summary=$summary"; } >> "$GITHUB_OUTPUT"
+        # The findings are model text: workflow commands in them must not run.
+        stop=$(openssl rand -hex 16); echo "::stop-commands::$stop"; cat "$RUNNER_TEMP/$KIND-findings.md"; echo "::$stop::"
+        { echo "ok=$([ "$verdict" = PASS ] && echo true || echo false)"; echo "verdict=$verdict"; echo "head=$HEAD_SHA"
+          echo "cost=$cost"; echo "summary=$summary"; } >> "$GITHUB_OUTPUT"
         { echo "### $summary"; cat "$RUNNER_TEMP/$KIND-findings.md"; } >> "$GITHUB_STEP_SUMMARY"
+    - if: always()
+      shell: bash
+      env:
+        KIND: ${{ inputs.kind }}
+      run: rm -rf "$RUNNER_TEMP/anthropic-$KIND"

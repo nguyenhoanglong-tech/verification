@@ -11,3 +11,4 @@ jobs:
         with:
           persist-credentials: false
       - run: python3 tests/test_tier.py
+      - run: python3 tests/test_score.py
