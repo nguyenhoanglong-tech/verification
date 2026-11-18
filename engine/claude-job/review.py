@@ -58,6 +58,8 @@ def bugs_findings(result: dict, head_dir: str) -> list[dict]:
             raise ValueError(f"malformed finding: {str(x)[:200]}")
         path = str(x.get("file", "")).removeprefix(head_dir.rstrip("/") + "/")
         line = x.get("line")
+        if x.get("severity") not in SEVERITIES:
+            print(f"bugs: a finding had no valid severity ({x.get('severity')!r}); counted as P0")
         findings.append({"call": "bugs", "severity": x.get("severity") if x.get("severity") in SEVERITIES else "P0",
                          "file": path, "line": line if isinstance(line, int) else None, "summary": str(x["summary"]),
                          "failure": str(x.get("failure") or x.get("failure_scenario") or "")})
