@@ -39,7 +39,7 @@ def failure_kind(text: str) -> str:
 
 
 def last_json(text: str):
-    """The last JSON value in a CLI or model output: a ```json block, else the last line that parses."""
+    """The last JSON value in the CLI's output: the last line or ```json block that parses."""
     blocks = re.findall(r"```(?:json)?\s*\n(.*?)\n```", text or "", re.S)
     for chunk in reversed(blocks + (text or "").strip().splitlines()):
         try:
@@ -49,20 +49,62 @@ def last_json(text: str):
     return None
 
 
+FENCE = re.compile(r"^( {0,3})(`{3,}|~{3,})(.*)$")
+CONTAINER = re.compile(r"^ {0,3}([-+*]([ \t]|$)|\d{1,9}[.)]([ \t]|$)|>)")
+
+
+def final_block(text: str) -> tuple[str, str] | None:
+    """(info string, content) of the fenced code block that ends text, found by CommonMark's fence rules: a fence
+    is 3+ backticks or tildes indented at most 3 spaces; it closes on a fence of the same character, at least as
+    long, followed only by spaces or tabs; content lines lose up to the opener's indent. None when text does not
+    end with a closed fenced block. Lists, block quotes and HTML blocks are not parsed: outside a fence, a line that
+    could start an HTML block ("<") makes the reply an ERROR, and a list or quote does too once any fence line is
+    indented."""
+    lines = (text or "").replace("\r\n", "\n").replace("\r", "\n").replace("\0", "\ufffd").split("\n")
+    while lines and not lines[-1].strip(" \t"):
+        lines.pop()
+    opener, last, container, indented = None, None, False, False
+    for i, line in enumerate(lines):
+        m = FENCE.match(line)
+        if opener is None:
+            if m and not (m[2][0] == "`" and "`" in m[3]):
+                opener, indented = (m[2], m[3].strip(" \t"), i, len(m[1])), indented or bool(m[1])
+            elif re.match(r" {0,3}<", line):
+                return None
+            elif CONTAINER.match(line):
+                container = True
+        elif m and m[2][0] == opener[0][0] and len(m[2]) >= len(opener[0]) and not m[3].strip(" \t"):
+            body = [re.sub(f"^ {{0,{opener[3]}}}", "", x) for x in lines[opener[2] + 1:i]]
+            last, opener, indented = (opener[1], "\n".join(body), i), None, indented or bool(m[1])
+    if opener is not None or last is None or last[2] != len(lines) - 1 or (container and indented):
+        return None
+    return last[0], last[1]
+
+
+def findings_list(text: str) -> list | None:
+    """The findings array in the ```json block that must end /code-review's reply. Anything else is an ERROR,
+    never a guess."""
+    block = final_block(text)
+    if block is None or not re.match(r"json([ \t]|$)", block[0]):
+        return None
+    try:
+        value = json.loads(block[1])
+    except ValueError:
+        return None
+    return value if isinstance(value, list) else None
+
+
 def bugs_findings(result: dict, head_dir: str) -> list[dict]:
-    """/code-review returns a JSON array (or the structured output, when the model used it). A finding with no
-    valid severity is a P0: D8's review base counts every bug-hunt finding."""
-    out = result.get("structured_output")
-    items = out.get("findings") if isinstance(out, dict) else last_json(result.get("result", ""))
-    if isinstance(items, dict):
-        items = items.get("findings")
+    """/code-review returns a JSON array in its result text. A finding with no valid severity is a P0: D8's review
+    base counts every bug-hunt finding."""
+    items = findings_list(result.get("result", ""))
     if not isinstance(items, list):
         raise ValueError("no findings list in the Bugs call's output")
     findings = []
     for x in items:
-        if not isinstance(x, dict) or not x.get("summary"):
+        path = str(x.get("file") or "").removeprefix(head_dir.rstrip("/") + "/") if isinstance(x, dict) else ""
+        if not path or not x.get("summary"):
             raise ValueError(f"malformed finding: {str(x)[:200]}")
-        path = str(x.get("file", "")).removeprefix(head_dir.rstrip("/") + "/")
         line = x.get("line")
         if x.get("severity") not in SEVERITIES:
             log_data(f"bugs: a finding had no valid severity ({x.get('severity')!r}); counted as P0")
@@ -186,21 +228,19 @@ def main() -> dict:
         return out
     spec_text = json.loads(e.get("SPEC_TEXT") or '""')
     items = done_items(spec_text)
-    standards = e.get("STANDARDS", "CODING_STANDARDS.md")
+    standards = str(Path(e.get("STANDARDS", "CODING_STANDARDS.md")).resolve())
     common = ["--model", e["MODEL"], "--effort", e["EFFORT"], "--max-budget-usd", e.get("BUDGET_USD", "3"),
               "--tools", "Read", "--allowedTools", f"Read(/{data}/**)",
               "--disallowedTools", "Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch,Task,Agent", f"Read(/{secret}/**)",
               "--permission-mode", "dontAsk", "--output-format", "json"]
-    bugs_args = list(common)
-    if Path(standards).is_file():
-        bugs_args += ["--append-system-prompt-file", standards]
-    bugs_args += ["--json-schema", (ENGINE / "schema/bugs.json").read_text()]
     fill = lambda t: (t.replace("{{BASE_SHA}}", e["BASE_SHA"]).replace("{{DIFF}}", str(data / "diff.patch"))
                       .replace("{{HEAD}}", str(data / "head")).replace("{{STANDARDS}}", standards)
                       .replace("{{SPEC}}", spec_text)
                       .replace("{{ITEMS}}", "\n".join(f"{n}. {i}" for n, i in enumerate(items, 1)) or
                                "The section has no list: give one row per requirement it states, n counting from 1."))
-    calls = [("bugs", bugs_args, f"/code-review {e.get('LEVEL', 'medium')} {data / 'diff.patch'}\n\n"
+    # /code-review runs as a forked agent. Only this prompt reaches it: a system prompt flag does not, and a
+    # --json-schema result never comes back from the fork, so its findings arrive as a JSON array in the result text.
+    calls = [("bugs", common, f"/code-review {e.get('LEVEL', 'medium')} {data / 'diff.patch'}\n\n"
               + fill((ENGINE / "prompts/bugs.md").read_text()))]
     if spec_text:
         calls.append(("spec", common + ["--json-schema", (ENGINE / "schema/spec.json").read_text()],
@@ -229,6 +269,9 @@ def main() -> dict:
             else:
                 out["spec"] = {**spec_table(result), "sent": items}
         except ValueError as x:
+            fields = {k: result.get(k) for k in ("subtype", "num_turns", "local_command", "permission_denials",
+                                                 "structured_output")}
+            log_data(f"{name} call output: {json.dumps(fields)}\n{str(result.get('result', ''))[-4000:]}")
             out["error"] = f"{name} call: unparseable output: {x}"
             return out
     return out
