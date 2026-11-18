@@ -1,0 +1,23 @@
+# Written by selftest/branch.sh. PRs into verify/selftest/gate/slice1 run the gate from engine branch gate/slice1.
+name: verification
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [verify/selftest/gate/slice1]
+permissions: {}
+concurrency:
+  group: verification-selftest-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  verification:
+    permissions:
+      actions: read
+      contents: read
+      checks: write
+      issues: read
+      pull-requests: write
+      id-token: write
+    uses: nguyenhoanglong-tech/verification/.github/workflows/gate.yml@gate/slice1
+    with:
+      engine_ref: gate/slice1
+      runner: ${{ vars.VERIFICATION_RUNNER || 'ubuntu-24.04' }}
