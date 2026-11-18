@@ -1,0 +1,24 @@
+# Throwaway probe for chrislongnguyen/dotfiles#3304: a head-defined pull_request workflow tries the federation exchange.
+name: fed-probe-direct
+on: pull_request
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  exchange:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: OIDC claims (claims only, never the token)
+        run: |
+          t=$(curl -fsS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://api.anthropic.com" | jq -r .value)
+          python3 -c 'import sys,json,base64; p=sys.argv[1].split(".")[1]; c=json.loads(base64.urlsafe_b64decode(p+"="*(-len(p)%4))); print("CLAIMS", json.dumps({k:c.get(k) for k in ["event_name","repository_owner_id","repository_id","actor_id","job_workflow_ref","workflow_ref","ref","aud"]}))' "$t"
+      - uses: anthropics/claude-code-action@cc98b3ae241b0fcfb6a42a2690751afffecb4452
+        with:
+          prompt: "Reply with the single word ok."
+          claude_args: "--max-budget-usd 0.05 --max-turns 1"
+          github_token: ${{ github.token }}
+          anthropic_federation_rule_id: fdrl_01WTdkUmqUXTurXtkDaerJwR
+          anthropic_organization_id: 9661d981-ce74-4832-bd6f-92048d9aea93
+          anthropic_service_account_id: svac_01Vrgh4uDhqvqr6iLQsaxMyZ
+          anthropic_workspace_id: wrkspc_018nwehRHTcTJ5ihWRdjWnVy
