@@ -180,7 +180,7 @@ class BugsCall(unittest.TestCase):
             self.assertIn(f'"{field}"', prompt)
 
     def test_record_holds_the_findings_of_a_fenced_array(self):
-        text = f"Two notes.\n```json\n{json.dumps([self.FINDING])}\n```\nAn empty list prints as:\n```\n[]\n```"
+        text = f"An empty list prints as:\n```\n[]\n```\nTwo notes.\n```json\n{json.dumps([self.FINDING])}\n```"
         _, out, _ = self.run_in_tmp(text)
         self.assertIsNone(out["error"])
         self.assertEqual([(f["file"], f["line"], f["severity"], f["summary"]) for f in out["findings"]],
@@ -240,7 +240,7 @@ class Bugs(unittest.TestCase):
 
     def test_fenced_array_with_one_finding_per_line(self):
         text = ('```json\n[\n{"file": "a.py", "line": 1, "summary": "s1", "severity": "P1"},\n'
-                '{"file": "b.py", "line": 2, "summary": "s2", "severity": "P0"}\n]\n```\nDone.')
+                '{"file": "b.py", "line": 2, "summary": "s2", "severity": "P0"}\n]\n```\n')
         self.assertEqual([f["file"] for f in bugs_findings({"result": text}, HEAD)], ["a.py", "b.py"])
 
     def test_fenced_object_then_fenced_findings_array(self):
@@ -260,10 +260,21 @@ class Bugs(unittest.TestCase):
             with self.assertRaises(ValueError, msg=text):
                 bugs_findings({"result": text}, HEAD)
 
-    def test_untagged_empty_fence_does_not_hide_the_findings(self):
-        text = ('```json\n[{"file": "a.py", "line": 5, "summary": "s", "severity": "P0"}]\n```\n'
-                'With no findings the output is:\n```\n[]\n```')
-        self.assertEqual([f["file"] for f in bugs_findings({"result": text}, HEAD)], ["a.py"])
+    def test_reply_that_does_not_end_with_the_json_block_is_an_error(self):
+        block = '```json\n[{"file": "a.py", "line": 5, "summary": "s", "severity": "P0"}]\n```'
+        for text in (block + '\nWith no findings the output is:\n```\n[]\n```', block + '\nDone.'):
+            with self.assertRaises(ValueError, msg=text):
+                bugs_findings({"result": text}, HEAD)
+
+    def test_fence_markers_inside_an_earlier_example_do_not_move_the_block(self):
+        text = ('An example:\n~~~text\n```json\n~~~\n'
+                '```json\n[{"file": "a.py", "line": 9, "summary": "s", "severity": "P1"}]\n```')
+        self.assertEqual([(f["file"], f["line"]) for f in bugs_findings({"result": text}, HEAD)], [("a.py", 9)])
+
+    def test_indented_example_is_never_a_finding(self):
+        text = ('The format is:\n\n    ```json\n    [{"file": "x.py", "line": 1,\n      "summary": "example"}]\n    ```\n')
+        with self.assertRaises(ValueError):
+            bugs_findings({"result": text}, HEAD)
 
     def test_finding_without_a_file_is_malformed(self):
         for item in ({"summary": "example"}, {"summary": "s", "file": ""}, {"summary": "s", "file": HEAD + "/"}):

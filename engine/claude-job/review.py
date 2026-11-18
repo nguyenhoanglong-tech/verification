@@ -50,17 +50,22 @@ def last_json(text: str):
 
 
 def findings_list(text: str) -> list | None:
-    """The findings array in /code-review's reply: the last ```json block that holds a list. Nothing outside a
-    ```json block is read, so a reply that breaks the required format is an ERROR, never a guess."""
-    blocks = re.findall(r"```json[ \t]*\n(.*?)\n[ \t]*```", (text or "").replace("\r\n", "\n"), re.S)
-    for chunk in reversed(blocks):
-        try:
-            value = json.loads(chunk)
-        except ValueError:
-            continue
-        if isinstance(value, list):
-            return value
-    return None
+    """The findings array that ends /code-review's reply. The reply must end with a ```json block: its last
+    non-blank line closes the block, and the nearest fence line above it opens it with ```json. Fences count only
+    at the start of a line. Anything else is an ERROR, never a guess."""
+    lines = [line.rstrip() for line in (text or "").replace("\r\n", "\n").split("\n")]
+    while lines and not lines[-1]:
+        lines.pop()
+    if len(lines) < 2 or lines[-1] != "```":
+        return None
+    opener = next((i for i in range(len(lines) - 2, -1, -1) if lines[i].startswith("```")), None)
+    if opener is None or lines[opener] != "```json":
+        return None
+    try:
+        value = json.loads("\n".join(lines[opener + 1:-1]))
+    except ValueError:
+        return None
+    return value if isinstance(value, list) else None
 
 
 def bugs_findings(result: dict, head_dir: str) -> list[dict]:
