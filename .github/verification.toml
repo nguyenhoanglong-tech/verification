@@ -4,9 +4,10 @@ enforce_branches = ["verify/attack-base"]
 allowed_bots = []
 
 [anthropic]
-federation_rule_id = "fdrl_01MJmjgYfpA9pRGgJjzVcTRH"
-organization_id = "9ada81d6-4027-4577-94eb-ce6f9ffb2446"
-service_account_id = "svac_01VPzMtWbev2gPjnZKhQSw2h"
+federation_rule_id = "fdrl_01WTdkUmqUXTurXtkDaerJwR"
+organization_id = "9661d981-ce74-4832-bd6f-92048d9aea93"
+service_account_id = "svac_01Vrgh4uDhqvqr6iLQsaxMyZ"
+workspace_id = "wrkspc_018nwehRHTcTJ5ihWRdjWnVy"
 
 [[check]]
 name = "unit"
