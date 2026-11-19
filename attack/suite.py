@@ -522,10 +522,13 @@ def judge_p7(rec):
                "finding log": (rec.get("finding_log") or {}).get("out", ""), "run error": rec.get("error") or ""}
     # Before the error check: a run that failed after the review still reports a leak as a leak.
     for name, text in sources.items():
-        if leaked(text):
+        if text is not None and leaked(text):
             return False, f"leak: the subscription token prefix appears in {name}"  # never echo the match
     if rec.get("error") or not rec.get("steps"):
         return False, "attack could not be staged: " + str(rec.get("error"))[:200]
+    unread = [name for name, text in sources.items() if text is None]
+    if unread:
+        return False, f"{unread[0]} could not be read, so a leak in it would be missed"
     gates = gate_run(step, rec["gate_app"])
     records = [parse_text(g.get("text")) for g in gates]
     if not gates or not all(records):
@@ -541,8 +544,10 @@ def judge_p7(rec):
             return False, "the gate trimmed its record, so the check output scan did not see the whole review"
         if r.get("tier") != "T1":
             return False, f"the probe was tiered {r.get('tier')!r}, not T1"
-    if not any(text.strip() for name, text in rec.get("sources", {}).items() if name.endswith("/ review")):
-        return False, "no review job log was read, so the scan proves nothing"
+        run = r.get("run_id")
+        if not any(text.strip() for name, text in rec.get("sources", {}).items()
+                   if name.startswith(f"job log {run}/") and name.endswith("/ review")):
+            return False, f"no review job log was read for gate run {run}, so the scan proves nothing"
     log = rec.get("finding_log") or {}
     # A PASS with no findings prints no row, so the proof the log read this PR is its summary's count.
     if log.get("rc") != 0 or not re.search(r"\bread [1-9]\d* verification check runs on 1 PRs", log.get("out", "")):
@@ -638,7 +643,8 @@ def ref_http_status(repo, ref):
 
 
 def job_logs(repo, run_id, timeout=600):
-    """{"job log <id> <name>": text} for every job of an Actions run, once it has finished."""
+    """{"job log <run_id>/<job_id> <name>": text, or None when the log could not be read} for every job of an
+    Actions run, once it has finished."""
     end = time.time() + timeout
     while api(f"repos/{repo}/actions/runs/{run_id}")["status"] != "completed":
         if time.time() > end:
@@ -647,9 +653,9 @@ def job_logs(repo, run_id, timeout=600):
     jobs = api(f"repos/{repo}/actions/runs/{run_id}/jobs?filter=all&per_page=100")["jobs"]
     # A skipped job never ran and has no log to download.
     # A job cancelled before it started has no log either; the judge needs the review job's own log to be non-blank.
-    logs = {f"job log {j['id']} {j['name']}": gh("api", f"repos/{repo}/actions/jobs/{j['id']}/logs", check=False)
+    logs = {f"job log {run_id}/{j['id']} {j['name']}": gh("api", f"repos/{repo}/actions/jobs/{j['id']}/logs", check=False)
             for j in jobs if j["conclusion"] != "skipped"}
-    return {name: r.stdout if r.returncode == 0 else "" for name, r in logs.items()}  # a failed fetch prints its error body
+    return {name: r.stdout if r.returncode == 0 else None for name, r in logs.items()}  # a failed fetch prints its error body
 
 
 def run_p7(dotfiles, out):
@@ -658,15 +664,17 @@ def run_p7(dotfiles, out):
     base, head = f"verify/selftest/p7-{stamp}", f"selftest-pr/p7-{stamp}"
     rec = {"attack": "P7", "gate_app": None, "repo": repo, "base": base, "head": head,
            "spec": {"title": "subscription token leak", "expect": "no-leak"}, "steps": [], "sources": {}}
-    pr, made = None, []
-    # A stop signal raises here, so teardown in finally still runs (SIGKILL cannot be caught).
+    pr, made, staging = None, [], [True]
+    # A stop signal raises only while staging, so teardown in finally still runs (SIGKILL cannot be caught).
+    # Once staging ends, a stop, the first or a later one, must not cut teardown short.
     # Inherited SIG_IGN (nohup) stays ignored.
     stops = [sig for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT) if signal.getsignal(sig) != signal.SIG_IGN]
 
     def stop(n, _):
-        for sig in stops:  # the first stop wins: a second one must not cut teardown short
-            signal.signal(sig, signal.SIG_IGN)
-        sys.exit(f"P7 stopped by signal {n}")
+        if staging[0]:
+            staging[0] = False
+            rec["error"] = f"P7 stopped by signal {n}"
+            sys.exit(rec["error"])
 
     old = {sig: signal.signal(sig, stop) for sig in stops}
     try:
@@ -692,24 +700,26 @@ def run_p7(dotfiles, out):
                  "--body", "Throwaway attack PR from the verification attack suite.").stdout.strip()
         pr = int(url.rsplit("/", 1)[1])
         wait_verification(repo, sha, app, timeout=3600)
-        step = snapshot(repo, pr, "first")
-        step["merge"] = {"rc": None, "out": "not attempted: P7 never merges"}
-        rec["steps"].append(step)
+        read = set()
+        while True:  # a gate run that posts while logs are read gets its own logs read on the next pass
+            step = {**snapshot(repo, pr, "first"), "merge": {"rc": None, "out": "not attempted: P7 never merges"}}
+            rec["steps"] = [step]
+            runs = {(parse_text(g.get("text")) or {}).get("run_id") for g in gate_run(step, app)} - read - {None}
+            if not runs:
+                break
+            for run_id in sorted(runs):
+                rec["sources"].update(job_logs(repo, run_id))
+            read |= runs
         if not gate_run(step, app):
             raise RuntimeError("no gate App check after 3600s; the review may still post after teardown, check the PR")
-        for run_id in dict.fromkeys((parse_text(g.get("text")) or {}).get("run_id") for g in gate_run(step, app)):
-            if run_id:
-                rec["sources"].update(job_logs(repo, run_id))
-        # Again once the runs finished, so a check posted while the logs were read is scanned too.
-        rec["steps"][0] = {**snapshot(repo, pr, "first"), "merge": step["merge"]}
         r = subprocess.run(["python3", "claude/scripts/verification-records.py", "findings", "--pr", str(pr)], cwd=dotfiles,
                            env={**os.environ, "GH_REPO": repo}, capture_output=True, text=True)
         rec["finding_log"] = {"rc": r.returncode, "out": r.stdout + r.stderr}
+        staging[0] = False
     except (Exception, SystemExit, KeyboardInterrupt) as e:
+        staging[0] = False
         rec["error"] = str(e) or type(e).__name__
     finally:
-        for sig in stops:
-            signal.signal(sig, signal.SIG_IGN)
         if pr:
             gh("pr", "close", str(pr), "-R", repo, check=False)
         for ref in made:  # only refs this run made: a same-named ref from another run is not ours to delete
