@@ -28,7 +28,9 @@ the same finding schema as the Bugs call. Its P0 fails the gate, and its error i
 review returns no security result is an ERROR too, unless the budget refused a call: that is a budget skip, as for
 the Bugs call, and the record's `security.ran` is false. It is not Claude Code's `/security-review`: that command runs
 `git status` and `git diff` through Bash before any model call, and this sandbox gives the model only Read. On CLI
-2.1.326 both routes stop with "Permission to use Bash has been denied" and send no request.
+2.1.326 the API route stops with "Permission to use Bash has been denied" and sends no request. The subscription
+route, whose cwd is an empty directory that is not a git repository, sends the model only "/security-review needs to
+run inside a git repository"; given a git cwd, it stops with the same Bash refusal.
 
 Each call is billed to the API or to the Claude subscription (D18). The tier job picks the route from the base
 toml and this month's records:
