@@ -29,8 +29,9 @@ on:
         required: false
       claude_code_oauth_token:
         description: >-
-          The Claude subscription token (D18). The review runs on it when the API budget refuses and the base toml's
-          [subscription] fallback is on. Only the review job's claude step gets the value; the tier job sees whether it is set.
+          The Claude subscription token (D18), from the caller's `verification-subscription` environment, passed by
+          name. The review runs on it when the API budget refuses and the base toml's [subscription] fallback is on.
+          Only the review job's claude step gets the value; the tier job sees whether it is set.
         required: false
 permissions: {}
 env:
@@ -81,6 +82,10 @@ jobs:
 
   tier:
     needs: start
+    # The token lives in its own environment, not in verification-gate, so the review job, which reads PR content,
+    # can reach no gate App key. Its branch rule names only the caller's default branch, the ref every
+    # pull_request_target run carries; a workflow a PR head adds runs on another ref and gets no token (dotfiles#3408).
+    environment: verification-subscription
     runs-on: ${{ inputs.runner }}
     container: python:3.12-bookworm@sha256:4209fae09a3e20afd863e528bfddc235da5fd5977983e1996cd54cc9a72e6267
     timeout-minutes: 5
@@ -193,6 +198,7 @@ jobs:
   review:
     needs: tier
     if: needs.tier.outputs.review == 'true'
+    environment: verification-subscription  # see the tier job
     runs-on: ${{ inputs.runner }}
     container: python:3.12-bookworm@sha256:4209fae09a3e20afd863e528bfddc235da5fd5977983e1996cd54cc9a72e6267
     timeout-minutes: 40
