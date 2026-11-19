@@ -1,7 +1,9 @@
 # The engine repo tests itself: PRs into verify/attack-base run the gate from the dev branch (selftest.yml).
-mode = "observe"
+mode = "shadow"
 enforce_branches = ["verify/attack-base"]
 allowed_bots = []
+# The attack suite stages about 13 reviewed heads in one run; the default 5 a day would skip its reviews.
+reviews_per_day = 50
 
 [anthropic]
 federation_rule_id = "fdrl_01WTdkUmqUXTurXtkDaerJwR"
@@ -12,6 +14,11 @@ workspace_id = "wrkspc_018nwehRHTcTJ5ihWRdjWnVy"
 [[check]]
 name = "unit"
 run = "cd sandbox && python3 test_calc.py && cd .. && python3 tests/test_tier.py"
+
+# attack/suite.py breaks verify-attack/calc.py; this check is the one that must catch it.
+[[check]]
+name = "attack"
+run = "cd verify-attack && python3 test_calc.py"
 
 [tiers]
 risk = [".github/**", "engine/**"]
