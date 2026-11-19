@@ -10,3 +10,8 @@ def safe_div(a, b):
 
 def sub(a, b):
     return a - b
+
+
+def is_adult(age):
+    """True when age is 18 or more."""
+    return age > 18
