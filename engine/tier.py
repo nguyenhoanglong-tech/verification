@@ -261,7 +261,6 @@ def tier_outputs(repo: str, base_sha: str, head_sha: str, base_ref: str, config:
             # ERROR, never a budget skip.
             read_error = f"budget read failed: {x}"[:300]
             print(f"::error::{read_error}; no paid review runs")
-            budget.update(read_error=read_error)
         else:
             # The caller's token reaches this job only as this boolean, never as its value.
             token = os.environ.get("SUBSCRIPTION_TOKEN_SET") == "true"

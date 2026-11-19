@@ -254,8 +254,10 @@ def review_problem(review) -> str:
     if not rows(review.get("findings")):
         return "has no findings list"
     security = review.get("security")
+    costs = ("cost_usd", "subscription_cost_usd")
     if security is not None and not (isinstance(security, dict) and isinstance(security.get("ran"), bool)
-                                     and rows(security.get("findings"))):
+                                     and rows(security.get("findings"))
+                                     and all(isinstance(security.get(k), (int, float)) for k in costs)):
         return "has a malformed security entry"
     return ""
 
@@ -427,8 +429,9 @@ def post() -> int:
                     review={k: judged.get(k) for k in ("cost_usd", "findings", "security") if judged.get(k) is not None},
                     security_owed=((needs.get("tier") or {}).get("outputs") or {}).get("security") == "true")
     failed.update(own_run())
+    _, text = fit(failed)
     body = {"status": "completed", "conclusion": conclusion(failed),
-            "output": {"title": failed["title"], "text": render_text(failed), "summary": f"verdict: {failed['verdict']}\nerror: {reason}\n\nrun: {run_url}"}}
+            "output": {"title": failed["title"], "text": text, "summary": f"verdict: {failed['verdict']}\nerror: {reason}\n\nrun: {run_url}"}}
     write_check(github, repo, head_sha, body)
     return 1 if body["conclusion"] == "failure" else 0
 

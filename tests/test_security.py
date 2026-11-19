@@ -221,6 +221,18 @@ class Record(unittest.TestCase):
         self.assertEqual((security.get("ran"), [x["severity"] for x in security.get("findings", [])]), (True, ["P0"]))
         self.assertEqual(records[-1]["verdict"], "FAIL", "the fallback is never weaker than what the judge found")
 
+    def test_a_failed_publish_of_a_long_report_still_fits(self):
+        result = review_main("true")[0]
+        result["security"]["findings"] = [{**result["security"]["findings"][0], "summary": "x" * 3000}] * 60
+        records = self.post(gate_needs(json.dumps(result)), fail={"POST check-runs": [fakes.http_error(422)]})
+        self.assertEqual((len(records), records[-1]["verdict"]), (2, "FAIL"))
+        self.assertLessEqual(len(verdict.render_text(records[-1])), verdict.LIMIT)
+
+    def test_a_security_entry_without_its_cost_is_an_error_not_a_crash(self):
+        clean = {"findings": [], "spec": None, "cost_usd": 0.5, "billing": "api", "error": None, "budget_refused": False}
+        record, errors = verdict_of(gate_needs(json.dumps({**clean, "security": {"ran": True, "findings": []}})))
+        self.assertEqual(record["verdict"], "ERROR", errors)
+
     def test_the_posted_month_total_counts_the_security_spend(self):
         record = self.post(gate_needs(json.dumps(review_main("true")[0])))[-1]
         self.assertEqual((record["security"]["cost_usd"], record["cost_usd"]), (0.3, 0.8))
