@@ -16,7 +16,6 @@ from datetime import datetime, timezone
 from urllib.parse import quote
 
 MARKER = "<!-- verification-record v1 -->"
-ACTIONS_APP = 15368
 BUDGET_SKIPPED = "review skipped: budget"
 LIMIT = 65000  # GitHub refuses a check run whose output text or summary passes 65,535 characters
 
@@ -50,11 +49,11 @@ def parse_text(text: str | None) -> dict | None:
     return record if isinstance(record, dict) and record.get("schema") == 1 else None
 
 
-def prior_verdicts(check_runs: list[dict], own_id: int | None) -> list[str]:
-    """Verdicts of the other gate runs on this head. A failure posted before records existed counts as FAIL."""
+def prior_verdicts(check_runs: list[dict]) -> list[str]:
+    """Verdicts of the earlier gate runs on this head. A failure posted before records existed counts as FAIL."""
     out = []
     for run in check_runs:
-        if run.get("id") == own_id or run.get("status") != "completed":
+        if run.get("status") != "completed":
             continue
         record = parse_text((run.get("output") or {}).get("text"))
         if record:
@@ -288,19 +287,14 @@ def own_run() -> dict:
             "run_attempt": int(os.environ.get("GITHUB_RUN_ATTEMPT") or 0) or None}
 
 
-def write_check(github, repo: str, head_sha: str, own_id: int | None, body: dict) -> None:
-    """This run's own check run, and no other: a run never overwrites another run's record. A gate job re-run alone
-    keeps the start job's check_id, whose check already holds the earlier attempt's record, so a finished check gets
-    a new one."""
-    if own_id and github.api(f"repos/{repo}/check-runs/{own_id}").get("status") == "completed":
-        own_id = None
-    if own_id:
-        github.api(f"repos/{repo}/check-runs/{own_id}", "PATCH", body)
-    else:
-        github.api(f"repos/{repo}/check-runs", "POST", {"name": "verification", "head_sha": head_sha, **body})
+def write_check(github, repo: str, head_sha: str, body: dict) -> None:
+    """A new finished check run as the gate App, so a run never overwrites another run's record. Reads keep
+    GH_TOKEN; only this write takes GATE_TOKEN, and with none it raises and nothing is posted."""
+    github.api(f"repos/{repo}/check-runs", "POST", {"name": "verification", "head_sha": head_sha, **body},
+               token=os.environ["GATE_TOKEN"])
 
 
-def judge(github, needs: dict, repo: str, head_sha: str, run_url: str, own_id: int | None, base_ref: str) -> dict:
+def judge(github, needs: dict, repo: str, head_sha: str, run_url: str, base_ref: str) -> dict:
     inputs, ran, errors = from_needs(needs, head_sha)
     start = needs.get("start", {}).get("outputs") or {}
     if inputs["mode"] is None:
@@ -318,7 +312,7 @@ def judge(github, needs: dict, repo: str, head_sha: str, run_url: str, own_id: i
             today, month = budget.get("reviews_today"), budget.get("month_usd")
         if month is not None:
             budget.update(reviews_today=int(today) + (1 if cost else 0), month_usd=round(float(month) + cost, 4))
-    record = {**decide(head_sha=head_sha, errors=errors, prior=prior_verdicts(runs, own_id), **inputs), **own_run()}
+    record = {**decide(head_sha=head_sha, errors=errors, prior=prior_verdicts(runs), **inputs), **own_run()}
     out = needs.get("tier", {}).get("outputs") or {}
     skip = out.get("skip") or (BUDGET_SKIPPED if record["budget"].get("skipped") else "")
     fitted, text = fit(record)
@@ -336,12 +330,11 @@ def post() -> int:
 
     repo, head_sha, run_url = os.environ["GITHUB_REPOSITORY"], os.environ["HEAD_SHA"], os.environ["RUN_URL"]
     base_ref = os.environ.get("BASE_REF", "")
-    needs, own_id, record = {}, None, None
+    needs, record = {}, None
     try:
         needs = json.loads(os.environ["NEEDS"])
-        own_id = int((needs.get("start", {}).get("outputs") or {}).get("check_id") or 0) or None
-        record, body = judge(github, needs, repo, head_sha, run_url, own_id, base_ref)
-        write_check(github, repo, head_sha, own_id, body)
+        record, body = judge(github, needs, repo, head_sha, run_url, base_ref)
+        write_check(github, repo, head_sha, body)
         return 1 if body["conclusion"] == "failure" else 0
     except Exception as x:
         reason = f"the gate could not post its verdict: {type(x).__name__}: {x}"[:400]
@@ -354,7 +347,7 @@ def post() -> int:
     failed.update(own_run())
     body = {"status": "completed", "conclusion": conclusion(failed),
             "output": {"title": failed["title"], "text": render_text(failed), "summary": f"verdict: ERROR\nerror: {reason}\n\nrun: {run_url}"}}
-    write_check(github, repo, head_sha, own_id, body)
+    write_check(github, repo, head_sha, body)
     return 1 if body["conclusion"] == "failure" else 0
 
 

@@ -55,7 +55,7 @@ jobs:
     permissions:
       actions: read
       contents: read
-      checks: write
+      checks: read
       issues: read
       pull-requests: write
       id-token: write

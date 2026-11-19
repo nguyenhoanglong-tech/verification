@@ -1,11 +1,13 @@
-# Self-test caller: PRs into verify/attack-base run the gate from the dev branch, so engine changes can be
-# tried before a release SHA is pinned in any real repo. Real repos pin the engine by SHA.
+# Self-test caller: PRs into verify/attack-base, or into a throwaway verify/attack-base-* copy of it, run the gate from
+# the dev branch, so engine changes can be tried before a release SHA is pinned in any real repo. Real repos pin the
+# engine by SHA. This file runs from main, the one branch the verification-gate environment's rule names, so the gate
+# App's key reaches the gate job; it passes the key by name, since a cross-owner `secrets: inherit` passes nothing.
 name: verification
 run-name: verification ${{ github.event.pull_request.head.sha }}
 on:
   pull_request_target:
     types: [opened, synchronize, reopened]
-    branches: [verify/attack-base]
+    branches: [verify/attack-base, 'verify/attack-base-*']
 permissions: {}
 concurrency:
   group: verification-${{ github.event.pull_request.number }}
@@ -15,7 +17,7 @@ jobs:
     permissions:
       actions: read
       contents: read
-      checks: write
+      checks: read
       issues: read
       pull-requests: write
       id-token: write
@@ -23,3 +25,8 @@ jobs:
     with:
       engine_ref: dev
       runner: ${{ vars.VERIFICATION_RUNNER || 'ubuntu-24.04' }}
+      app_id: "5828645"
+      # The last `verification` check the gate posted here as GitHub Actions, at 2026-11-19T02:57:10Z.
+      legacy_cutover: "135303833179"
+    secrets:
+      VERIFICATION_APP_KEY: ${{ secrets.VERIFICATION_APP_KEY }}

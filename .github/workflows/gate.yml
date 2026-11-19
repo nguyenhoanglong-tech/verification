@@ -16,11 +16,32 @@ on:
         type: string
         required: false
         default: ubuntu-24.04
+      app_id:
+        description: >-
+          The gate App's id. Only that App posts the `verification` check: every workflow runs as GitHub Actions,
+          a PR's own included, so a check from GitHub Actions proves nothing (chrislongnguyen/dotfiles#3383).
+        type: string
+        required: false
+        default: ""
+      legacy_cutover:
+        description: >-
+          The highest check-run id of a `verification` check the gate posted as GitHub Actions before the gate App.
+          Those records still count for the sticky rule and the budget; any later GitHub Actions one is ignored.
+          A check-run id, never a time: a poster sets its own started_at and completed_at.
+        type: string
+        required: false
+        default: "0"
+    secrets:
+      VERIFICATION_APP_KEY:
+        description: The gate App's private key, from the caller's `verification-gate` environment, passed by name.
+        required: false
 permissions: {}
 env:
   HEAD_SHA: ${{ github.event.pull_request.head.sha }}
   BASE_REF: ${{ github.event.pull_request.base.ref }}
   PR_NUMBER: ${{ github.event.pull_request.number }}
+  GATE_APP_ID: ${{ inputs.app_id }}
+  LEGACY_CUTOVER: ${{ inputs.legacy_cutover }}
 jobs:
   start:
     runs-on: ${{ inputs.runner }}
@@ -28,9 +49,7 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read  # the base ref read, on a private caller repo
-      checks: write
     outputs:
-      check_id: ${{ steps.s.outputs.check_id }}
       base_sha: ${{ steps.s.outputs.base_sha }}
     steps:
       - uses: actions/checkout@v6
@@ -52,18 +71,16 @@ jobs:
           # Not github.sha: that is the default-branch tip under pull_request_target and the merge commit under
           # pull_request. Not the PR event's base, which can be stale. A fault here ends the job green with no
           # outputs: the tier job then reports the error and the gate posts it (neutral in shadow), never a red job.
+          # No in-progress check: only the gate job holds the gate App's token, and a missing check already blocks.
           try:
               if not base_ref or not all(c.isalnum() or c in "._/-" for c in base_ref):
                   raise ValueError(f"base ref name is not plain enough to look up: {base_ref}")
               base_sha = github.api(f"repos/{repo}/git/ref/heads/{base_ref}")["object"]["sha"]
               print(f"base {base_sha}")
-              run = github.api(f"repos/{repo}/check-runs", "POST", {
-                  "name": "verification", "head_sha": os.environ["HEAD_SHA"], "status": "in_progress",
-                  "output": {"title": "running", "summary": f"The verification gate is running on {os.environ['HEAD_SHA']}."}})
           except Exception as x:
               print(f"::error::start: {type(x).__name__}: {x}")
           else:
-              open(os.environ["GITHUB_OUTPUT"], "a").write(f"check_id={run['id']}\nbase_sha={base_sha}\n")
+              open(os.environ["GITHUB_OUTPUT"], "a").write(f"base_sha={base_sha}\n")
           PY
 
   tier:
@@ -225,15 +242,30 @@ jobs:
       group: verification-gate-${{ github.repository }}-${{ github.event.pull_request.head.sha }}
       cancel-in-progress: false
       queue: max
+    # The environment's branch rule names only the caller's default branch, which is the ref every
+    # pull_request_target run carries, so head code naming it gets "not allowed to deploy" and no key.
+    environment: verification-gate
     runs-on: ${{ inputs.runner }}
     container: python:3.12-bookworm@sha256:4209fae09a3e20afd863e528bfddc235da5fd5977983e1996cd54cc9a72e6267
     timeout-minutes: 5
     permissions:
       actions: read
-      checks: write
+      checks: read
       contents: read
     steps:
       - run: echo "base ${{ needs.tier.outputs.base_sha }}"
+      # Fail closed: with no App or no key this job ends red and posts nothing, and the missing check blocks.
+      - env:
+          KEY: ${{ secrets.VERIFICATION_APP_KEY }}
+        run: |
+          case "$GATE_APP_ID" in ''|*[!0-9]*) echo "::error::no gate App id: nothing is posted"; exit 1;; esac
+          [ -n "$KEY" ] || { echo "::error::no gate App key in the verification-gate environment: nothing is posted"; exit 1; }
+      - id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510  # v3.3.0
+        with:
+          app-id: ${{ inputs.app_id }}
+          private-key: ${{ secrets.VERIFICATION_APP_KEY }}
+          permission-checks: write
       - uses: actions/checkout@v6
         with:
           repository: nguyenhoanglong-tech/verification
@@ -242,6 +274,7 @@ jobs:
           persist-credentials: false
       - env:
           GH_TOKEN: ${{ github.token }}
+          GATE_TOKEN: ${{ steps.app.outputs.token }}
           NEEDS: ${{ toJSON(needs) }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
         run: python3 engine-src/engine/verdict.py post

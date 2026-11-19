@@ -74,25 +74,44 @@ class Sticky(unittest.TestCase):
         out.append({"id": 100, "status": "in_progress", "conclusion": None, "output": {"text": None}})
         return out
 
+    def test_only_checks_the_gate_posted_count(self):
+        """#3383: every workflow posts as GitHub Actions, a PR's own included. A FAIL from the gate App or from GitHub
+        Actions at or below the cut-over sticks; a forged one above the cut-over, or from another app, does not."""
+        failed, _ = run(mode="enforce", machine=[("unit", "fail")])
+        cases = {(fakes.GATE_APP, 900): ["FAIL"], (fakes.github.ACTIONS_APP, fakes.CUTOVER): ["FAIL"],
+                 (fakes.github.ACTIONS_APP, fakes.CUTOVER + 1): [], (1210556, 900): []}
+        for (app, id), want in cases.items():
+            fake = fakes.GitHub(checks={"h": [fakes.check(id, failed, app=app)]})
+            with fakes.installed(fake):
+                self.assertEqual(prior_verdicts(fakes.github.verification_runs("o/r", "h")), want, (app, id))
+
+    def test_a_missing_gate_app_trusts_no_app_and_a_bad_cutover_raises(self):
+        failed, _ = run(mode="enforce", machine=[("unit", "fail")])
+        fake = fakes.GitHub(checks={"h": [fakes.check(900, failed)]})
+        with fakes.installed(fake, GATE_APP_ID="", LEGACY_CUTOVER="0"):
+            self.assertEqual(fakes.github.verification_runs("o/r", "h"), [])
+        with fakes.installed(fake, LEGACY_CUTOVER="2026-11-19"), self.assertRaises(ValueError):
+            fakes.github.verification_runs("o/r", "h")
+
     def test_fail_stays_fail_after_a_passing_rerun(self):
         failed, _ = run(mode="enforce", machine=[("unit", "fail")])
-        record, result = run(mode="enforce", prior=prior_verdicts(self.runs(failed), own_id=100))
+        record, result = run(mode="enforce", prior=prior_verdicts(self.runs(failed)))
         self.assertEqual((record["verdict"], result), ("FAIL", "failure"))
 
     def test_would_block_is_sticky_in_shadow(self):
         failed, result = run(machine=[("unit", "fail")])
         self.assertEqual(result, "neutral")
-        record, result = run(prior=prior_verdicts(self.runs(failed), own_id=100))
+        record, result = run(prior=prior_verdicts(self.runs(failed)))
         self.assertEqual((record["verdict"], result, record["title"]), ("FAIL", "neutral", "T1 would block (shadow trial)"))
 
     def test_error_is_not_sticky(self):
         errored, result = run(mode="enforce", errors=["x"])
         self.assertEqual(result, "failure")
-        record, result = run(mode="enforce", prior=prior_verdicts(self.runs(errored), own_id=100))
+        record, result = run(mode="enforce", prior=prior_verdicts(self.runs(errored)))
         self.assertEqual((record["verdict"], result), ("PASS", "success"))
 
     def test_failure_without_a_record_counts_as_fail(self):
-        self.assertEqual(prior_verdicts(self.runs(legacy_failure=True), own_id=100), ["FAIL"])
+        self.assertEqual(prior_verdicts(self.runs(legacy_failure=True)), ["FAIL"])
 
     def test_record_round_trips(self):
         record, _ = run(review={"findings": [bug("P0")], "spec": None, "cost_usd": 1.25})
@@ -168,6 +187,18 @@ class MonthRecords(unittest.TestCase):
             got = fakes.github.month_records("o/r", fakes.ENV["GITHUB_WORKFLOW_REF"], datetime(2026, 11, 1, 1, 0, tzinfo=timezone.utc))
         self.assertEqual(budget_base(got, datetime(2026, 11, 1, 1, 0, tzinfo=timezone.utc)), (1, 2.0))
 
+    def test_a_forged_actions_record_above_the_cutover_cannot_reset_the_budget(self):
+        """#3383 budget forge: a PR's own workflow posts a newer `verification` record saying nothing was spent."""
+        fake = fakes.GitHub(workflow_runs=[{"head_sha": "pr", "created_at": "2026-11-18T12:00:00Z"},
+                                           {"head_sha": "old", "created_at": "2026-11-18T09:00:00Z"}],
+                            checks={"pr": [fakes.check(fakes.CUTOVER + 1, self.paid(0, 0.0), "2026-11-18T14:00:00Z",
+                                                       app=fakes.github.ACTIONS_APP)],
+                                    "old": [fakes.check(fakes.CUTOVER, self.paid(4, 44.0), "2026-11-18T09:30:00Z",
+                                                        app=fakes.github.ACTIONS_APP)]})
+        with fakes.installed(fake):
+            got = fakes.github.month_records("o/r", fakes.ENV["GITHUB_WORKFLOW_REF"], Budget.NOW)
+        self.assertEqual(budget_base(got, Budget.NOW), (4, 44.0))
+
     def test_an_unreadable_workflow_ref_raises(self):
         with self.assertRaises(RuntimeError):
             fakes.github.month_records("o/r", "", Budget.NOW)
@@ -178,7 +209,7 @@ class Needs(unittest.TestCase):
         tier = {"base_sha": "b", "mode": "shadow", "tiers": "T1", "has_checks": "true", "review": review_flag,
                 "budget": json.dumps(BUDGET), "switch_spec": "false"}
         tier["checks"] = f"{base64.b64encode(b'unit').decode()}:{base64.b64encode(b'true').decode()}"
-        return {"start": {"result": "success", "outputs": {"check_id": "100"}},
+        return {"start": {"result": "success", "outputs": {"base_sha": "b"}},
                 "tier": {"result": "success", "outputs": tier},
                 "checks": {"result": "success", "outputs": {"head": "h", "results": '[{"name":"unit","result":"pass"}]'}},
                 "review": {"result": "success", "outputs": {"head": "h", "result": json.dumps(review_result)}}}
@@ -256,7 +287,7 @@ class Post(unittest.TestCase):
     def needs(self, tier=None, tier_result="success", start=None, review=None):
         tier = {"base_sha": "b", "mode": "shadow", "tiers": "T1", "has_checks": "false", "budget": json.dumps(BUDGET),
                 "review": "true" if review else "false", "switch_spec": "false", **(tier or {})} if tier_result == "success" else {}
-        return {"start": start or {"result": "success", "outputs": {"check_id": "7", "base_sha": "b"}},
+        return {"start": start or {"result": "success", "outputs": {"base_sha": "b"}},
                 "tier": {"result": tier_result, "outputs": tier},
                 "checks": {"result": "skipped", "outputs": {}},
                 "review": {"result": "success", "outputs": {"head": "h", "result": json.dumps(review)}} if review
@@ -269,7 +300,7 @@ class Post(unittest.TestCase):
 
     def test_tier_crash_in_shadow_ends_neutral(self):
         code, _, writes = self.post(fakes.GitHub(), self.needs(tier_result="failure"))
-        self.assertEqual([(m, p, b["conclusion"]) for m, p, b in writes], [("PATCH", "repos/o/r/check-runs/7", "neutral")])
+        self.assertEqual([(m, p, b["conclusion"]) for m, p, b in writes], [("POST", "repos/o/r/check-runs", "neutral")])
         self.assertEqual(code, 0)
         self.assertEqual(parse_text(writes[0][2]["output"]["text"])["verdict"], "ERROR")
 
@@ -290,19 +321,26 @@ class Post(unittest.TestCase):
 
     def test_a_later_run_never_overwrites_an_earlier_record(self):
         first, _ = run(review={"findings": [bug("P0")], "spec": None, "cost_usd": 2.5})
-        fake = fakes.GitHub(checks={"h": [fakes.check(1, first), fakes.check(7, None, status="in_progress", conclusion=None)]})
+        fake = fakes.GitHub(checks={"h": [fakes.check(1, first)]})
         _, _, writes = self.post(fake, self.needs(tier={"budget": json.dumps({**BUDGET, "skipped": True}),
                                                         "skip": "review skipped: budget"}))
-        self.assertEqual([p for _, p, _ in writes], ["repos/o/r/check-runs/7"])
+        self.assertEqual([(m, p) for m, p, _ in writes], [("POST", "repos/o/r/check-runs")])
         record = parse_text(writes[0][2]["output"]["text"])
         self.assertEqual((record["verdict"], record["findings"]), ("FAIL", []))
 
-    def test_a_rerun_gate_job_never_patches_a_finished_check(self):
-        """Re-running only the gate job keeps the start job's check_id; that check already holds attempt 1's record."""
-        first, _ = run(review={"findings": [bug("P0")], "spec": None, "cost_usd": 2.5})
-        fake = fakes.GitHub(checks={"h": [fakes.check(7, first)]})
-        _, _, writes = self.post(fake, self.needs())
-        self.assertEqual([(m, p) for m, p, _ in writes], [("POST", "repos/o/r/check-runs")])
+    def test_the_check_is_posted_with_the_gate_app_token_only(self):
+        """#3383: reads use the Actions token; the one write uses the gate App's token, so the App is the poster."""
+        fake = fakes.GitHub()
+        self.post(fake, self.needs())
+        self.assertEqual(fake.tokens, ["app-token"])
+
+    def test_no_gate_app_token_posts_nothing(self):
+        fake = fakes.GitHub()
+        with fakes.installed(fake, NEEDS=json.dumps(self.needs())):
+            del fakes.os.environ["GATE_TOKEN"]
+            with self.assertRaises(KeyError):
+                verdict.post()
+        self.assertEqual(fake.writes(), [])
 
     def test_output_over_the_limit_is_trimmed_and_still_parses(self):
         findings = [{**bug("P0"), "summary": "s" * 150, "failure": "f" * 300} for _ in range(2000)]
@@ -324,12 +362,12 @@ class Post(unittest.TestCase):
             self.assertIn("https://example.invalid/run", writes[0][2]["output"]["summary"])
 
     def test_error_record_names_its_own_run_too(self):
-        _, _, writes = self.post(fakes.GitHub(fail={"PATCH check-runs/7": [fakes.http_error(422)]}), self.needs())
+        _, _, writes = self.post(fakes.GitHub(fail={"POST check-runs": [fakes.http_error(422)]}), self.needs())
         record = parse_text(writes[-1][2]["output"]["text"])
         self.assertEqual((record["verdict"], record["run_id"], record["run_attempt"]), ("ERROR", 4242, 2))
 
     def test_a_failed_update_still_ends_the_check(self):
-        fake = fakes.GitHub(fail={"PATCH check-runs/7": [fakes.http_error(422)]})
+        fake = fakes.GitHub(fail={"POST check-runs": [fakes.http_error(422)]})
         code, _, writes = self.post(fake, self.needs())
         self.assertEqual(len(writes), 2)
         last = writes[-1][2]
