@@ -282,5 +282,77 @@ class Record(unittest.TestCase):
         self.assertIn("outside the base checkout", out.get("error") or "")
 
 
+class FailClosedByConstruction(unittest.TestCase):
+    """#77 round 3 (checklist C1-C4): PASS only from a positive, fully validated set; everything else is ERROR."""
+
+    def judge_needs(self, needs, month_records=None):
+        when = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        records = month_records or (lambda *a: [(when, {"budget": BUDGET})])
+        with fakes.installed(fakes.GitHub()), mock.patch.object(fakes.github, "month_records", records):
+            (record, _), _ = fakes.run(verdict.judge, fakes.github, needs, "o/r", "h", "url", "dev")
+        return record
+
+    def test_c1_a_string_false_refusal_flag_is_an_error(self):
+        result = fakes.review_result(budget_refused="false", security=None)
+        record = self.judge_needs(gate_needs(json.dumps(result), security="true"))
+        self.assertEqual((record["verdict"], verdict.conclusion(record)), ("ERROR", "failure"), record["error"])
+
+    def test_c1_a_bool_security_cost_is_an_error(self):
+        security = {"ran": True, "findings": [], "cost_usd": True, "subscription_cost_usd": False}
+        result = fakes.review_result(security=security, calls=["bugs", "security"])
+        record = self.judge_needs(gate_needs(json.dumps(result), security="true"))
+        self.assertEqual((record["verdict"], verdict.conclusion(record)), ("ERROR", "failure"), record["error"])
+
+    def test_c1_c2_an_owed_spec_call_that_did_not_run_is_never_a_pass(self):
+        result = fakes.review_result()
+        record = self.judge_needs(gate_needs(json.dumps(result), security="false", switch_spec="true"))
+        self.assertEqual((record["verdict"], verdict.conclusion(record)), ("ERROR", "failure"), record["error"])
+
+    def test_c2_a_failed_lookup_before_the_spec_call_is_an_error(self):
+        def claude(args, prompt, billing, runner):
+            return reply("```json\n[]\n```", 0.5) if prompt.startswith("/code-review") else reply("done", 0.1)
+
+        def unreadable(*a):
+            raise RuntimeError("503 from the Actions API")
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {
+                "RUNNER_TEMP": tmp, "HEAD_DIR": tmp, "BASE_SHA": "b", "ANTHROPIC": "{}", "MODEL": "m", "EFFORT": "medium",
+                "SPEC_TEXT": json.dumps("## Done when\n- a\n"), "PACE": json.dumps(BUDGET), "SECURITY": "false",
+                "GITHUB_REPOSITORY": "o/r", "GITHUB_WORKFLOW_REF": "o/r/.github/workflows/c.yml@refs/heads/main"}), \
+                mock.patch.object(review, "prepare"), mock.patch.object(review, "exchange", return_value=""), \
+                mock.patch.object(review, "claude", claude), \
+                mock.patch.object(fakes.github, "month_records", unreadable, create=True):
+            out, _ = fakes.run(review.main)
+        record = self.judge_needs(gate_needs(json.dumps(out), security="false", switch_spec="true"))
+        self.assertEqual((record["verdict"], verdict.conclusion(record)), ("ERROR", "failure"), record["error"])
+        self.assertNotIn("spec_skipped", out)
+        self.assertIn("budget read failed", out["error"])
+
+    def test_c2_a_failed_lookup_while_posting_is_an_error(self):
+        def unreadable(*a):
+            raise RuntimeError("503 from the Actions API")
+        record = self.judge_needs(gate_needs(json.dumps(fakes.review_result()), security="false"), month_records=unreadable)
+        self.assertEqual((record["verdict"], verdict.conclusion(record)), ("ERROR", "failure"), record["error"])
+
+    def test_c3_a_fail_whose_only_p0_was_trimmed_survives_a_failed_publish_and_stays_sticky(self):
+        rows = [{"call": "bugs", "severity": "P1", "file": "a.py", "line": 1, "summary": "s" * 150, "failure": "f" * 300}
+                for _ in range(1999)]
+        rows.append({**rows[0], "severity": "P0", "summary": "the only P0"})
+        first = fakes.GitHub(fail={"POST check-runs": [fakes.http_error(502)]})
+        when = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        month = mock.patch.object(fakes.github, "month_records", lambda *a: [(when, {"budget": BUDGET})])
+        result = fakes.review_result(findings=rows)
+        with fakes.installed(first, NEEDS=json.dumps(gate_needs(json.dumps(result), security="false"))), month:
+            fakes.run(verdict.post)
+        posted = verdict.parse_text(first.writes()[-1][2]["output"]["text"])
+        rerun = fakes.GitHub(checks={"h": [fakes.check(1, posted, conclusion=first.writes()[-1][2]["conclusion"])]})
+        clean = gate_needs(json.dumps(fakes.review_result()), security="false")
+        with fakes.installed(rerun, NEEDS=json.dumps(clean)), month:
+            fakes.run(verdict.post)
+        again = verdict.parse_text(rerun.writes()[-1][2]["output"]["text"])
+        self.assertEqual((len(first.writes()), posted["verdict"], posted.get("p0"), again["verdict"]), (2, "FAIL", 1, "FAIL"),
+                         "the fallback posts the computed FAIL, and a clean rerun on the same head still sees it")
+        self.assertNotIn("the only P0", json.dumps(posted["findings"]), "the P0 row itself was trimmed")
+
+
 if __name__ == "__main__":
     unittest.main()

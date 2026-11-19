@@ -105,3 +105,9 @@ def outside_stop_commands(log: str, needle: str) -> list[str]:
     if token is not None:
         out.append(f"block never closed: {token}")
     return out
+
+
+def review_result(**over) -> dict:
+    """A complete, valid review job result: the Bugs call ran and found nothing. Override any key."""
+    return {"findings": [], "security": None, "spec": None, "cost_usd": 0.5, "subscription_cost_usd": 0.0,
+            "billing": "api", "error": None, "budget_refused": False, "calls": ["bugs"], **over}
