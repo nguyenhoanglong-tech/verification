@@ -282,7 +282,8 @@ def main() -> dict:
     items = done_items(spec_text)
     standards = str(Path(e.get("STANDARDS", "CODING_STANDARDS.md")).resolve())
     common = ["--model", e["MODEL"], "--effort", e["EFFORT"], "--max-budget-usd", e.get("BUDGET_USD", "3"),
-              "--tools", "Read", "--allowedTools", f"Read(/{data}/**)",
+              # The standards file is named by its own path: the subscription call's cwd is empty, not the base.
+              "--tools", "Read", "--allowedTools", f"Read(/{data}/**),Read(/{standards})",
               "--disallowedTools", "Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch,Task,Agent", f"Read(/{secret}/**)",
               "--permission-mode", "dontAsk", "--output-format", "json"]
     fill = lambda t: (t.replace("{{BASE_SHA}}", e["BASE_SHA"]).replace("{{DIFF}}", str(data / "diff.patch"))

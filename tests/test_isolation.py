@@ -93,7 +93,7 @@ def plant(head: Path, marks: Path) -> None:
 @unittest.skipUnless(CLI, "set CLAUDE_ISOLATION_CLI to a Claude Code binary to run the isolation test")
 class Isolation(unittest.TestCase):
     def run_route(self, billing: str) -> tuple[dict, list[dict], Path]:
-        tmp = Path(tempfile.mkdtemp())
+        tmp = Path(tempfile.mkdtemp()).resolve()  # the engine resolves the standards path; macOS /tmp is a link
         self.addCleanup(subprocess.run, ["rm", "-rf", str(tmp)])
         review_dir, marks = tmp / "review", tmp / "marks"
         marks.mkdir()
@@ -101,7 +101,10 @@ class Isolation(unittest.TestCase):
         plant(head, marks)
         (review_dir / "data/diff.patch").write_text("diff --git a/sub/x.py b/sub/x.py\n")
         (review_dir / "secret").mkdir(parents=True)
-        api = FakeApi([str(head / "sub/x.py"), str(review_dir / "secret/token"), "/proc/self/environ"])
+        (tmp / "base").mkdir()
+        (tmp / "base/CODING_STANDARDS.md").write_text("R1 STANDARDS_CONTENT\n")
+        api = FakeApi([str(head / "sub/x.py"), str(tmp / "base/CODING_STANDARDS.md"), str(review_dir / "secret/token"),
+                       "/proc/self/environ"])
         self.addCleanup(api.server.shutdown)
         real_run = subprocess.run
 
@@ -113,7 +116,7 @@ class Isolation(unittest.TestCase):
             token_file.write_text(API)
             return ""
         env = {"RUNNER_TEMP": str(tmp), "HEAD_DIR": str(head), "BASE_SHA": "b", "ANTHROPIC": "{}",
-               "MODEL": "claude-opus-5-5", "EFFORT": "medium", "SPEC_TEXT": '""', "STANDARDS": str(tmp / "none.md"),
+               "MODEL": "claude-opus-5-5", "EFFORT": "medium", "SPEC_TEXT": '""', "STANDARDS": str(tmp / "base/CODING_STANDARDS.md"),
                "PACE": json.dumps({"route": billing}), "SUBSCRIPTION_TOKEN": OAUTH, "ANTHROPIC_API_KEY": API}
         with mock.patch.dict(os.environ, env), mock.patch.object(review, "prepare"), \
                 mock.patch.object(review, "exchange", exchange), mock.patch.object(review.subprocess, "run", run):
@@ -127,6 +130,7 @@ class Isolation(unittest.TestCase):
         sent = json.dumps([r["body"] for r in requests])
         self.assertEqual([c for c in CANARIES if c in sent], [], "nothing from the head's config or any token reaches the model")
         self.assertIn("HEAD_FILE_CONTENT", sent, "the fake model's Read of a head file went through")
+        self.assertIn("STANDARDS_CONTENT", sent, "the base's standards file is readable")
         self.assertNotIn("HOME=", sent, "/proc/self/environ was not read")
         self.assertEqual(list(marks.iterdir()), [], "no head hook ran and no head MCP server started")
         self.assertEqual({t["name"] for r in requests for t in r["body"].get("tools") or []}, {"Read"})
