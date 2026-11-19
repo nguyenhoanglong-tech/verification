@@ -4,7 +4,7 @@ name: verification
 on:
   pull_request_target:
     types: [opened, synchronize, reopened]
-    branches: [verify/attack-base]
+    branches: [verify/attack-base, verify/selftest/p4c-order]
 permissions: {}
 concurrency:
   group: verification-${{ github.event.pull_request.number }}
