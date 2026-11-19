@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""The review (D8, D16): the Bugs call, then the Spec call when the switch is on.
+"""The review (D8, D16): the Bugs call, the security call when the PR touches a risk path (dotfiles#3408), then the
+Spec call when the switch is on.
 
 Each call is billed to the API (`claude --bare -p`, the federation token through apiKeyHelper) or, when the API budget
 refuses, to the Claude subscription (D18 as amended 2026-11-19). The tier job picks the first route; a call the API
 refuses for spend or credit is retried once on the subscription when the subscription may run.
 The head never sits in a working directory: its files and diff are copied to $RUNNER_TEMP/review/data and read as data,
 so no head CLAUDE.md, command, skill or setting can load (amendment item 9).
-Writes one JSON `result` output: {findings, spec, cost_usd, subscription_cost_usd, billing, error, budget_refused}.
+Writes one JSON `result` output: {findings, security, spec, cost_usd, subscription_cost_usd, billing, error,
+budget_refused, calls}, plus refused and limit when they apply. calls lists every call that ran and parsed, in order;
+the gate passes a run only when it holds every call the tier job owed (verdict.parse_review checks the shape).
 
   review.py
 """
@@ -28,7 +31,7 @@ ENGINE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ENGINE))
 import github  # noqa: E402
 from tier import done_items  # noqa: E402
-from verdict import budget_base, log_data, route  # noqa: E402
+from verdict import SEVERITIES, STATUSES, budget_base, log_data, route, unrun_security  # noqa: E402
 
 # The org's Console spend limit refuses with this text (HTTP 400, invalid_request_error). It is the budget, not an error.
 SPEND_LIMIT = re.compile(r"You have reached your specified (?:workspace )?API usage limits")
@@ -37,8 +40,6 @@ CREDIT = re.compile(r"credit balance is too low", re.I)
 # "You've hit your limit · resets 3pm". A token the CLI cannot use is an error: "Not logged in", or a 401.
 PLAN_LIMIT = re.compile(r"Claude AI usage limit reached|You[’']ve hit your (?:\w+ )?limit", re.I)
 AUTH = re.compile(r"Not logged in|authentication_error|OAuth (?:access )?token|\b401\b", re.I)
-SEVERITIES = ("P0", "P1")
-STATUSES = ("Yes", "Partly", "No")
 
 
 def failure_kind(text: str, billing: str = "api") -> str:
@@ -105,12 +106,12 @@ def findings_list(text: str) -> list | None:
     return value if isinstance(value, list) else None
 
 
-def bugs_findings(result: dict, head_dir: str) -> list[dict]:
-    """/code-review returns a JSON array in its result text. A finding with no valid severity is a P0: D8's review
-    base counts every bug-hunt finding."""
+def findings_of(result: dict, head_dir: str, call: str = "bugs") -> list[dict]:
+    """The Bugs and the security call return a JSON array in their result text. A finding with no valid severity is a
+    P0: D8's review base counts every bug-hunt finding."""
     items = findings_list(result.get("result", ""))
     if not isinstance(items, list):
-        raise ValueError("no findings list in the Bugs call's output")
+        raise ValueError(f"no findings list in the {call} call's output")
     findings = []
     for x in items:
         path = str(x.get("file") or "").removeprefix(head_dir.rstrip("/") + "/") if isinstance(x, dict) else ""
@@ -118,9 +119,10 @@ def bugs_findings(result: dict, head_dir: str) -> list[dict]:
             raise ValueError(f"malformed finding: {str(x)[:200]}")
         line = x.get("line")
         if x.get("severity") not in SEVERITIES:
-            log_data(f"bugs: a finding had no valid severity ({x.get('severity')!r}); counted as P0")
-        findings.append({"call": "bugs", "severity": x.get("severity") if x.get("severity") in SEVERITIES else "P0",
-                         "file": path, "line": line if isinstance(line, int) else None, "summary": str(x["summary"]),
+            log_data(f"{call}: a finding had no valid severity ({x.get('severity')!r}); counted as P0")
+        findings.append({"call": call, "severity": x.get("severity") if x.get("severity") in SEVERITIES else "P0",
+                         "file": path, "line": line if isinstance(line, int) and not isinstance(line, bool) else None,
+                         "summary": str(x["summary"]),
                          "failure": str(x.get("failure") or x.get("failure_scenario") or "")})
     return findings
 
@@ -130,8 +132,9 @@ def spec_table(result: dict) -> dict:
     if not (isinstance(out, dict) and out.get("answer") in STATUSES and isinstance(out.get("items"), list)
             and all(isinstance(i, dict) and i.get("status") in STATUSES and i.get("item") for i in out["items"])):
         raise ValueError("no Spec table in the Spec call's output")
-    return {"answer": out["answer"], "items": [{"n": i.get("n"), "item": i["item"], "status": i["status"],
-                                               "evidence": i.get("evidence", "")} for i in out["items"]]}
+    n = lambda v: v if isinstance(v, int) and not isinstance(v, bool) else None
+    return {"answer": out["answer"], "items": [{"n": n(i.get("n")), "item": str(i["item"]), "status": i["status"],
+                                               "evidence": str(i.get("evidence") or "")} for i in out["items"]]}
 
 
 def outcome(proc_rc: int, stdout: str, stderr: str, billing: str = "api") -> tuple[dict | None, str]:
@@ -247,15 +250,20 @@ def claude(args: list[str], prompt: str, billing: str, runner: Runner) -> tuple[
     return p.returncode, p.stdout, p.stderr
 
 
+class BudgetUnreadable(Exception):
+    """The budget could not be read again. That is no refusal: the run ends with an error, never a budget skip."""
+
+
 def reroute(pace: dict, api_spent: float, token: bool, refused: str = "") -> tuple[str | None, str]:
     """(billing, why) for the next call, from the budget read again: other gate runs may have paid since the tier job
-    read it. This run already counts as one review on whichever route it used. A failed read allows no paid call."""
+    read it. This run already counts as one review on whichever route it used. None is a cap refusal; a failed read
+    raises BudgetUnreadable."""
     now = datetime.now(timezone.utc)
     try:
         totals = budget_base(github.month_records(os.environ["GITHUB_REPOSITORY"],
                                                   os.environ.get("GITHUB_WORKFLOW_REF", ""), now), now)
     except Exception as x:
-        return None, "; ".join(filter(None, [refused, f"budget read failed: {x}"[:300]]))
+        raise BudgetUnreadable(f"budget read failed: {x}"[:300]) from x
     totals["month_usd"] += api_spent
     billing, why = route(totals, pace, token, refused)
     print(f"budget re-read: {totals['reviews_today']} other paid reviews today of {pace.get('reviews_per_day')}, "
@@ -266,8 +274,8 @@ def reroute(pace: dict, api_spent: float, token: bool, refused: str = "") -> tup
 
 
 def empty_result() -> dict:
-    return {"findings": [], "spec": None, "cost_usd": 0.0, "subscription_cost_usd": 0.0, "billing": None, "error": None,
-            "budget_refused": False}
+    return {"findings": [], "security": None, "spec": None, "cost_usd": 0.0, "subscription_cost_usd": 0.0,
+            "billing": None, "error": None, "budget_refused": False, "calls": []}
 
 
 def main() -> dict:
@@ -283,14 +291,21 @@ def main() -> dict:
         d.mkdir(parents=True, exist_ok=True)
     secret.chmod(0o700)
     out = empty_result()
+    if e.get("SECURITY") == "true":
+        out["security"] = unrun_security()
     prepare(Path(e["HEAD_DIR"]), e["BASE_SHA"], data)
     runner = Runner(token_file=secret / "token", home=home, cwd=cwd, oauth=oauth)
     pace = json.loads(e.get("PACE") or "{}")
     billing, exchanged, used, refused = pace.get("route") or "api", False, [], ""
-    base = Path.cwd()
+    base = Path.cwd().resolve()
     spec_text = json.loads(e.get("SPEC_TEXT") or '""')
     items = done_items(spec_text)
-    standards = str(Path(e.get("STANDARDS", "CODING_STANDARDS.md")).resolve())
+    standards = (base / e.get("STANDARDS", "CODING_STANDARDS.md")).resolve()
+    # The path comes from the base toml; every call is allowed to Read it, so it must stay inside the base checkout.
+    if not standards.is_relative_to(base):
+        out["error"] = f"the standards file {standards} is outside the base checkout {base}"
+        return out
+    standards = str(standards)
     common = ["--model", e["MODEL"], "--effort", e["EFFORT"], "--max-budget-usd", e.get("BUDGET_USD", "3"),
               # The base and the standards file are named by their own paths: the subscription call's cwd is empty.
               "--tools", "Read", "--allowedTools", f"Read(/{data}/**),Read(/{base}/**),Read(/{standards})",
@@ -306,15 +321,22 @@ def main() -> dict:
     # --json-schema result never comes back from the fork, so its findings arrive as a JSON array in the result text.
     calls = [("bugs", common, f"/code-review {e.get('LEVEL', 'medium')} {data / 'diff.patch'}\n\n"
               + fill((ENGINE / "prompts/bugs.md").read_text()))]
+    # Not /security-review: its prompt runs `git status` and `git diff` through Bash, which this sandbox never grants.
+    if out["security"]:
+        calls.append(("security", common, fill((ENGINE / "prompts/security.md").read_text())))
     if spec_text:
         calls.append(("spec", common + ["--json-schema", (ENGINE / "schema/spec.json").read_text()],
                       fill((ENGINE / "prompts/spec.md").read_text())))
     for name, args, prompt in calls:
         if name == "spec":
-            billing, why = reroute(pace, out["cost_usd"], bool(oauth), refused)
+            try:
+                billing, why = reroute(pace, out["cost_usd"], bool(oauth), refused)
+            except BudgetUnreadable as x:
+                out["error"] = f"spec call: {x}"
+                return out
             if billing is None:
-                print(f"Spec call skipped: {why}")
-                out["spec_skipped"] = why
+                print(f"Spec call refused by the budget: {why}")
+                out.update(budget_refused=True, limit=f"Spec call: {why}")
                 return out
         retried = False
         while True:
@@ -329,6 +351,8 @@ def main() -> dict:
             cost = float((result or {}).get("total_cost_usd") or 0)
             spent = "cost_usd" if billing == "api" else "subscription_cost_usd"
             out[spent] = round(out[spent] + cost, 6)
+            if name == "security":
+                out["security"][spent] = round(out["security"][spent] + cost, 6)
             # A subscription call counts against its daily cap once it ran, whatever came back; an API call is
             # billed when it cost something or returned a result.
             if billing not in used and (billing == "subscription" or cost or not failure):
@@ -344,7 +368,11 @@ def main() -> dict:
                 retried = True
                 out["refused"] = "api spend limit" if kind == "budget" else "api credit"
                 refused = "API spend limit refused the call" if kind == "budget" else "API credit balance too low"
-                billing, why = reroute(pace, out["cost_usd"], bool(oauth), refused)
+                try:
+                    billing, why = reroute(pace, out["cost_usd"], bool(oauth), refused)
+                except BudgetUnreadable as x:
+                    out["error"] = f"{name} call: {refused}; {x}"
+                    return out
                 if billing == "subscription":
                     print(f"{name} call: retried on the subscription ({why})")
                     continue
@@ -359,9 +387,12 @@ def main() -> dict:
             return out
         try:
             if name == "bugs":
-                out["findings"] = bugs_findings(result, str(data / "head"))
+                out["findings"] = findings_of(result, str(data / "head"))
+            elif name == "security":
+                out["security"].update(ran=True, findings=findings_of(result, str(data / "head"), "security"))
             else:
                 out["spec"] = {**spec_table(result), "sent": items}
+            out["calls"].append(name)
         except ValueError as x:
             fields = {k: result.get(k) for k in ("subtype", "num_turns", "local_command", "permission_denials",
                                                  "structured_output")}

@@ -12,7 +12,8 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "engine/claude-job"))
 import review  # noqa: E402
-from review import bugs_findings, failure_kind, outcome, spec_table  # noqa: E402
+import verdict  # noqa: E402
+from review import findings_of, failure_kind, outcome, spec_table  # noqa: E402
 sys.path.insert(0, str(ROOT / "tests"))
 import fakes  # noqa: E402
 
@@ -87,6 +88,7 @@ class Logging(unittest.TestCase):
                 mock.patch.object(review, "prepare"), mock.patch.object(review, "exchange", return_value=""), \
                 mock.patch.object(review, "claude", lambda *a: (0, cli, "")):
             out, log = fakes.run(review.main)
+            assert not verdict.parse_review(json.dumps(out))[1], verdict.parse_review(json.dumps(out))[1]
         self.assertIn("unparseable output", out["error"])
         self.assertIn("MODEL-TEXT", log)
         self.assertIn('"local_command": "code_review"', log)
@@ -116,8 +118,11 @@ class SpecBudget(unittest.TestCase):
                 mock.patch.object(review, "claude", claude), \
                 mock.patch.object(fakes.github, "month_records", lambda *a: records, create=True):
             out, _ = fakes.run(review.main)
+            assert not verdict.parse_review(json.dumps(out))[1], verdict.parse_review(json.dumps(out))[1]
         self.assertEqual(len(calls), 1, "the Spec call did not run")
-        self.assertTrue(out.get("spec_skipped"))
+        self.assertNotIn("spec_skipped", out)
+        self.assertEqual((out["budget_refused"], out["calls"]), (True, ["bugs"]))
+        self.assertIn("Spec call: API daily pace 5/5", out["limit"])
         self.assertEqual((out["cost_usd"], out["spec"], out["error"]), (1.5, None, None))
 
 
@@ -147,6 +152,7 @@ class BugsCall(unittest.TestCase):
                     mock.patch.object(review, "reroute", return_value=("api", "")), \
                     mock.patch.object(review, "claude", claude):
                 out, log = fakes.run(review.main)
+                assert not verdict.parse_review(json.dumps(out))[1], verdict.parse_review(json.dumps(out))[1]
         finally:
             os.chdir(old)
         return calls, out, log
@@ -234,96 +240,96 @@ class Bugs(unittest.TestCase):
     def test_json_array_from_code_review_text(self):
         text = ('Findings:\n```json\n[{"file": "' + HEAD + '/a.py", "line": 4, "summary": "off by one", '
                 '"failure_scenario": "age 18 -> False", "severity": "P0"},\n {"file": "b.py", "summary": "style"}]\n```')
-        got = bugs_findings({"result": text}, HEAD)
+        got = findings_of({"result": text}, HEAD)
         self.assertEqual([(f["file"], f["line"], f["severity"]) for f in got], [("a.py", 4, "P0"), ("b.py", None, "P0")])
         self.assertEqual(got[0]["failure"], "age 18 -> False")
 
     def test_fenced_array_with_one_finding_per_line(self):
         text = ('```json\n[\n{"file": "a.py", "line": 1, "summary": "s1", "severity": "P1"},\n'
                 '{"file": "b.py", "line": 2, "summary": "s2", "severity": "P0"}\n]\n```\n')
-        self.assertEqual([f["file"] for f in bugs_findings({"result": text}, HEAD)], ["a.py", "b.py"])
+        self.assertEqual([f["file"] for f in findings_of({"result": text}, HEAD)], ["a.py", "b.py"])
 
     def test_fenced_object_then_fenced_findings_array(self):
         text = ('Each finding looks like:\n```json\n{"file": "x.py", "line": 1}\n```\n'
                 '```json\n[{"file": "a.py", "line": 3, "summary": "s", "severity": "P1"}]\n```')
-        self.assertEqual([(f["file"], f["line"]) for f in bugs_findings({"result": text}, HEAD)], [("a.py", 3)])
+        self.assertEqual([(f["file"], f["line"]) for f in findings_of({"result": text}, HEAD)], [("a.py", 3)])
 
     def test_crlf_fenced_array_over_several_lines(self):
         text = ('Findings:\r\n```json\r\n[\r\n{"file": "a.py", "line": 7, "summary": "s", "severity": "P0"}\r\n]\r\n```'
                 '\r\n')
-        self.assertEqual([(f["file"], f["line"]) for f in bugs_findings({"result": text}, HEAD)], [("a.py", 7)])
+        self.assertEqual([(f["file"], f["line"]) for f in findings_of({"result": text}, HEAD)], [("a.py", 7)])
 
     def test_json_outside_a_json_fence_is_never_a_finding(self):
         for text in ('```text\n[{"file": "x.py", "line": 1, "summary": "example"}]\n```',
                      '[{"file": "a.py", "line": 3, "summary": "s", "severity": "P1"}]',
                      'No findings.\n[]'):
             with self.assertRaises(ValueError, msg=text):
-                bugs_findings({"result": text}, HEAD)
+                findings_of({"result": text}, HEAD)
 
     def test_reply_that_does_not_end_with_the_json_block_is_an_error(self):
         block = '```json\n[{"file": "a.py", "line": 5, "summary": "s", "severity": "P0"}]\n```'
         for text in (block + '\nWith no findings the output is:\n```\n[]\n```', block + '\nDone.'):
             with self.assertRaises(ValueError, msg=text):
-                bugs_findings({"result": text}, HEAD)
+                findings_of({"result": text}, HEAD)
 
     def test_fence_markers_inside_an_earlier_example_do_not_move_the_block(self):
         text = ('An example:\n~~~text\n```json\n~~~\n'
                 '```json\n[{"file": "a.py", "line": 9, "summary": "s", "severity": "P1"}]\n```')
-        self.assertEqual([(f["file"], f["line"]) for f in bugs_findings({"result": text}, HEAD)], [("a.py", 9)])
+        self.assertEqual([(f["file"], f["line"]) for f in findings_of({"result": text}, HEAD)], [("a.py", 9)])
 
     def test_indented_example_is_never_a_finding(self):
         text = ('The format is:\n\n    ```json\n    [{"file": "x.py", "line": 1,\n      "summary": "example"}]\n    ```\n')
         with self.assertRaises(ValueError):
-            bugs_findings({"result": text}, HEAD)
+            findings_of({"result": text}, HEAD)
 
     def test_closing_fence_indented_up_to_three_spaces_is_read(self):
         text = 'Findings:\n```json\n[{"file": "a.py", "line": 2, "summary": "s", "severity": "P0"}]\n  ```\n'
-        self.assertEqual([f["file"] for f in bugs_findings({"result": text}, HEAD)], ["a.py"])
+        self.assertEqual([f["file"] for f in findings_of({"result": text}, HEAD)], ["a.py"])
 
     def test_json_lines_inside_a_final_text_block_are_never_findings(self):
         text = ('```text\n```json\nprose\n```json\n[{"file": "x.py", "line": 1, "summary": "example"}]\n```')
         with self.assertRaises(ValueError):
-            bugs_findings({"result": text}, HEAD)
+            findings_of({"result": text}, HEAD)
 
     def test_longer_fence_and_info_words_follow_commonmark(self):
         text = ('```json findings\n[{"file": "a.py", "line": 3, "summary": "s", "severity": "P1"}]\n`````')
-        self.assertEqual([f["line"] for f in bugs_findings({"result": text}, HEAD)], [3])
+        self.assertEqual([f["line"] for f in findings_of({"result": text}, HEAD)], [3])
 
     def test_closing_fence_followed_by_a_no_break_space_does_not_close(self):
         with self.assertRaises(ValueError):
-            bugs_findings({"result": "```json\n[]\n```\xa0"}, HEAD)
+            findings_of({"result": "```json\n[]\n```\xa0"}, HEAD)
 
     def test_info_string_is_split_on_spaces_and_tabs_only(self):
         for info in ("\x1cjson", "json\x1c", "\x85json", "\u2003json", "json\xa0"):
             with self.assertRaises(ValueError, msg=repr(info)):
-                bugs_findings({"result": f"```{info}\n[]\n```"}, HEAD)
-        self.assertEqual(bugs_findings({"result": "``` json\tfindings \n[]\n```"}, HEAD), [])
+                findings_of({"result": f"```{info}\n[]\n```"}, HEAD)
+        self.assertEqual(findings_of({"result": "``` json\tfindings \n[]\n```"}, HEAD), [])
 
     def test_nul_and_opener_indent_follow_commonmark(self):
         self.assertEqual(review.final_block(" ```json\n []\n```"), ("json", "[]"))
         text = '```json\n[{"file": "a.py", "line": 1, "summary": "a\x00b", "severity": "P1"}]\n```'
-        self.assertEqual([f["summary"] for f in bugs_findings({"result": text}, HEAD)], ["a\ufffdb"])
+        self.assertEqual([f["summary"] for f in findings_of({"result": text}, HEAD)], ["a\ufffdb"])
 
     def test_list_quote_or_html_with_an_indented_fence_is_an_error(self):
         for text in ('<!--\n```json\n[]\n```', '<div>\n\n```json\n[]\n```', '- item\n  ~~~json\n[]\n~~~',
                      '> q\n```json\n[]\n  ```'):
             with self.assertRaises(ValueError, msg=text):
-                bugs_findings({"result": text}, HEAD)
+                findings_of({"result": text}, HEAD)
 
     def test_review_with_a_bullet_list_then_the_block_at_column_0_is_read(self):
         text = ('- **P0** a.py:1 off by one\n> quoted line\n\n```json\n'
                 '[{"file": "a.py", "line": 1, "summary": "<b>", "severity": "P0"}]\n```')
-        self.assertEqual([f["file"] for f in bugs_findings({"result": text}, HEAD)], ["a.py"])
+        self.assertEqual([f["file"] for f in findings_of({"result": text}, HEAD)], ["a.py"])
 
     def test_finding_without_a_file_is_malformed(self):
         for item in ({"summary": "example"}, {"summary": "s", "file": ""}, {"summary": "s", "file": HEAD + "/"}):
             with self.assertRaises(ValueError, msg=item):
-                bugs_findings({"result": f"```json\n{json.dumps([item])}\n```"}, HEAD)
+                findings_of({"result": f"```json\n{json.dumps([item])}\n```"}, HEAD)
 
     def test_empty_and_unparseable(self):
-        self.assertEqual(bugs_findings({"result": "No findings.\n```json\n[]\n```"}, HEAD), [])
+        self.assertEqual(findings_of({"result": "No findings.\n```json\n[]\n```"}, HEAD), [])
         with self.assertRaises(ValueError):
-            bugs_findings({"result": "I could not review this."}, HEAD)
+            findings_of({"result": "I could not review this."}, HEAD)
 
 
 class Spec(unittest.TestCase):

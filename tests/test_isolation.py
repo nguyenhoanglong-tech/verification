@@ -1,7 +1,7 @@
 """The subscription call runs without --bare (which reads no OAuth token), so it must rebuild --bare's isolation.
 
-This runs review.main() with the pinned CLI against a fake Messages API on 127.0.0.1, once per billing route, with both
-the Bugs and the Spec call. The fake model asks to Read a head file, a base file, the secret token and the process
+This runs review.main() with the pinned CLI against a fake Messages API on 127.0.0.1, once per billing route, with the
+Bugs, the security and the Spec call. The fake model asks to Read a head file, a base file, the secret token and the process
 environ, then answers: no findings, and a Spec table through the StructuredOutput tool. The test checks
 what reached the model: nothing from the head's CLAUDE.md, AGENTS.md, skills, hooks or MCP config, no token, and the
 same system prompt and tools on both routes. Skipped unless CLAUDE_ISOLATION_CLI names a CLI binary (test.yml sets it).
@@ -22,6 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "engine/claude-job"))
 import fakes  # noqa: E402
 import review  # noqa: E402
+import verdict  # noqa: E402
 
 CLI = os.environ.get("CLAUDE_ISOLATION_CLI", "")
 OAUTH = "sk-" + "ant-oat01-ISOLATIONCANARY"  # split: a whole token-shaped literal trips secret scanners
@@ -124,7 +125,7 @@ class Isolation(unittest.TestCase):
             token_file.write_text(API)
             return ""
         env = {"RUNNER_TEMP": str(tmp), "HEAD_DIR": str(head), "BASE_SHA": "b", "ANTHROPIC": "{}",
-               "MODEL": "claude-opus-5-5", "EFFORT": "medium", "SPEC_TEXT": json.dumps("## Done when\n- a\n"), "STANDARDS": str(tmp / "base/CODING_STANDARDS.md"),
+               "MODEL": "claude-opus-5-5", "EFFORT": "medium", "SPEC_TEXT": json.dumps("## Done when\n- a\n"), "SECURITY": "true", "STANDARDS": str(tmp / "base/CODING_STANDARDS.md"),
                "PACE": json.dumps({"route": billing, "reviews_per_day": 5 if billing == "api" else 0, "budget_month_usd": 100,
                                    "subscription_fallback": True, "subscription_per_day": 5}),
                "GITHUB_REPOSITORY": "o/r", "SUBSCRIPTION_TOKEN": OAUTH, "ANTHROPIC_API_KEY": API}
@@ -132,8 +133,10 @@ class Isolation(unittest.TestCase):
                 mock.patch.object(review, "exchange", exchange), mock.patch.object(review.subprocess, "run", run), \
                 mock.patch.object(review.github, "month_records", lambda *a: []):
             out, log = fakes.run(review.main)
+            assert not verdict.parse_review(json.dumps(out))[1], verdict.parse_review(json.dumps(out))[1]
         self.assertEqual((out["error"], out["billing"], out["findings"]), (None, billing, []), log[-2000:])
-        self.assertEqual(out["spec"]["answer"], "Yes", "the second call ran too")
+        self.assertEqual((out["security"]["ran"], out["security"]["findings"]), (True, []), "the security call ran")
+        self.assertEqual(out["spec"]["answer"], "Yes", "the Spec call ran too")
         return out, api.requests, marks
 
     def check_route(self, billing: str) -> list[dict]:

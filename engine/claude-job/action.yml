@@ -1,9 +1,10 @@
 name: verification review
-description: The Bugs call and, when the switch is on, the Spec call, on the API or the Claude subscription (D8, D16, D18), with the PR head read as data.
+description: The Bugs call, the security call on a risk-path PR and, when the switch is on, the Spec call, on the API or the Claude subscription (D8, D16, D18), with the PR head read as data.
 inputs:
   model: {required: true, description: Claude model id}
   effort: {required: true, description: reasoning effort}
   level: {required: false, default: medium, description: /code-review level}
+  security: {required: false, default: "false", description: "\"true\" when the PR touches a [tiers] risk path: the security call runs"}
   base_sha: {required: true, description: the base branch tip the tier job resolved}
   anthropic: {required: true, description: "JSON with federation_rule_id, organization_id, service_account_id, workspace_id"}
   spec_text: {required: false, default: '""', description: "JSON string: the done-when sections the Spec call checks; empty means no Spec call"}
@@ -12,7 +13,7 @@ inputs:
   pace: {required: false, default: "{}", description: "JSON: the tier job's budget (caps, totals, billing route); each re-read routes against it"}
   claude_code_oauth_token: {required: false, default: "", description: "D18: the subscription token; empty means no subscription call"}
 outputs:
-  result: {description: "JSON: findings, spec, cost_usd, subscription_cost_usd, billing, error, budget_refused", value: "${{ steps.review.outputs.result }}"}
+  result: {description: "JSON: findings, security, spec, cost_usd, subscription_cost_usd, billing, error, budget_refused", value: "${{ steps.review.outputs.result }}"}
   head: {description: head SHA the review ran on, value: "${{ steps.head.outputs.head }}"}
 runs:
   using: composite
@@ -41,6 +42,7 @@ runs:
         MODEL: ${{ inputs.model }}
         EFFORT: ${{ inputs.effort }}
         LEVEL: ${{ inputs.level }}
+        SECURITY: ${{ inputs.security }}
         ANTHROPIC: ${{ inputs.anthropic }}
         SPEC_TEXT: ${{ inputs.spec_text }}
         STANDARDS: ${{ inputs.standards }}
