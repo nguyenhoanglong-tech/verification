@@ -1,0 +1,24 @@
+# Throwaway self-test caller for #3308 box proofs. PRs into verify/selftest/g2 run the gate from engine main 10f9f16abb853a063fbce3531689084e47cdf256.
+name: verification
+run-name: verification ${{ github.event.pull_request.head.sha }}
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [verify/selftest/g2]
+permissions: {}
+concurrency:
+  group: verification-selftest-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  verification:
+    permissions:
+      actions: read
+      contents: read
+      checks: write
+      issues: read
+      pull-requests: write
+      id-token: write
+    uses: nguyenhoanglong-tech/verification/.github/workflows/gate.yml@10f9f16abb853a063fbce3531689084e47cdf256
+    with:
+      engine_ref: 10f9f16abb853a063fbce3531689084e47cdf256
+      runner: ${{ vars.VERIFICATION_RUNNER || 'ubuntu-24.04' }}
