@@ -8,10 +8,6 @@ from datetime import datetime, timedelta
 
 from verdict import parse_text
 
-# GitHub Actions. Every workflow posts as this app, a PR's own included, so its `verification` check counts only at or
-# below the caller's cut-over id: the gate's own checks from before the gate App (chrislongnguyen/dotfiles#3383).
-ACTIONS_APP = 15368
-
 
 def api(path: str, method: str = "GET", body: dict | None = None, raw: bool = False, token: str | None = None):
     url = path if path.startswith("https://") else f"{os.environ.get('GITHUB_API_URL', 'https://api.github.com')}/{path}"
@@ -33,11 +29,11 @@ def graphql(query: str, **variables) -> dict:
 
 
 def gate_posted(run: dict) -> bool:
-    """A `verification` check run the gate posted: the gate App's (GATE_APP_ID), or GitHub Actions' at or below
-    LEGACY_CUTOVER. A bad value raises, and every reader fails closed."""
-    app, cutover = (run.get("app") or {}).get("id"), int(os.environ.get("LEGACY_CUTOVER") or 0)
+    """A `verification` check run the gate App (GATE_APP_ID) posted. Never one from GitHub Actions, the gate's poster
+    before the App, not even an old one: any job holding checks: write, a PR's own included, can rewrite any GitHub
+    Actions check run's conclusion and text (chrislongnguyen/dotfiles#3383)."""
     gate = os.environ.get("GATE_APP_ID", "")
-    return (gate.isdigit() and app == int(gate)) or (app == ACTIONS_APP and run["id"] <= cutover)
+    return gate.isdigit() and (run.get("app") or {}).get("id") == int(gate)
 
 
 def verification_runs(repo: str, sha: str) -> list[dict]:
