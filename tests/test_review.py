@@ -12,6 +12,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "engine/claude-job"))
 import review  # noqa: E402
+import verdict  # noqa: E402
 from review import findings_of, failure_kind, outcome, spec_table  # noqa: E402
 sys.path.insert(0, str(ROOT / "tests"))
 import fakes  # noqa: E402
@@ -87,6 +88,7 @@ class Logging(unittest.TestCase):
                 mock.patch.object(review, "prepare"), mock.patch.object(review, "exchange", return_value=""), \
                 mock.patch.object(review, "claude", lambda *a: (0, cli, "")):
             out, log = fakes.run(review.main)
+            assert not verdict.parse_review(json.dumps(out))[1], verdict.parse_review(json.dumps(out))[1]
         self.assertIn("unparseable output", out["error"])
         self.assertIn("MODEL-TEXT", log)
         self.assertIn('"local_command": "code_review"', log)
@@ -116,6 +118,7 @@ class SpecBudget(unittest.TestCase):
                 mock.patch.object(review, "claude", claude), \
                 mock.patch.object(fakes.github, "month_records", lambda *a: records, create=True):
             out, _ = fakes.run(review.main)
+            assert not verdict.parse_review(json.dumps(out))[1], verdict.parse_review(json.dumps(out))[1]
         self.assertEqual(len(calls), 1, "the Spec call did not run")
         self.assertNotIn("spec_skipped", out)
         self.assertEqual((out["budget_refused"], out["calls"]), (True, ["bugs"]))
@@ -149,6 +152,7 @@ class BugsCall(unittest.TestCase):
                     mock.patch.object(review, "reroute", return_value=("api", "")), \
                     mock.patch.object(review, "claude", claude):
                 out, log = fakes.run(review.main)
+                assert not verdict.parse_review(json.dumps(out))[1], verdict.parse_review(json.dumps(out))[1]
         finally:
             os.chdir(old)
         return calls, out, log

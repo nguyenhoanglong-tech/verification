@@ -248,6 +248,7 @@ class MidRun(unittest.TestCase):
                 mock.patch.object(review, "claude", claude), \
                 mock.patch.object(fakes.github, "month_records", month_records, create=True):
             out, log = fakes.run(review.main)
+            assert not verdict.parse_review(json.dumps(out))[1], verdict.parse_review(json.dumps(out))[1]
             self.assertNotIn("SUBSCRIPTION_TOKEN", os.environ, "the token leaves the process env before any call")
         return calls, out, log
 

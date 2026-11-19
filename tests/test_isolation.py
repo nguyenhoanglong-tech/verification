@@ -22,6 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "engine/claude-job"))
 import fakes  # noqa: E402
 import review  # noqa: E402
+import verdict  # noqa: E402
 
 CLI = os.environ.get("CLAUDE_ISOLATION_CLI", "")
 OAUTH = "sk-" + "ant-oat01-ISOLATIONCANARY"  # split: a whole token-shaped literal trips secret scanners
@@ -132,6 +133,7 @@ class Isolation(unittest.TestCase):
                 mock.patch.object(review, "exchange", exchange), mock.patch.object(review.subprocess, "run", run), \
                 mock.patch.object(review.github, "month_records", lambda *a: []):
             out, log = fakes.run(review.main)
+            assert not verdict.parse_review(json.dumps(out))[1], verdict.parse_review(json.dumps(out))[1]
         self.assertEqual((out["error"], out["billing"], out["findings"]), (None, billing, []), log[-2000:])
         self.assertEqual((out["security"]["ran"], out["security"]["findings"]), (True, []), "the security call ran")
         self.assertEqual(out["spec"]["answer"], "Yes", "the Spec call ran too")

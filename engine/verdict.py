@@ -135,8 +135,9 @@ def decide(*, head_sha, base_sha, tiers, mode, switch_spec, machine, review, bud
     owed: the calls the tier job owed (bugs, security, spec); done: the calls the review job ran and parsed.
 
     The one verdict rule. FAIL: a machine check failed, a P0 was found, or an earlier run on this head failed. PASS:
-    only when nothing failed, nothing went wrong, and every owed call is in done, or the budget refused the review
-    (budget["skipped"] is True, set only from an explicit cap refusal). Everything else is ERROR.
+    only when nothing failed, nothing went wrong, and every owed call is in done, or a real cap refusal skipped it
+    (budget["skipped"] is True, set only from an explicit bool-true refusal; DECISIONS D18, D21). Everything else is
+    ERROR: a lookup that failed, a malformed result, or an owed call that did not run for any other reason.
     """
     findings = list((review or {}).get("findings", [])) + spec_findings((review or {}).get("spec"))
     security = (review or {}).get("security") or (unrun_security() if security_owed else None)

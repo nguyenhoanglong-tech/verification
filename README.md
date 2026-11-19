@@ -20,8 +20,9 @@ rule, the budget pace and the dotfiles finding log read that record.
 
 One rule in `verdict.decide()` sets the verdict. FAIL: a machine check failed, a review found a P0, or an earlier run on
 this head failed. PASS only when none of that holds, nothing went wrong, and every call the tier job owed (`bugs`,
-`security`, `spec`) is in the review job's `calls`, or the review was refused by a budget cap (`budget_refused`
-is the bool `true`, or the tier job's own cap check skipped it). Everything else is ERROR: a review result that fails
+`security`, `spec`) is in the review job's `calls`, or a real budget cap refused the review (`budget_refused` is the
+bool `true`, or the tier job's own cap check skipped it): that is `review skipped: budget` (D18, D21), and the machine
+checks decide. Everything else is ERROR: a review result that fails
 `verdict.parse_review`'s schema, a budget or tier lookup that raised (before the Spec call or while posting), or an
 owed call that did not run. When posting the check fails, the fallback posts the verdict and P0 count the judge
 already computed, so a FAIL stays FAIL and stays sticky.

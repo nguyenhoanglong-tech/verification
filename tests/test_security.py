@@ -55,6 +55,7 @@ def review_main(security, sec_reply=None):
             mock.patch.object(review, "prepare"), mock.patch.object(review, "exchange", return_value=""), \
             mock.patch.object(review, "claude", claude):
         out, _ = fakes.run(review.main)
+        assert not verdict.parse_review(json.dumps(out))[1], verdict.parse_review(json.dumps(out))[1]
     return out, calls
 
 
@@ -276,6 +277,7 @@ class Record(unittest.TestCase):
                         mock.patch.object(review, "prepare"), mock.patch.object(review, "exchange", return_value=""), \
                         mock.patch.object(review, "claude", lambda *a: calls.append(a) or reply("```json\n[]\n```", 0.1)):
                     out, _ = fakes.run(review.main)
+                    assert not verdict.parse_review(json.dumps(out))[1], verdict.parse_review(json.dumps(out))[1]
             finally:
                 os.chdir(old)
         self.assertEqual(calls, [], "no model call reads a file outside the base")
@@ -308,6 +310,17 @@ class FailClosedByConstruction(unittest.TestCase):
         record = self.judge_needs(gate_needs(json.dumps(result), security="false", switch_spec="true"))
         self.assertEqual((record["verdict"], verdict.conclusion(record)), ("ERROR", "failure"), record["error"])
 
+    def test_c2_a_real_cap_refusal_before_the_spec_call_stays_a_budget_skip(self):
+        """D18, D21: the pin for the other side of C2. A real cap refusal is the budget, and the machine checks decide."""
+        result = fakes.review_result(budget_refused=True, limit="Spec call: API daily pace 5/5")
+        record = self.judge_needs(gate_needs(json.dumps(result), security="false", switch_spec="true"))
+        self.assertEqual((record["verdict"], record["title"], record["budget"]["skipped"]),
+                         ("PASS", "T2 passed (review skipped: budget)", True), record["error"])
+        failing = gate_needs(json.dumps(result), security="false", switch_spec="true", has_checks="true",
+                             checks="dW5pdA==:dHJ1ZQ==")
+        failing["checks"] = {"result": "success", "outputs": {"head": "h", "results": '[{"name":"unit","result":"fail"}]'}}
+        self.assertEqual(self.judge_needs(failing)["verdict"], "FAIL", "the machine checks still decide")
+
     def test_c2_a_failed_lookup_before_the_spec_call_is_an_error(self):
         def claude(args, prompt, billing, runner):
             return reply("```json\n[]\n```", 0.5) if prompt.startswith("/code-review") else reply("done", 0.1)
@@ -322,6 +335,7 @@ class FailClosedByConstruction(unittest.TestCase):
                 mock.patch.object(review, "claude", claude), \
                 mock.patch.object(fakes.github, "month_records", unreadable, create=True):
             out, _ = fakes.run(review.main)
+            assert not verdict.parse_review(json.dumps(out))[1], verdict.parse_review(json.dumps(out))[1]
         record = self.judge_needs(gate_needs(json.dumps(out), security="false", switch_spec="true"))
         self.assertEqual((record["verdict"], verdict.conclusion(record)), ("ERROR", "failure"), record["error"])
         self.assertNotIn("spec_skipped", out)
