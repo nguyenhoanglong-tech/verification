@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One verdict record per gate run (D25), the sticky rule (G4) and the budget pace (D21).
+"""One verdict record per gate run (D25), the sticky rule (G4), the budget pace (D21) and the billing route (D18).
 
 The record goes into the `verification` check run's output text after MARKER, as one fenced JSON block.
 The sticky rule, the budget pace and the dotfiles finding log read that record, never `conclusion` alone.
@@ -63,8 +63,9 @@ def prior_verdicts(check_runs: list[dict]) -> list[str]:
     return out
 
 
-def budget_base(dated_records: list[tuple[str, dict]], now: datetime) -> tuple[int, float]:
-    """Paid reviews today and USD this month, carried by the newest record of this month."""
+def budget_base(dated_records: list[tuple[str, dict]], now: datetime) -> dict:
+    """The running totals the newest record of this month carries: API-paid reviews today, API USD this month and
+    subscription reviews today. A record written before D18's subscription route has no subscription count: 0."""
     newest = None
     for at, record in dated_records:
         when = datetime.fromisoformat(at.replace("Z", "+00:00"))
@@ -72,14 +73,35 @@ def budget_base(dated_records: list[tuple[str, dict]], now: datetime) -> tuple[i
             if newest is None or when > newest[0]:
                 newest = (when, record["budget"])
     if newest is None:
-        return 0, 0.0
+        return {"reviews_today": 0, "month_usd": 0.0, "subscription_today": 0}
     when, budget = newest
-    today = int(budget.get("reviews_today", 0)) if when.date() == now.date() else 0
-    return today, float(budget.get("month_usd", 0))
+    same_day = when.date() == now.date()
+    return {"reviews_today": int(budget.get("reviews_today", 0)) if same_day else 0,
+            "month_usd": float(budget.get("month_usd", 0)),
+            "subscription_today": int(budget.get("subscription_today", 0)) if same_day else 0}
 
 
-def budget_allows(reviews_today: int, month_usd: float, reviews_per_day: int, budget_month_usd: float) -> bool:
-    return reviews_today < reviews_per_day and month_usd < budget_month_usd
+def route(totals: dict, caps: dict, token: bool, refused: str = "") -> tuple[str | None, str]:
+    """(billing, why) for the next paid call: "api" while the API pace and month cap allow and nothing refused the API,
+    else "subscription" while the fallback is on, a token is present and its own daily pace allows, else None.
+    why names every limit that moved the call off the API, empty on "api". caps is the tier job's budget."""
+    hit = [refused] if refused else []
+    if totals["reviews_today"] >= caps["reviews_per_day"]:
+        hit.append(f"API daily pace {totals['reviews_today']}/{caps['reviews_per_day']}")
+    if totals["month_usd"] >= caps["budget_month_usd"]:
+        hit.append(f"API month cap ${totals['month_usd']:.2f}/${float(caps['budget_month_usd']):.2f}")
+    if not hit:
+        return "api", ""
+    per_day = int(caps.get("subscription_per_day", 0))
+    if not caps.get("subscription_fallback"):
+        hit.append("subscription fallback off")
+    elif not token:
+        hit.append("no subscription token")
+    elif totals["subscription_today"] >= per_day:
+        hit.append(f"subscription daily pace {totals['subscription_today']}/{per_day}")
+    else:
+        return "subscription", "; ".join(hit)
+    return None, "; ".join(hit)
 
 
 def spec_findings(spec: dict | None) -> list[dict]:
@@ -99,7 +121,8 @@ def spec_findings(spec: dict | None) -> list[dict]:
 def decide(*, head_sha, base_sha, tiers, mode, switch_spec, machine, review, budget, errors, prior) -> dict:
     """Build the record. mode is "shadow" or "enforce"; post() settles it with fallback_mode when the tier job could not.
 
-    machine: [{name, result: pass|fail}]. review: None when no review ran, else {findings, spec, cost_usd}.
+    machine: [{name, result: pass|fail}]. review: None when no review ran, else {findings, spec, cost_usd, billing,
+    subscription_cost_usd}. cost_usd is API spend only; a subscription call's cost is notional and kept apart.
     errors: why this run could not judge (job failures, review errors). prior: verdicts of earlier runs on this head.
     """
     findings = list((review or {}).get("findings", [])) + spec_findings((review or {}).get("spec"))
@@ -120,6 +143,8 @@ def decide(*, head_sha, base_sha, tiers, mode, switch_spec, machine, review, bud
         "schema": 1, "head_sha": head_sha, "base_sha": base_sha, "tier": tiers, "mode": mode,
         "verdict": verdict, "title": title, "switch_spec": bool(switch_spec), "machine": machine,
         "findings": findings, "spec": (review or {}).get("spec"), "cost_usd": float((review or {}).get("cost_usd") or 0),
+        "billing": (review or {}).get("billing"),
+        "subscription_cost_usd": float((review or {}).get("subscription_cost_usd") or 0),
         "budget": budget, "error": "; ".join(errors) or None,
     }
 
@@ -143,12 +168,15 @@ def summary(record: dict, stamp_text: str, reasons: str, run_url: str) -> str:
     lines = [f"Verified-by: {stamp_text} head={record['head_sha']}", "",
              f"verdict: {record['verdict']}", f"tiers: {record['tier']} ({reasons})", f"base: {record['base_sha']}",
              f"mode: {record['mode']}", f"spec call: {'yes' if record['switch_spec'] else 'no'}",
-             f"cost_usd: {record['cost_usd']:.4f}",
-             "budget: " + (BUDGET_SKIPPED + "".join(f" ({record['budget'][k]})" for k in ("read_error", "spec_skipped")
+             f"billing: {record.get('billing') or 'none'}",
+             f"cost_usd: {record['cost_usd']:.4f}" + (f" (subscription, notional: {record['subscription_cost_usd']:.4f})"
+                                                       if record.get("subscription_cost_usd") else ""),
+             "budget: " + (BUDGET_SKIPPED + "".join(f" ({record['budget'][k]})" for k in ("limit", "read_error", "spec_skipped")
                                                     if record["budget"].get(k))
                            if record["budget"].get("skipped") else
                            f"{record['budget'].get('reviews_today', 0)} paid reviews today, "
-                           f"${record['budget'].get('month_usd', 0):.2f} this month"),
+                           f"${record['budget'].get('month_usd', 0):.2f} this month, "
+                           f"{record['budget'].get('subscription_today', 0)} subscription reviews today"),
              "machine: " + (" ".join(f"{m['name']}={m['result']}" for m in record["machine"]) or "none")]
     if record["error"]:
         lines.append(f"error: {record['error']}")
@@ -264,6 +292,8 @@ def from_needs(needs: dict, head_sha: str) -> tuple[dict, list[str], list[str]]:
         # not an error (coordinator, 2026-11-18).
         if review and (review.get("budget_refused") or review.get("spec_skipped")):
             budget["skipped"] = True
+            if review.get("limit"):
+                budget["limit"] = review["limit"]
             if review.get("spec_skipped"):
                 budget["spec_skipped"] = f"Spec call: {review['spec_skipped']}"
         if review and review.get("error"):
@@ -303,15 +333,20 @@ def judge(github, needs: dict, repo: str, head_sha: str, run_url: str, base_ref:
     runs = github.verification_runs(repo, head_sha)
     budget = inputs["budget"]
     if budget:
-        cost = float((inputs["review"] or {}).get("cost_usd") or 0)
+        review = inputs["review"] or {}
+        cost = float(review.get("cost_usd") or 0)
+        on_subscription = "subscription" in (review.get("billing") or "")
         now = datetime.now(timezone.utc)
         try:
-            today, month = budget_base(github.month_records(repo, os.environ.get("GITHUB_WORKFLOW_REF", ""), now), now)
+            totals = budget_base(github.month_records(repo, os.environ.get("GITHUB_WORKFLOW_REF", ""), now), now)
         except Exception as x:
             print(f"budget read failed: {x}; the totals carry on from the tier job's read")
-            today, month = budget.get("reviews_today"), budget.get("month_usd")
-        if month is not None:
-            budget.update(reviews_today=int(today) + (1 if cost else 0), month_usd=round(float(month) + cost, 4))
+            totals = {k: budget.get(k) for k in ("reviews_today", "month_usd", "subscription_today")}
+        if totals["month_usd"] is not None:
+            # The subscription's cost is notional: it never adds to month_usd, which the API month cap reads.
+            budget.update(reviews_today=int(totals["reviews_today"] or 0) + (1 if cost else 0),
+                          month_usd=round(float(totals["month_usd"]) + cost, 4),
+                          subscription_today=int(totals["subscription_today"] or 0) + (1 if on_subscription else 0))
     record = {**decide(head_sha=head_sha, errors=errors, prior=prior_verdicts(runs), **inputs), **own_run()}
     out = needs.get("tier", {}).get("outputs") or {}
     skip = out.get("skip") or (BUDGET_SKIPPED if record["budget"].get("skipped") else "")

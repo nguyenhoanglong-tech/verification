@@ -17,9 +17,29 @@ text: head and base SHA, tiers, mode, `verdict` (PASS, FAIL or ERROR), the Spec 
 results, every review finding with its P0 or P1 severity, the Spec table, cost and budget state. The sticky
 rule, the budget pace and the dotfiles finding log read that record.
 
-The review (`engine/claude-job`) runs `claude --bare -p` twice at most: `/code-review` on the diff, then the
-Spec call when the PR closes an issue whose done-when section existed when the PR opened. The working
-directory is the base; the head's files and diff are copied out of it and read as data.
+The review (`engine/claude-job`) makes two calls at most: `/code-review` on the diff, then the Spec call when
+the PR closes an issue whose done-when section existed when the PR opened. The head's files and diff are
+copied out of the working directory and read as data.
+
+Each call is billed to the API or to the Claude subscription (D18). The tier job picks the route from the base
+toml and this month's records:
+
+| Route | When | How the call runs |
+| --- | --- | --- |
+| `api` | API-paid reviews today < `reviews_per_day` and API spend this month < `budget_month_usd` | `claude --bare -p`, the federation token through `apiKeyHelper`, cwd = the base checkout |
+| `subscription` | an API limit is reached, `[subscription] fallback = true`, the caller passed `claude_code_oauth_token`, and subscription reviews today < `[subscription] reviews_per_day` | `claude -p --safe-mode --strict-mcp-config`, the token in that process's env only, cwd = an empty dir with no `CLAUDE.md` or `.claude` above it |
+| none | neither may run, or the budget could not be read | no paid call: `review skipped: budget (<the limits hit>)` |
+
+`--bare` reads no OAuth token, so the subscription call rebuilds its isolation; `tests/test_isolation.py` runs
+the pinned CLI on both routes against a fake API and checks that the head's config, the secret dir and the
+process env never reach the model, and that both routes send the same system prompt and tools. An API call
+refused by the spend limit or for credit is retried once on the subscription when that route may run. A
+rejected subscription token is an ERROR, never a budget skip.
+
+Each record says `billing` (`api`, `subscription`, `api+subscription` or null). `cost_usd`,
+`budget.reviews_today` and `budget.month_usd` count the API only; `budget.subscription_today` counts
+subscription reviews, and `subscription_cost_usd` is the notional cost the subscription paid. Records written
+before this field read as API, with no subscription reviews.
 
 The caller grants `actions: read` (the budget reads the caller's own runs this month), `contents: read`,
 `checks: read`, `issues: read` (the Spec switch reads the issues a PR closes), `pull-requests: write` and `id-token: write`. It sets `runner` from the
@@ -29,7 +49,9 @@ The gate App posts the check. Each repo's own App (`checks: write`, nothing else
 alone, and its private key is `VERIFICATION_APP_KEY` in the caller repo's environment `verification-gate`,
 whose branch rule names the default branch only: under `pull_request_target` that is the ref every run
 carries, and head code naming the environment is refused. The caller passes `app_id`, the key by name
-(`secrets: VERIFICATION_APP_KEY: ${{ secrets.VERIFICATION_APP_KEY }}`). The sticky rule and the budget read the
+(`secrets: VERIFICATION_APP_KEY: ${{ secrets.VERIFICATION_APP_KEY }}`). A caller that turns the subscription route on
+also passes `claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}`; only the review job's claude step
+gets the value. The sticky rule and the budget read the
 App's records only: any job holding `checks: write`, a PR's own included, can rewrite a GitHub Actions check run,
 so the gate's records from before the App count for nothing. With no App id or no key the gate job ends red and
 posts nothing.

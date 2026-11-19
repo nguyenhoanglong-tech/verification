@@ -1,5 +1,5 @@
 name: verification review
-description: The Bugs call and, when the switch is on, the Spec call, each as `claude --bare -p` with the PR head read as data (D8, D16).
+description: The Bugs call and, when the switch is on, the Spec call, on the API or the Claude subscription (D8, D16, D18), with the PR head read as data.
 inputs:
   model: {required: true, description: Claude model id}
   effort: {required: true, description: reasoning effort}
@@ -9,11 +9,10 @@ inputs:
   spec_text: {required: false, default: '""', description: "JSON string: the done-when sections the Spec call checks; empty means no Spec call"}
   standards: {required: false, default: CODING_STANDARDS.md, description: the coding standards file at base}
   budget: {required: false, default: "3", description: max USD per call}
-  pace: {required: false, default: "{}", description: "JSON: the tier job's budget (reviews_per_day, budget_month_usd); the Spec call reads the budget again against it"}
-  subscription_fallback: {required: false, default: "false", description: "D18: retry on a credit error with the subscription token. Off until built."}
-  claude_code_oauth_token: {required: false, default: "", description: "D18: the subscription token for that retry"}
+  pace: {required: false, default: "{}", description: "JSON: the tier job's budget (caps, totals, billing route); each re-read routes against it"}
+  claude_code_oauth_token: {required: false, default: "", description: "D18: the subscription token; empty means no subscription call"}
 outputs:
-  result: {description: "JSON: findings, spec, cost_usd, error, budget_refused, credit_error", value: "${{ steps.review.outputs.result }}"}
+  result: {description: "JSON: findings, spec, cost_usd, subscription_cost_usd, billing, error, budget_refused", value: "${{ steps.review.outputs.result }}"}
   head: {description: head SHA the review ran on, value: "${{ steps.head.outputs.head }}"}
 runs:
   using: composite
@@ -48,13 +47,6 @@ runs:
         BUDGET_USD: ${{ inputs.budget }}
         PACE: ${{ inputs.pace }}
         GH_TOKEN: ${{ github.token }}
+        # Under its own name: review.py takes it out of its env and hands it to the subscription call alone.
+        SUBSCRIPTION_TOKEN: ${{ inputs.claude_code_oauth_token }}
       run: python3 "$GITHUB_ACTION_PATH/review.py"
-    # D18: the subscription fallback goes here. It stays off: the input defaults to false and the retry is not built.
-    - name: subscription fallback on a credit error (D18, off)
-      if: inputs.subscription_fallback == 'true' && steps.review.outputs.credit_error == 'true'
-      shell: bash
-      env:
-        CLAUDE_CODE_OAUTH_TOKEN: ${{ inputs.claude_code_oauth_token }}
-      run: |
-        echo "::error::the D18 subscription retry is not built"
-        exit 1

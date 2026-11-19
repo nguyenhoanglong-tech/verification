@@ -27,6 +27,11 @@ on:
       VERIFICATION_APP_KEY:
         description: The gate App's private key, from the caller's `verification-gate` environment, passed by name.
         required: false
+      claude_code_oauth_token:
+        description: >-
+          The Claude subscription token (D18). The review runs on it when the API budget refuses and the base toml's
+          [subscription] fallback is on. Only the review job's claude step gets the value; the tier job sees whether it is set.
+        required: false
 permissions: {}
 env:
   HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -115,6 +120,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           BASE_SHA: ${{ needs.start.outputs.base_sha }}
+          SUBSCRIPTION_TOKEN_SET: ${{ secrets.claude_code_oauth_token != '' }}
         run: python3 engine-src/engine/tier.py github
 
   head_archive:
@@ -223,6 +229,7 @@ jobs:
           spec_text: ${{ needs.tier.outputs.spec_text }}
           standards: ${{ needs.tier.outputs.standards }}
           pace: ${{ needs.tier.outputs.budget }}
+          claude_code_oauth_token: ${{ secrets.claude_code_oauth_token }}
 
   gate:
     # The one result the ruleset reads. One gate at a time per head, so each reads the verdicts the one before it

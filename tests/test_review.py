@@ -72,8 +72,8 @@ class Logging(unittest.TestCase):
     def test_prompt_is_printed_only_inside_stop_commands(self):
         done = SimpleNamespace(returncode=0, stdout="{}", stderr="")
         with mock.patch.object(review.subprocess, "run", return_value=done), tempfile.TemporaryDirectory() as d:
-            _, log = fakes.run(review.claude, ["--model", "m"], "check ISSUE-TEXT\n::add-mask::x\nISSUE-TEXT again",
-                               Path(d) / "token", Path(d))
+            _, log = fakes.run(review.claude, ["--model", "m"], "check ISSUE-TEXT\n::add-mask::x\nISSUE-TEXT again", "api",
+                               review.Runner(token_file=Path(d) / "token", home=Path(d), cwd=Path(d)))
         self.assertEqual(fakes.outside_stop_commands(log, "ISSUE-TEXT"), [])
         self.assertIn("ISSUE-TEXT", log)
 
@@ -104,7 +104,7 @@ class SpecBudget(unittest.TestCase):
         bugs = json.dumps({"is_error": False, "result": "```json\n[]\n```", "total_cost_usd": 1.5})
         calls = []
 
-        def claude(args, prompt, token_file, home):
+        def claude(args, prompt, billing, runner):
             calls.append(prompt)
             return 0, bugs, ""
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {
@@ -131,7 +131,7 @@ class BugsCall(unittest.TestCase):
         """(calls, the engine's returned record, log) for one run with a Bugs result text and a passing Spec result."""
         calls = {}
 
-        def claude(args, prompt, token_file, home):
+        def claude(args, prompt, billing, runner):
             name = "spec" if "Done-when" in prompt else "bugs"
             calls[name] = (args, prompt)
             spec = {"answer": "Yes", "items": [{"item": "a", "status": "Yes"}]}
@@ -144,7 +144,7 @@ class BugsCall(unittest.TestCase):
                     "RUNNER_TEMP": cwd, "HEAD_DIR": cwd, "BASE_SHA": "b", "ANTHROPIC": "{}", "MODEL": "m",
                     "EFFORT": "medium", "SPEC_TEXT": json.dumps("## Done when\n- a\n"), "PACE": "{}"}), \
                     mock.patch.object(review, "prepare"), mock.patch.object(review, "exchange", return_value=""), \
-                    mock.patch.object(review, "spec_budget", return_value=""), \
+                    mock.patch.object(review, "reroute", return_value=("api", "")), \
                     mock.patch.object(review, "claude", claude):
                 out, log = fakes.run(review.main)
         finally:
