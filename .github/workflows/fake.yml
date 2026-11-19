@@ -1,5 +1,5 @@
 name: fake
-on: pull_request
+on: push
 jobs:
   verification:
     runs-on: ubuntu-latest
