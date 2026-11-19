@@ -200,8 +200,8 @@ class TierRoute(unittest.TestCase):
 
     def test_a_budget_read_failure_stays_closed(self):
         out, budget, _ = self.main(self.ON, fail={"GET actions/workflows": [fakes.http_error(403)]})
-        self.assertEqual((out["review"], out["skip"], budget["route"]), ("false", "review skipped: budget", None))
-        self.assertIn("budget read failed", budget["read_error"])
+        self.assertEqual((out["review"], out["skip"], budget["route"]), ("false", "budget unreadable", None))
+        self.assertIn("budget read failed", out["error"])
 
     def test_a_bad_block_is_a_config_error(self):
         out, _, _ = self.main(self.ON.replace("reviews_per_day = 30", 'reviews_per_day = "30"'))

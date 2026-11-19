@@ -156,5 +156,119 @@ class Edges(unittest.TestCase):
         self.assertIn("SECURITY: ${{ inputs.security }}", action)
 
 
+def gate_needs(result_text, security="true", mode="enforce", **tier_extra):
+    """The gate job's NEEDS for a T2 run whose review job succeeded on this head and returned result_text."""
+    tier_out = {"base_sha": "b", "mode": mode, "tiers": "T2", "has_checks": "false", "review": "true",
+                "security": security, "budget": json.dumps(BUDGET), "switch_spec": "false", "reasons": "r", **tier_extra}
+    return {"start": {"result": "success", "outputs": {"base_sha": "b"}},
+            "tier": {"result": "success", "outputs": tier_out},
+            "checks": {"result": "skipped", "outputs": {}},
+            "review": {"result": "success", "outputs": {"head": "h", "result": result_text}}}
+
+
+def verdict_of(needs):
+    inputs, _, errors = verdict.from_needs(needs, "h")
+    return verdict.decide(head_sha="h", errors=errors, prior=[], **inputs), errors
+
+
+class FailClosed(unittest.TestCase):
+    """Codex review of 9987fc0, P0s: an empty review result and an unreadable budget are ERRORs, never PASS."""
+
+    def test_an_empty_or_null_review_result_is_an_error_never_a_pass(self):
+        clean = {"findings": [], "spec": None, "cost_usd": 0.5, "billing": "api", "error": None, "budget_refused": False}
+        cases = {"{} with the pass owed": ("{}", "true"), "null with the pass owed": ("null", "true"),
+                 "an empty security entry": (json.dumps({**clean, "security": {}}), "true"),
+                 "a null security entry": (json.dumps({**clean, "security": None}), "true"),
+                 "{} with no pass owed": ("{}", "false"), "null with no pass owed": ("null", "false"),
+                 "no findings list": (json.dumps({**clean, "findings": None}), "false")}
+        for name, (text, owed) in cases.items():
+            with self.subTest(name):
+                record, errors = verdict_of(gate_needs(text, security=owed))
+                self.assertEqual((record["verdict"], verdict.conclusion(record)), ("ERROR", "failure"), errors)
+
+    def test_an_unreadable_budget_is_an_error_not_a_budget_skip(self):
+        fake = fakes.GitHub(config='mode = "enforce"\n', files=[f(".github/workflows/x.yml")],
+                            fail={"GET actions/workflows": [fakes.http_error(403)]})
+        with tempfile.NamedTemporaryFile("r", suffix=".out") as o, fakes.installed(fake, GITHUB_OUTPUT=o.name):
+            fakes.run(tier.github_main)
+            out = dict(line.split("=", 1) for line in Path(o.name).read_text().splitlines() if "=" in line)
+        self.assertEqual((out["review"], out["security"]), ("false", "true"))
+        needs = {"start": {"result": "success", "outputs": {"base_sha": "b"}},
+                 "tier": {"result": "success", "outputs": out},
+                 "checks": {"result": "skipped", "outputs": {}}, "review": {"result": "skipped", "outputs": {}}}
+        record, errors = verdict_of(needs)
+        self.assertEqual((record["verdict"], verdict.conclusion(record), record["title"]),
+                         ("ERROR", "failure", "T2 error: re-run"), errors)
+        self.assertIn("budget read failed", out.get("error", ""))
+
+
+class Record(unittest.TestCase):
+    """Codex review of 9987fc0, P1s."""
+
+    def post(self, needs, fail=None, prior_month=1.0):
+        fake = fakes.GitHub(fail=fail or {})
+        when = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with fakes.installed(fake, NEEDS=json.dumps(needs)), mock.patch.object(
+                fakes.github, "month_records", lambda *a: [(when, {"budget": {**BUDGET, "month_usd": prior_month}})]):
+            fakes.run(verdict.post)
+        return [verdict.parse_text(b["output"]["text"]) for _, _, b in fake.writes()]
+
+    def test_a_failed_publish_keeps_the_completed_security_result(self):
+        needs = gate_needs(json.dumps(review_main("true")[0]))
+        records = self.post(needs, fail={"POST check-runs": [fakes.http_error(422)]})
+        self.assertEqual(len(records), 2)
+        security = records[-1]["security"] or {}
+        self.assertEqual((security.get("ran"), [x["severity"] for x in security.get("findings", [])]), (True, ["P0"]))
+        self.assertEqual(records[-1]["verdict"], "FAIL", "the fallback is never weaker than what the judge found")
+
+    def test_the_posted_month_total_counts_the_security_spend(self):
+        record = self.post(gate_needs(json.dumps(review_main("true")[0])))[-1]
+        self.assertEqual((record["security"]["cost_usd"], record["cost_usd"]), (0.3, 0.8))
+        self.assertAlmostEqual(record["budget"]["month_usd"], 1.8)
+
+    def test_a_record_with_no_pass_owed_says_so_with_an_explicit_null(self):
+        record = self.post(gate_needs(json.dumps(review_main("false")[0]), security="false"))[-1]
+        self.assertIn("security", record)
+        self.assertIsNone(record["security"])
+
+    def test_a_dropped_security_tier_output_is_an_error(self):
+        needs = gate_needs(json.dumps(review_main("true")[0]))
+        del needs["tier"]["outputs"]["security"]
+        record, errors = verdict_of(needs)
+        self.assertIn("tier outputs missing: security", errors)
+        self.assertNotEqual(record["verdict"], "PASS")
+
+    def test_the_pass_is_owed_on_a_truncated_list_and_on_a_rename_out_of_a_risk_path(self):
+        self.assertTrue(tier.classify([f("a.py")], {}, truncated=True).security)
+        renamed = {"filename": "ci/x.yml", "previous_filename": ".github/workflows/x.yml", "additions": 1, "deletions": 1}
+        self.assertTrue(tier.classify([renamed], {}).security)
+        self.assertFalse(tier.classify([f("a.py", 400)], {}).security)
+
+    def test_the_prompt_asks_for_a_finding_on_a_workflow_with_no_permissions_block(self):
+        text = (ROOT / "engine/prompts/security.md").read_text()
+        self.assertIn("no `permissions:` block", text)
+        self.assertIn("echo", text)
+
+    def test_a_standards_path_outside_the_base_checkout_is_refused(self):
+        calls = []
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / "base"
+            base.mkdir()
+            (Path(tmp) / "outside.md").write_text("x\n")
+            old = os.getcwd()
+            os.chdir(base)
+            try:
+                with mock.patch.dict(os.environ, {"RUNNER_TEMP": tmp, "HEAD_DIR": tmp, "BASE_SHA": "b", "ANTHROPIC": "{}",
+                                                  "MODEL": "m", "EFFORT": "medium", "SPEC_TEXT": '""', "SECURITY": "true",
+                                                  "STANDARDS": "../outside.md", "PACE": json.dumps(BUDGET)}), \
+                        mock.patch.object(review, "prepare"), mock.patch.object(review, "exchange", return_value=""), \
+                        mock.patch.object(review, "claude", lambda *a: calls.append(a) or reply("```json\n[]\n```", 0.1)):
+                    out, _ = fakes.run(review.main)
+            finally:
+                os.chdir(old)
+        self.assertEqual(calls, [], "no model call reads a file outside the base")
+        self.assertIn("outside the base checkout", out.get("error") or "")
+
+
 if __name__ == "__main__":
     unittest.main()
