@@ -465,11 +465,17 @@ def refused_by_gate(step, app):
         return False, f"error: {step['label']}: {merge['error']}"
     if step["pr"]["mergeStateStatus"] == "DIRTY":
         return False, f"error: {step['label']}: refused for a merge conflict, not by the gate; re-run on a stable base"
-    out = merge.get("out") or ""
-    failing = any(g["conclusion"] not in ("success", None) for g in gate_run(step, app))
-    if merge.get("rc") is not None and (GATE_REFUSAL.search(out) or failing and "not mergeable" in out):
+    if gate_refused(step, app):
         return True, "held"
     return False, f"error: {step['label']}: the merge was not refused by the gate's rules"
+
+
+def gate_refused(step, app):
+    """True when a merge that did not go through was refused by the gate: GitHub names the base's rules, or calls the
+    PR not mergeable while the gate App's check fails on the staged commit."""
+    merge, out = step["merge"], step["merge"].get("out") or ""
+    failing = any(g["conclusion"] not in ("success", None) for g in gate_run(step, app))
+    return merge.get("rc") not in (None, 0) and bool(GATE_REFUSAL.search(out) or failing and "not mergeable" in out)
 
 
 def fakes_green(step):
@@ -549,8 +555,10 @@ def judge(rec):
         if "then_spec" in rec:
             if first["pr"]["mergeStateStatus"] not in ("CLEAN", "HAS_HOOKS", "UNSTABLE"):
                 return False, "expected the first head to be mergeable, got " + first["pr"]["mergeStateStatus"]
+        elif not merged and gate_refused(first, app):
+            return False, "expected the merge to succeed, and the gate's rules refused it"
         elif not merged:
-            return False, "expected the merge to succeed: " + first["merge"]["out"]
+            return False, "error: first: the merge failed for a reason that is not the gate's"
     else:
         held, why = refused_by_gate(first, app)
         if not held:
@@ -569,8 +577,9 @@ def judge(rec):
         early, late = steps[1], steps[2]
         if early["merge"]["rc"] == 0:
             return False, "merged right after the push, before the new head was verified"
-        if early["pr"]["mergeStateStatus"] == "DIRTY":
-            return False, "right-after-push: refused for a merge conflict, not by the gate; re-run on a stable base"
+        held, why = refused_by_gate(early, app)
+        if not held:
+            return False, why
         late_gates = gate_run(late, app)
         want = rec["then_spec"]["expect"]
         if want == "block":
@@ -816,7 +825,8 @@ def fetch_log(repo, job_id):
     """A job's log, or None when it reads failed or blank after four tries: a log can 404, or read blank, for a short
     while after its run completes."""
     for wait in (15, 15, 15, 0):
-        r = gh("api", f"repos/{repo}/actions/jobs/{job_id}/logs", check=False)
+        # gh refuses to print a log's terminal escape sequences unless told to; the flag goes after the endpoint.
+        r = gh("api", f"repos/{repo}/actions/jobs/{job_id}/logs", "--allow-escape-sequences", check=False)
         if r.returncode == 0 and r.stdout.strip():
             return r.stdout
         time.sleep(wait)

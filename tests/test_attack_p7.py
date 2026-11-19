@@ -38,6 +38,7 @@ reviews_per_day = 3
 """
 COLUMNS = "pr\tcheck_run\thead_sha\tverdict\tcall\tseverity\tfile\tline\tsummary"
 PROBE_SHA, BASE_SHA, TIP, MOVED, ATTACK_SHA, FORK_SHA = "p" * 40, "b" * 40, "m" * 40, "q" * 40, "a" * 40, "f" * 40
+AUTH = "HTTP 401: " + "Bad " + "credentials (https://api.github.com/graphql)"
 POLICY = ("X Pull request o/r#5 is not mergeable: the base branch policy prohibits the merge.\n"
           "To have the pull request merged after all the requirements have been met, add the `--auto` flag.")
 
@@ -79,6 +80,7 @@ class FakeGitHub:
         self.comments = {"issues": [], "pulls": [], "reviews": []}
         self.fail, self.calls, self.hooks, self.writes, self.merges = {}, [], [], [], []
         self.moved, self.pr_commits, self.findings_read, self.merge_answer = False, None, None, (1, POLICY)
+        self.merge_state, self.color_logs = "BLOCKED", False
 
     def check(self, name, head=PROBE_SHA, status="completed", app=APP, text=None, summary="", conclusion="success"):
         self.checks.append({"id": len(self.checks) + 1, "name": name, "status": status,
@@ -147,7 +149,7 @@ class FakeGitHub:
                     k, v = args[i + 1].split("=", 1)
                     fields[k] = v
                 i += 2
-            elif args[i] == "--include":
+            elif args[i] in ("--include", "--allow-escape-sequences"):
                 i += 1
             else:
                 path, i = args[i], i + 1
@@ -220,6 +222,8 @@ class FakeGitHub:
                 return ok({"total_count": total, "jobs": self.page(attempt["jobs"], q)})
             return ok({"status": attempt["status"]})
         m = re.fullmatch(r"actions/jobs/(\d+)/logs", tail)
+        if m and self.color_logs and "--allow-escape-sequences" not in args:  # gh with a real log's color codes
+            return "the response contains terminal escape sequences; pass --allow-escape-sequences to output it anyway", 1
         if m:
             answers = self.logs[int(m.group(1))]
             rc, text = answers.pop(0) if len(answers) > 1 else answers[0]
@@ -252,13 +256,13 @@ class FakeGitHub:
             return "", 0
         if args[1] == "merge":
             self.merges.append(args)
-            rc, text = self.merge_answer
+            rc, text = self.merge_answer.pop(0) if isinstance(self.merge_answer, list) else self.merge_answer
             if rc == 0:
                 p["state"] = "MERGED"
             return text, rc
         if "-q" in args:
             return p["state"] + "\n", 0
-        return json.dumps({"number": n, "url": "u", "state": p["state"], "mergeStateStatus": "BLOCKED",
+        return json.dumps({"number": n, "url": "u", "state": p["state"], "mergeStateStatus": self.merge_state,
                            "headRefOid": self.head_of(n), "mergedAt": None, "baseRefName": p["base"],
                            "isCrossRepository": bool(p.get("cross"))}), 0
 
@@ -422,8 +426,21 @@ class C2Attacks(unittest.TestCase):
 
     def test_c2_an_auth_failed_merge_is_an_error(self):
         fake = self.engine()
-        fake.merge_answer = (1, "HTTP 401: Bad credentials (https://api.github.com/graphql)")
+        fake.merge_answer = (1, AUTH)
         _, result = attack(fake, "P2")
+        self.assertEqual(result, "ERROR")
+
+    def test_c2_an_auth_failed_merge_of_a_passing_head_is_an_error(self):
+        fake = self.engine(conclusion="success")
+        fake.merge_answer = (1, AUTH)
+        _, result = attack(fake, "P1")
+        self.assertEqual(result, "ERROR")
+
+    def test_c2_an_auth_failed_merge_right_after_a_push_is_an_error(self):
+        fake = self.engine(conclusion="success")
+        fake.check("verification", head="c" * 40, app=5828645, conclusion="failure")
+        fake.merge_state, fake.merge_answer = "CLEAN", [(1, AUTH), (1, POLICY)]
+        _, result = attack(fake, "P6")
         self.assertEqual(result, "ERROR")
 
 
@@ -440,11 +457,13 @@ class C3Credentials(P7Case):
         self.assertNotIn(SHORT, stdout)
 
     def test_c3_annotations_and_pr_comments_are_scanned(self):
-        for where in ("annotation", "issues", "pulls", "reviews"):
+        for where in ("gate check output", "annotation", "issues", "pulls", "reviews"):
             with self.subTest(where):
                 self.fake = FakeGitHub()
                 gate = self.fake.gate(99)
-                if where == "annotation":
+                if where == "gate check output":
+                    gate["output"]["summary"] = "verdict: PASS\n- [P1] " + CANARY
+                elif where == "annotation":
                     self.fake.annotations[gate["id"]] = [{"message": CANARY, "path": "verify-p7/probe.py"}]
                 else:
                     self.fake.comments[where] = [{"body": CANARY}]
@@ -674,6 +693,12 @@ class Wait(unittest.TestCase):
 
 
 class Logs(unittest.TestCase):
+    def test_a_log_with_color_codes_is_read(self):
+        fake = FakeGitHub()
+        fake.color_logs, fake.logs[5] = True, [(0, "review ran\n")]
+        with mock.patch.object(suite, "gh", fake.gh), mock.patch.object(suite, "time", FakeClock()):
+            self.assertEqual(suite.fetch_log("o/r", 5), "review ran\n")
+
     def test_a_log_not_yet_archived_is_fetched_again(self):
         fake = FakeGitHub()
         fake.logs[5] = [(1, '{"message":"Not Found"}'), (0, ""), (0, "review ran\n")]
