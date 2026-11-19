@@ -118,6 +118,11 @@ def spec_findings(spec: dict | None) -> list[dict]:
                   for n, item in enumerate(spec.get("sent", []), 1) if n not in judged]
 
 
+def unrun_security() -> dict:
+    """The security entry of a run that owes the pass, before the pass has run."""
+    return {"ran": False, "findings": [], "cost_usd": 0.0, "subscription_cost_usd": 0.0}
+
+
 def decide(*, head_sha, base_sha, tiers, mode, switch_spec, machine, review, budget, errors, prior,
            security_owed=False) -> dict:
     """Build the record. mode is "shadow" or "enforce"; post() settles it with fallback_mode when the tier job could not.
@@ -129,8 +134,7 @@ def decide(*, head_sha, base_sha, tiers, mode, switch_spec, machine, review, bud
     errors: why this run could not judge (job failures, review errors). prior: verdicts of earlier runs on this head.
     """
     findings = list((review or {}).get("findings", [])) + spec_findings((review or {}).get("spec"))
-    security = (review or {}).get("security") or (
-        {"ran": False, "findings": [], "cost_usd": 0.0, "subscription_cost_usd": 0.0} if security_owed else None)
+    security = (review or {}).get("security") or (unrun_security() if security_owed else None)
     fail = (any(m["result"] != "pass" for m in machine) or "FAIL" in prior
             or any(f["severity"] == "P0" for f in findings + (security or {}).get("findings", [])))
     verdict = "FAIL" if fail else "ERROR" if errors else "PASS"
@@ -175,7 +179,10 @@ def summary(record: dict, stamp_text: str, reasons: str, run_url: str) -> str:
              f"verdict: {record['verdict']}", f"tiers: {record['tier']} ({reasons})", f"base: {record['base_sha']}",
              f"mode: {record['mode']}", f"spec call: {'yes' if record['switch_spec'] else 'no'}",
              "security pass: " + ("not owed" if not record.get("security") else
-                                  f"ran, cost_usd {record['security']['cost_usd']:.4f}" if record["security"]["ran"]
+                                  f"ran, cost_usd {record['security']['cost_usd']:.4f}"
+                                  + (f" (subscription, notional: {record['security']['subscription_cost_usd']:.4f})"
+                                     if record["security"].get("subscription_cost_usd") else "")
+                                  if record["security"]["ran"]
                                   else "owed, did not run"),
              f"billing: {record.get('billing') or 'none'}"
              + (f" (API refused: {record['refused']})" if record.get("refused") else ""),

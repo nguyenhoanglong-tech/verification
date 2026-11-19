@@ -30,7 +30,7 @@ ENGINE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ENGINE))
 import github  # noqa: E402
 from tier import done_items  # noqa: E402
-from verdict import budget_base, log_data, route  # noqa: E402
+from verdict import budget_base, log_data, route, unrun_security  # noqa: E402
 
 # The org's Console spend limit refuses with this text (HTTP 400, invalid_request_error). It is the budget, not an error.
 SPEND_LIMIT = re.compile(r"You have reached your specified (?:workspace )?API usage limits")
@@ -286,7 +286,7 @@ def main() -> dict:
     secret.chmod(0o700)
     out = empty_result()
     if e.get("SECURITY") == "true":
-        out["security"] = {"ran": False, "findings": [], "cost_usd": 0.0, "subscription_cost_usd": 0.0}
+        out["security"] = unrun_security()
     prepare(Path(e["HEAD_DIR"]), e["BASE_SHA"], data)
     runner = Runner(token_file=secret / "token", home=home, cwd=cwd, oauth=oauth)
     pace = json.loads(e.get("PACE") or "{}")

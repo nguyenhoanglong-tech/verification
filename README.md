@@ -25,7 +25,8 @@ the working directory and read as data.
 
 The security call (dotfiles#3408) runs `engine/prompts/security.md` in the same sandbox, on the same route and with
 the same finding schema as the Bugs call. Its P0 fails the gate, and its error is an ERROR. A risk-path run whose
-review returns no security result is an ERROR too. It is not Claude Code's `/security-review`: that command runs
+review returns no security result is an ERROR too, unless the budget refused a call: that is a budget skip, as for
+the Bugs call, and the record's `security.ran` is false. It is not Claude Code's `/security-review`: that command runs
 `git status` and `git diff` through Bash before any model call, and this sandbox gives the model only Read. On CLI
 2.1.326 both routes stop with "Permission to use Bash has been denied" and send no request.
 
