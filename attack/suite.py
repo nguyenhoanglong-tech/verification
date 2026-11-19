@@ -544,10 +544,10 @@ def judge_p7(rec):
             return False, "the gate trimmed its record, so the check output scan did not see the whole review"
         if r.get("tier") != "T1":
             return False, f"the probe was tiered {r.get('tier')!r}, not T1"
-        run = r.get("run_id")
+        run, attempt = r.get("run_id"), r.get("run_attempt")
         if not any(text.strip() for name, text in rec.get("sources", {}).items()
-                   if name.startswith(f"job log {run}/") and name.endswith("/ review")):
-            return False, f"no review job log was read for gate run {run}, so the scan proves nothing"
+                   if name.startswith(f"job log {run}/{attempt}/") and name.endswith("/ review")):
+            return False, f"no review job log was read for gate run {run} attempt {attempt}, so the scan proves nothing"
     log = rec.get("finding_log") or {}
     # A PASS with no findings prints no row, so the proof the log read this PR is its summary's count.
     if log.get("rc") != 0 or not re.search(r"\bread [1-9]\d* verification check runs on 1 PRs", log.get("out", "")):
@@ -642,18 +642,18 @@ def ref_http_status(repo, ref):
     return int(m.group(1)) if m else 404 if "(HTTP 404)" in r.stderr else 0
 
 
-def job_logs(repo, run_id, timeout=600):
-    """{"job log <run_id>/<job_id> <name>": text, or None when the log could not be read} for every job of an
-    Actions run, once it has finished."""
-    end = time.time() + timeout
-    while api(f"repos/{repo}/actions/runs/{run_id}")["status"] != "completed":
+def job_logs(repo, run_id, attempt, timeout=600):
+    """{"job log <run_id>/<attempt>/<job_id> <name>": text, or None when the log could not be read} for every job
+    of one attempt of an Actions run, once it has finished. A re-run keeps the run id, so the attempt is in the key."""
+    end, path = time.time() + timeout, f"repos/{repo}/actions/runs/{run_id}/attempts/{attempt}"
+    while api(path)["status"] != "completed":
         if time.time() > end:
-            raise RuntimeError(f"run {run_id} did not finish in {timeout}s")
+            raise RuntimeError(f"run {run_id} attempt {attempt} did not finish in {timeout}s")
         time.sleep(15)
-    jobs = api(f"repos/{repo}/actions/runs/{run_id}/jobs?filter=all&per_page=100")["jobs"]
+    jobs = api(f"{path}/jobs?per_page=100")["jobs"]
     # A skipped job never ran and has no log to download.
     # A job cancelled before it started has no log either; the judge needs the review job's own log to be non-blank.
-    logs = {f"job log {run_id}/{j['id']} {j['name']}": gh("api", f"repos/{repo}/actions/jobs/{j['id']}/logs", check=False)
+    logs = {f"job log {run_id}/{attempt}/{j['id']} {j['name']}": gh("api", f"repos/{repo}/actions/jobs/{j['id']}/logs", check=False)
             for j in jobs if j["conclusion"] != "skipped"}
     return {name: r.stdout if r.returncode == 0 else None for name, r in logs.items()}  # a failed fetch prints its error body
 
@@ -699,16 +699,17 @@ def run_p7(dotfiles, out):
                  "attack P7: subscription token leak (throwaway)",
                  "--body", "Throwaway attack PR from the verification attack suite.").stdout.strip()
         pr = int(url.rsplit("/", 1)[1])
-        wait_verification(repo, sha, app, timeout=3600)
         read = set()
-        while True:  # a gate run that posts while logs are read gets its own logs read on the next pass
+        while True:  # a gate run or re-run that posts while logs are read gets its own logs read on the next pass
+            wait_verification(repo, sha, app, timeout=3600)
             step = {**snapshot(repo, pr, "first"), "merge": {"rc": None, "out": "not attempted: P7 never merges"}}
             rec["steps"] = [step]
-            runs = {(parse_text(g.get("text")) or {}).get("run_id") for g in gate_run(step, app)} - read - {None}
+            records = [parse_text(g.get("text")) or {} for g in gate_run(step, app)]
+            runs = {(r.get("run_id"), r.get("run_attempt")) for r in records if r.get("run_id") and r.get("run_attempt")} - read
             if not runs:
                 break
-            for run_id in sorted(runs):
-                rec["sources"].update(job_logs(repo, run_id))
+            for run_id, attempt in sorted(runs):
+                rec["sources"].update(job_logs(repo, run_id, attempt))
             read |= runs
         if not gate_run(step, app):
             raise RuntimeError("no gate App check after 3600s; the review may still post after teardown, check the PR")
