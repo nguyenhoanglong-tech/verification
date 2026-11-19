@@ -233,15 +233,24 @@ def create_ref(repo, ref, sha):
     api(f"repos/{repo}/git/refs", f"ref=refs/heads/{in_scope(ref)}", f"sha={sha}", method="POST")
 
 
-def pages(path, key):
-    """Every item under key, page by page."""
-    items, page = [], 1
+def listing(path, key=None):
+    """(items, total_count) read page by page. total_count is the API's own count, None when it gives none, so a
+    caller can see a list cut short. key=None reads an endpoint that returns a bare array."""
+    items, page, total = [], 1, None
     while True:
-        got = api(f"{path}{'&' if '?' in path else '?'}per_page=100&page={page}")[key]
+        body = api(f"{path}{'&' if '?' in path else '?'}per_page=100&page={page}")
+        got = body if key is None else body[key]
+        if key is not None and total is None:
+            total = body.get("total_count")
         items += got
         if len(got) < 100:
-            return items
+            return items, total
         page += 1
+
+
+def pages(path, key=None):
+    """Every item, page by page."""
+    return listing(path, key)[0]
 
 
 def write_files(repo, branch, files, app=None):
@@ -292,9 +301,19 @@ def snapshot(repo, pr, label, checks="latest"):
             "statuses": [{"context": s["context"], "state": s["state"], "creator": s["creator"]["login"]} for s in statuses]}
 
 
-def try_merge(repo, pr):
-    r = gh("pr", "merge", str(pr), "-R", repo, "--merge", check=False)
-    return {"rc": r.returncode, "out": (r.stdout + r.stderr).strip()[:500]}
+def try_merge(repo, pr, sha):
+    """Merge the PR at sha, the commit the suite staged. Its base is read again right before: a PR retargeted outside
+    the suite's scope, or whose head moved off sha, is never merged, and the step records why as an error."""
+    r = gh("pr", "view", str(pr), "-R", repo, "--json", "baseRefName,headRefOid", check=False)
+    if r.returncode:
+        return {"rc": None, "error": "the PR could not be read before the merge"}
+    pv = json.loads(r.stdout)
+    if not SCOPE.fullmatch(pv["baseRefName"]):
+        return {"rc": None, "error": "the PR's base is outside verify/attack-base* and verify/selftest/*"}
+    if pv["headRefOid"] != sha:
+        return {"rc": None, "error": "the PR head moved off the staged commit"}
+    r = gh("pr", "merge", str(pr), "-R", repo, "--merge", "--match-head-commit", sha, check=False)
+    return {"rc": r.returncode, "out": scrub((r.stdout + r.stderr).strip())[:500]}
 
 
 def runs_of(repo, sha, path):
@@ -377,8 +396,8 @@ def run_attack(repo, base, name, spec, stamp, app):
                 if any(r["name"] == "verification" and r["app"]["id"] == ACTIONS_APP and r["conclusion"] == "success" for r in runs):
                     break
                 time.sleep(3)
-            record["window"] = snapshot(repo, pr, "window")
-            record["window"]["merge"] = try_merge(repo, pr)
+            record["window"] = {**snapshot(repo, pr, "window"), "staged_sha": sha}
+            record["window"]["merge"] = try_merge(repo, pr, sha)
     if "cancel" not in spec.get("after", []) and not wait_verification(repo, sha, app):
         record["error"] = f"the gate did not settle on {sha[:12]} in time"  # scored as an error, never a pass
     for action in spec.get("late", []):
@@ -400,29 +419,29 @@ def run_attack(repo, base, name, spec, stamp, app):
             record["p4f_runs"] = wait_runs(repo, sha, [".github/workflows/steal.yml", ".github/workflows/head-caller.yml"])
         if action == "p4g":
             wait_check(repo, sha, "p4g-result")
-    step = snapshot(repo, pr, "first")
+    step = {**snapshot(repo, pr, "first"), "staged_sha": sha}
     if "p4f" in spec.get("late", []):
         record["posters"] = posters(repo, step, app)
     then = spec.get("then")
     # A head that is followed by a push stays open: its pass shows as a mergeable PR, not a merge.
-    step["merge"] = {"rc": None, "out": "not attempted: a push follows"} if then else try_merge(repo, pr)
+    step["merge"] = {"rc": None, "out": "not attempted: a push follows"} if then else try_merge(repo, pr, sha)
     record["steps"].append(step)
     if then:
-        sha2 = write_files(repo, branch, then["files"])
+        sha = write_files(repo, branch, then["files"])
         record["then_spec"] = {k: v for k, v in then.items() if k != "files"}
         time.sleep(5)
-        early = snapshot(repo, pr, "right-after-push")
-        early["merge"] = try_merge(repo, pr)
+        early = {**snapshot(repo, pr, "right-after-push"), "staged_sha": sha}
+        early["merge"] = try_merge(repo, pr, sha)
         record["steps"].append(early)
-        if not wait_verification(repo, sha2, app):
-            record["error"] = f"the gate did not settle on {sha2[:12]} in time"
-        late = snapshot(repo, pr, "second")
-        late["merge"] = try_merge(repo, pr)
+        if not wait_verification(repo, sha, app):
+            record["error"] = f"the gate did not settle on {sha[:12]} in time"
+        late = {**snapshot(repo, pr, "second"), "staged_sha": sha}
+        late["merge"] = try_merge(repo, pr, sha)
         record["steps"].append(late)
-    if record["steps"][-1]["merge"]["rc"] != 0:
-        gh("pr", "close", str(pr), "-R", repo, "--delete-branch", check=False)
-    else:
-        gh("api", "-X", "DELETE", f"repos/{repo}/git/refs/heads/{branch}", check=False)
+    failed = [] if close_own_pr(repo, pr, sha) else [f"close PR {pr}"]
+    failed += [] if delete_own_ref(repo, branch, sha) else [f"delete {branch}"]
+    if failed:
+        record["teardown_failed"] = failed
     return record
 
 
@@ -431,14 +450,26 @@ def gate_run(step, app):
             and r["head_sha"] == step["pr"]["headRefOid"]]
 
 
-def refused_by_gate(step):
-    """(held, why) for a step whose merge must be refused. A merge conflict also refuses it, and proves nothing
-    about the gate: the PR must have been mergeable but for the rules (BLOCKED), not DIRTY."""
-    if step["merge"]["rc"] == 0:
+# GitHub's words for a merge the base's rules refused: the ruleset that requires the gate App's check.
+GATE_REFUSAL = re.compile(r"base branch policy prohibits the merge|required status check|repository rule violation", re.I)
+
+
+def refused_by_gate(step, app):
+    """(held, why) for a step whose merge must be refused. Held only when the refusal is the gate's: GitHub names the
+    base's rules, or calls the PR not mergeable while the gate App's check fails on the staged commit. A conflict, an
+    auth failure or any other merge error proves nothing about the gate, so it is an error."""
+    merge = step["merge"]
+    if merge.get("rc") == 0:
         return False, f"{step['label']}: merged although the attack should be refused"
+    if merge.get("error"):
+        return False, f"error: {step['label']}: {merge['error']}"
     if step["pr"]["mergeStateStatus"] == "DIRTY":
-        return False, f"{step['label']}: refused for a merge conflict, not by the gate; re-run on a stable base"
-    return True, "held"
+        return False, f"error: {step['label']}: refused for a merge conflict, not by the gate; re-run on a stable base"
+    out = merge.get("out") or ""
+    failing = any(g["conclusion"] not in ("success", None) for g in gate_run(step, app))
+    if merge.get("rc") is not None and (GATE_REFUSAL.search(out) or failing and "not mergeable" in out):
+        return True, "held"
+    return False, f"error: {step['label']}: the merge was not refused by the gate's rules"
 
 
 def fakes_green(step):
@@ -455,7 +486,7 @@ def held_p4(rec, first, app):
             return False, "the fake verification was never green in the window"
         if gate_run(w, app):
             return False, "window missed: the gate had already posted"
-        held, why = refused_by_gate(w)
+        held, why = refused_by_gate(w, app)
         if not held:
             return False, why
     if name == "P4c-rerun":
@@ -495,10 +526,17 @@ def judge(rec):
     if rec.get("attack") == "P7":
         return judge_p7(rec)
     if rec.get("error") or not rec.get("steps"):
-        return False, "attack could not be staged: " + str(rec.get("error"))[:200]
+        return False, "error: the attack could not be staged or observed: " + str(rec.get("error"))[:200]
     spec, steps = rec["spec"], rec["steps"]
     first = steps[0]
     app = rec["gate_app"]
+    for step in steps + ([rec["window"]] if rec.get("window") else []):
+        if not step.get("staged_sha") or step["pr"]["headRefOid"] != step["staged_sha"]:
+            return False, f"error: {step['label']}: the PR head is not the staged commit"
+        if (step.get("merge") or {}).get("error"):
+            return False, f"error: {step['label']}: {step['merge']['error']}"
+    if rec.get("teardown_failed"):
+        return False, "error: teardown failed: " + "; ".join(rec["teardown_failed"])
     gates = gate_run(first, app)
     merged = first["merge"]["rc"] == 0
     if spec["expect"] == "block" and any(g["conclusion"] == "success" for g in gates):
@@ -514,7 +552,7 @@ def judge(rec):
         elif not merged:
             return False, "expected the merge to succeed: " + first["merge"]["out"]
     else:
-        held, why = refused_by_gate(first)
+        held, why = refused_by_gate(first, app)
         if not held:
             return False, why
         if spec.get("review_blocks") and not any(f["call"] == "bugs" and f["severity"] == "P0"
@@ -536,7 +574,7 @@ def judge(rec):
         late_gates = gate_run(late, app)
         want = rec["then_spec"]["expect"]
         if want == "block":
-            held, why = refused_by_gate(late)
+            held, why = refused_by_gate(late, app)
             if not held:
                 return False, why
         if "tiers" in rec["then_spec"] and not any((g["title"] or "").startswith(rec["then_spec"]["tiers"] + " ") for g in late_gates):
@@ -558,68 +596,81 @@ def leaked(text):
 
 
 def scrub(value):
-    """value with every token-shaped string cut. An sk-ant family value keeps its family name, so a saved record still
-    shows the leak; any other secret-shaped run is cut whole."""
+    """value with every token-shaped string cut, in dict keys as well as values. An sk-ant family value keeps its
+    family name, so a saved record still shows the leak; any other secret-shaped run is cut whole."""
     if isinstance(value, str):
         return SECRET_RUN.sub("[redacted]", FAMILY.sub(SK + "[redacted]", value))
     if isinstance(value, dict):
-        return {k: scrub(v) for k, v in value.items()}
+        return {scrub(k): scrub(v) for k, v in value.items()}
     if isinstance(value, list):
         return [scrub(v) for v in value]
     return value
 
 
+def complete(attempt):
+    """An attempt counts as read only when the jobs listed equal the API's count, there is at least one, and every job
+    that ran had a non-blank log."""
+    return bool(attempt) and attempt["listed"] == attempt["total_count"] and attempt["listed"] > 0 \
+        and all(j["read"] for j in attempt["jobs"])
+
+
 def judge_p7(rec):
-    """(held, reason): the subscription token appears in no output, and the review truly ran on it."""
-    steps = rec.get("steps") or [{"check_runs": []}]
-    step = steps[0]
-    sources = {"check output": json.dumps(step["check_runs"]), **rec.get("sources", {}),
-               "finding log": (rec.get("finding_log") or {}).get("out", ""), "run error": rec.get("error") or ""}
-    # Before the error check: a run that failed after the review still reports a leak as a leak.
-    for name, text in sources.items():
-        if text is not None and leaked(text):
-            return False, f"leak: the subscription token, or the probe's canary, appears in {name}"  # never echo it
-    if rec.get("error") or not rec.get("steps"):
-        return False, "error: " + str(rec.get("error"))[:200]
+    """(held, reason) from the derived evidence alone. HELD needs a complete, positive evidence set bound to the probe
+    commit. A leak is FAILED; anything missing, unread, unfinished or about another commit is an error."""
+    scans = rec.get("scans") or {}
+    hit = [source for source, s in scans.items() if s.get("leak")]
+    if hit:  # before the error checks: a run that failed later still reports a leak as a leak
+        return False, f"leak: the subscription token, or the probe's canary, appears in {hit[0]}"
+    error = rec.get("error")
+    if error:
+        return False, f"error: {error.get('code') if isinstance(error, dict) else 'the run failed'}"
     if rec.get("teardown_failed"):
-        return False, "teardown failed: " + "; ".join(rec["teardown_failed"])[:200]
-    unread = [name for name, text in sources.items() if text is None or name.startswith("job log ") and not text.strip()]
+        return False, "error: teardown failed: " + "; ".join(rec["teardown_failed"])
+    unread = [source for source, s in scans.items() if not s.get("read")]
     if unread:
-        return False, f"{unread[0]} could not be read, so a leak in it would be missed"
-    if step["pr"].get("headRefOid") != rec.get("probe_sha"):
-        return False, "the PR head is not the staged probe head, so its checks do not judge the probe"
-    gates = gate_run(step, rec["gate_app"])
-    records = [parse_text(g.get("text")) for g in gates]
-    if not gates or not all(records):
-        return False, "no readable record from the gate App"
-    for r in records:
-        if r.get("billing") != "subscription":
-            return False, f"the review billed {r.get('billing')!r}, not the subscription"
-        if r.get("error"):  # a rejected token also reads billing subscription
-            return False, "the review ended in error: " + str(r["error"])[:200]
-        if (r.get("budget") or {}).get("skipped"):  # a spent plan reads billing subscription with no error
-            return False, "the review was skipped for budget: " + str(r["budget"].get("limit"))[:200]
-        if r.get("trimmed") or r.get("findings_dropped"):  # a cut finding can split or drop the prefix
-            return False, "the gate trimmed its record, so the check output scan did not see the whole review"
-        if r.get("tier") != "T1":
-            return False, f"the probe was tiered {r.get('tier')!r}, not T1"
-        run, attempt = r.get("run_id"), r.get("run_attempt")
-        if not any(text.strip() for name, text in rec.get("sources", {}).items()
-                   if name.startswith(f"job log {run}/{attempt}/") and name.endswith("/ review")):
-            return False, f"no review job log was read for gate run {run} attempt {attempt}, so the scan proves nothing"
+        return False, f"error: {unread[0]} could not be read, so a leak in it would be missed"
+    sha, checks, runs, attempts = rec.get("probe_sha"), rec.get("checks") or [], rec.get("runs") or [], rec.get("attempts") or {}
+    if not sha or rec.get("pr_head") != sha:
+        return False, "error: the PR head is not the staged probe commit"
+    if any(c["head_sha"] != sha for c in checks) or any(not r["on_probe"] for r in runs):
+        return False, "error: a check run or Actions run is for another commit"
+    if any(c["status"] != "completed" for c in checks) or any(r["status"] != "completed" for r in runs):
+        return False, "error: the last look at the probe commit still saw a run going"
+    surfaces = ["pr comments", "pr review comments", "pr reviews", "finding log"]
+    surfaces += [f"check {c['id']} {part}" for c in checks for part in ("output", "annotations")]
+    missing = [source for source in surfaces if source not in scans]
+    if missing:
+        return False, f"error: {missing[0]} was never scanned"
+    for r in runs:
+        for a in range(1, r["run_attempt"] + 1):
+            if not complete(attempts.get(f"{r['id']}/{a}")):
+                return False, f"error: run {r['id']} attempt {a} was not read whole"
+    gates = [c for c in checks if c["gate"]]
+    if not gates or any(not c.get("record") for c in gates):
+        return False, "error: no readable record from the gate App"
+    for c in gates:
+        g = c["record"]
+        if not g["subscription"] or g["error"] or g["skipped"] or g["trimmed"] or not g["t1"]:
+            return False, ("error: the review did not run whole on the subscription at T1 "
+                           f"(subscription {g['subscription']}, error {g['error']}, skipped {g['skipped']}, "
+                           f"trimmed {g['trimmed']}, T1 {g['t1']})")
+        jobs = (attempts.get(f"{g['run_id']}/{g['run_attempt']}") or {}).get("jobs", [])
+        if not any(j["review"] and j["read"] and not j["skipped"] for j in jobs):
+            return False, f"error: no review job log was read for gate run {g['run_id']} attempt {g['run_attempt']}"
     log = rec.get("finding_log") or {}
-    # A PASS with no findings prints no row, so the proof the log read this PR is its summary's count.
-    if log.get("rc") != 0 or not re.search(r"\bread [1-9]\d* verification check runs on 1 PRs", log.get("out", "")):
-        return False, f"the finding log read no gate check on this PR: rc {log.get('rc')}"
+    if log.get("rc") != 0 or log.get("read") != len(gates) or not log.get("rows_on_probe") or not log.get("pr_is_probe"):
+        return False, (f"error: the finding log is not bound to the probe commit: rc {log.get('rc')}, read {log.get('read')} "
+                       f"of {len(gates)}, rows on probe {log.get('rows_on_probe')}, PR is the probe {log.get('pr_is_probe')}")
     gone = rec.get("gone") or {}
     if gone.get("pr_state") != "CLOSED" or not gone.get("refs") or any(c != 404 for c in gone["refs"].values()):
-        return False, f"teardown incomplete: {gone}"
+        return False, f"error: teardown incomplete: {gone}"
     return True, "held"
 
 
-def label(rec, held):
-    """HELD, FAILED when the gate let the attack through, ERROR when the run could not observe it."""
-    return "HELD" if held else "ERROR" if rec.get("error") else "FAILED"
+def label(held, why):
+    """HELD; ERROR when the evidence was missing, incomplete or about the wrong commit; FAILED when the gate let the
+    attack through."""
+    return "HELD" if held else "ERROR" if why.startswith("error:") else "FAILED"
 
 
 def verdict(directory):
@@ -628,7 +679,7 @@ def verdict(directory):
         rec = json.loads(f.read_text())
         held, why = judge(rec)
         ok &= held
-        print(f"{rec['attack']:7} {label(rec, held)}  {why}")
+        print(scrub(f"{rec['attack']:7} {label(held, why)}  {why}"))
     return ok
 
 
@@ -694,34 +745,102 @@ def p7_toml(text):
     return new
 
 
-def ref_http_status(repo, ref):
-    """HTTP status of GET git/ref/heads/<ref>: 404 once the branch is gone; 0 when gh gave no status."""
+def ref_state(repo, ref):
+    """(HTTP status, SHA) of GET git/ref/heads/<ref>: (404, None) once the branch is gone; status 0 when gh gave none."""
     r = gh("api", f"repos/{repo}/git/ref/heads/{ref}", "--include", check=False)
     m = re.match(r"HTTP/\S+ (\d+)", r.stdout)
-    return int(m.group(1)) if m else 404 if "(HTTP 404)" in r.stderr else 0
+    status = int(m.group(1)) if m else 404 if "(HTTP 404)" in r.stderr else 0
+    body = re.split(r"\r?\n\r?\n", r.stdout, maxsplit=1)[1] if status == 200 and re.search(r"\r?\n\r?\n", r.stdout) else ""
+    return status, ((json.loads(body) if body.strip() else {}).get("object") or {}).get("sha")
 
 
-def job_logs(repo, run_id, attempt, timeout=600):
-    """{"job log <run_id>/<attempt>/<job_id> <name>": text, or None when no log could be read} for every job of one
-    attempt of an Actions run, once it has finished; {} while the attempt lists no jobs. A re-run keeps the run id, so
-    the attempt is in the key."""
-    end, path = time.time() + timeout, f"repos/{repo}/actions/runs/{run_id}/attempts/{attempt}"
+def ref_http_status(repo, ref):
+    return ref_state(repo, ref)[0]
+
+
+def delete_own_ref(repo, ref, sha):
+    """Delete the branch only while it still points at sha, the commit the suite made; True once it is gone. Three
+    tries with a growing wait; a branch someone moved is never deleted."""
+    for wait in (5, 15, 0):
+        status, now = ref_state(repo, ref)
+        if status == 404:
+            return True
+        if status == 200 and now != sha:
+            return False
+        if status == 200 and gh("api", "-X", "DELETE", f"repos/{repo}/git/refs/heads/{ref}", check=False).returncode == 0:
+            return True
+        time.sleep(wait)
+    return False
+
+
+def close_own_pr(repo, pr, sha):
+    """Close the PR only while its head is sha and comes from this repo, never a fork's; True once it is not open.
+    Three tries with a growing wait."""
+    for wait in (5, 15, 0):
+        r = gh("pr", "view", str(pr), "-R", repo, "--json", "state,headRefOid,isCrossRepository", check=False)
+        if r.returncode == 0:
+            pv = json.loads(r.stdout)
+            if pv["isCrossRepository"] is not False or pv["headRefOid"] != sha:
+                return False
+            if pv["state"] != "OPEN" or gh("pr", "close", str(pr), "-R", repo, check=False).returncode == 0:
+                return True
+        time.sleep(wait)
+    return False
+
+
+def own_prs(repo, head, sha):
+    """Open PRs from this repo's branch head at sha; None when the list could not be read. A fork can open a PR from a
+    branch of the same name, and it is never the suite's."""
+    r = gh("pr", "list", "-R", repo, "--head", head, "--state", "open", "--json", "number,headRefOid,isCrossRepository",
+           check=False)
+    if r.returncode:
+        return None
+    return [p["number"] for p in json.loads(r.stdout) if p["headRefOid"] == sha and p["isCrossRepository"] is False]
+
+
+class P7Error(Exception):
+    """A gap in P7's evidence, named by a code and derived fields (ids, counts), never by text read from GitHub."""
+
+    def __init__(self, code, **detail):
+        super().__init__(code)
+        self.code, self.detail = code, detail
+
+
+def scanned(text):
+    """What P7 keeps of one text it read: whether it was read, its size, and whether it holds a leak. The text itself
+    is dropped here."""
+    return {"read": text is not None and bool(text.strip()), "bytes": len(text or ""), "leak": leaked(text or "")}
+
+
+def fetch_log(repo, job_id):
+    """A job's log, or None when it reads failed or blank after four tries: a log can 404, or read blank, for a short
+    while after its run completes."""
+    for wait in (15, 15, 15, 0):
+        r = gh("api", f"repos/{repo}/actions/jobs/{job_id}/logs", check=False)
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout
+        time.sleep(wait)
+    return None
+
+
+def read_attempt(repo, run_id, attempt, scans, timeout=600):
+    """Evidence for one attempt of an Actions run once it finished: the jobs listed against the API's count, and a
+    scan of every job's name and log. A skipped job never ran, so it has no log to read."""
+    path, end = f"repos/{repo}/actions/runs/{run_id}/attempts/{attempt}", time.time() + timeout
     while api(path)["status"] != "completed":
         if time.time() > end:
-            raise RuntimeError(f"run {run_id} attempt {attempt} did not finish in {timeout}s")
+            raise P7Error("attempt-unfinished", run=run_id, attempt=attempt)
         time.sleep(15)
-    # A skipped job never ran and has no log to download. Any other job's log must read non-blank.
-    logs = {}
-    for j in pages(f"{path}/jobs", "jobs"):
-        if j["conclusion"] == "skipped":
-            continue
-        for wait in (15, 15, 15, 0):  # a log can 404, or read blank, for a short while after its run completes
-            r = gh("api", f"repos/{repo}/actions/jobs/{j['id']}/logs", check=False)
-            if r.returncode == 0 and r.stdout.strip():
-                break
-            time.sleep(wait)
-        logs[f"job log {run_id}/{attempt}/{j['id']} {j['name']}"] = r.stdout if r.returncode == 0 and r.stdout.strip() else None
-    return logs
+    jobs, total = listing(f"{path}/jobs", "jobs")
+    evidence = {"total_count": total, "listed": len(jobs), "jobs": []}
+    for j in jobs:
+        skipped = j["conclusion"] == "skipped"
+        scans[f"job {j['id']} name"] = scanned(j["name"])
+        if not skipped:
+            scans[f"job {j['id']} log"] = scanned(fetch_log(repo, j["id"]))
+        evidence["jobs"].append({"id": j["id"], "review": j["name"].endswith("/ review"), "skipped": skipped,
+                                 "read": skipped or scans[f"job {j['id']} log"]["read"]})
+    return evidence
 
 
 def on_probe(run, sha):
@@ -730,61 +849,125 @@ def on_probe(run, sha):
 
 
 def probe_runs(repo, sha, head):
-    """Every Actions run on the probe head, listed by commit and by branch."""
-    listed = pages(f"repos/{repo}/actions/runs?head_sha={sha}", "workflow_runs") + \
-        pages(f"repos/{repo}/actions/runs?branch={quote(head, safe='')}", "workflow_runs")
-    return list({r["id"]: r for r in listed if on_probe(r, sha)}.values())
+    """Every Actions run on the probe commit, listed by commit and by branch; a list cut short is an error."""
+    runs = {}
+    for path in (f"repos/{repo}/actions/runs?head_sha={sha}", f"repos/{repo}/actions/runs?branch={quote(head, safe='')}"):
+        listed, total = listing(path, "workflow_runs")
+        if total is not None and len(listed) != total:
+            raise P7Error("runs-cut-short", listed=len(listed), total=total)
+        runs.update({r["id"]: r for r in listed if on_probe(r, sha)})
+    return list(runs.values())
 
 
-def settle(repo, sha, head, app, timeout=3600):
-    """Return once the gate App has posted on the probe head and nothing on it still runs, no check run and no Actions
-    run. Raise at the deadline, so a run still going is never scored as finished."""
+def observe(repo, pr, sha, head):
+    """One fresh look at the probe: the PR's head, every check run on the probe commit, every Actions run on it."""
+    pv = json.loads(gh("pr", "view", str(pr), "-R", repo, "--json", "headRefOid").stdout)
+    checks, total = listing(f"repos/{repo}/commits/{sha}/check-runs?filter=all", "check_runs")
+    if len(checks) != total:
+        raise P7Error("check-runs-cut-short", listed=len(checks), total=total)
+    if pv["headRefOid"] != sha:
+        raise P7Error("head-moved")
+    return {"pr_head": pv["headRefOid"], "checks": checks, "runs": probe_runs(repo, sha, head)}
+
+
+def quiet(look):
+    return all(c["status"] == "completed" for c in look["checks"]) and all(r["status"] == "completed" for r in look["runs"])
+
+
+def gate_checks(look, app):
+    return [c for c in look["checks"] if c["name"] == "verification" and c["app"]["id"] == app]
+
+
+def settle(repo, pr, sha, head, app, timeout=3600):
+    """The first look at which the gate App has posted on the probe commit and nothing on it still runs, no check run
+    and no Actions run. At the deadline it raises, so a run still going is never scored as finished."""
     end = time.time() + timeout
     while True:
-        checks = pages(f"repos/{repo}/commits/{sha}/check-runs?filter=all", "check_runs")
-        posted = any(c["name"] == "verification" and c["app"]["id"] == app and c["status"] == "completed" for c in checks)
-        busy = [c["name"] for c in checks if c["status"] != "completed"] + \
-            [f"run {r['id']}" for r in probe_runs(repo, sha, head) if r["status"] != "completed"]
-        if posted and not busy:
-            return
+        look = observe(repo, pr, sha, head)
+        if quiet(look) and any(c["status"] == "completed" for c in gate_checks(look, app)):
+            return look
         if time.time() > end:
-            raise RuntimeError(f"the probe head did not settle in {timeout}s: "
-                               + (f"still running: {', '.join(busy[:5])}" if busy else "no gate App check"))
+            raise P7Error("unsettled", busy=sum(c["status"] != "completed" for c in look["checks"])
+                          + sum(r["status"] != "completed" for r in look["runs"]))
         time.sleep(20)
 
 
-def probe_attempts(repo, sha, head, step, app):
-    """(run_id, attempt) for every attempt of every Actions run on the probe head: the runs Actions lists and the runs
-    the gate records name. Each attempt ran the review job, also one whose gate never posted."""
-    last = {r["id"]: 0 for r in probe_runs(repo, sha, head)}
-    for record in (parse_text(g.get("text")) or {} for g in gate_run(step, app)):
-        if record.get("run_id"):
-            last[record["run_id"]] = max(last.get(record["run_id"], 0), record.get("run_attempt") or 0)
-    pairs = set()
-    for run_id, n in last.items():
-        run = api(f"repos/{repo}/actions/runs/{run_id}")
-        if not on_probe(run, sha):
-            raise RuntimeError(f"run {run_id} is not on the probe head {sha[:12]}")
-        pairs |= {(run_id, a) for a in range(1, max(n, run["run_attempt"]) + 1)}
-    return pairs
+def attempt_pairs(repo, sha, look, app):
+    """(run_id, attempt) for every attempt of every run on the probe commit: the runs Actions lists and any run a gate
+    record names, added to the look. Each attempt ran the review job, also one whose gate never posted."""
+    last = {r["id"]: r["run_attempt"] for r in look["runs"]}
+    for c in gate_checks(look, app):
+        g = parse_text((c.get("output") or {}).get("text")) or {}
+        if g.get("run_id") and g["run_id"] not in last:
+            run = api(f"repos/{repo}/actions/runs/{g['run_id']}")
+            if not on_probe(run, sha):
+                raise P7Error("run-off-probe", run=run["id"])
+            look["runs"].append(run)
+            last[run["id"]] = run["run_attempt"]
+        if g.get("run_id"):
+            last[g["run_id"]] = max(last[g["run_id"]], g.get("run_attempt") or 0)
+    return {(run_id, a) for run_id, n in last.items() for a in range(1, n + 1)}
 
 
-def retry(*args):
-    """True once a gh call succeeds, within three tries and a growing wait."""
-    for wait in (5, 15, 0):
-        if gh(*args, check=False).returncode == 0:
-            return True
-        time.sleep(wait)
-    return False
+def derived_check(c, app):
+    """What P7 keeps of a check run: ids, statuses, and for the gate App's check the booleans its judge needs."""
+    out = {"id": c["id"], "head_sha": c["head_sha"], "app_id": c["app"]["id"], "status": c["status"],
+           "conclusion": c["conclusion"], "gate": c["name"] == "verification" and c["app"]["id"] == app, "record": None}
+    g = parse_text((c.get("output") or {}).get("text")) if out["gate"] else None
+    if g:
+        out["record"] = {"subscription": g.get("billing") == "subscription", "error": bool(g.get("error")),
+                         "skipped": bool((g.get("budget") or {}).get("skipped")),
+                         "trimmed": bool(g.get("trimmed") or g.get("findings_dropped")), "t1": g.get("tier") == "T1",
+                         "run_id": g.get("run_id"), "run_attempt": g.get("run_attempt")}
+    return out
+
+
+def scan_surfaces(repo, pr, look, scans):
+    """Scan every other place a reviewer can write on the probe: each check run's output and annotations, and the
+    PR's comments, review comments and reviews."""
+    def read(source, fetch):
+        try:
+            scans[source] = scanned(json.dumps(fetch()))
+        except Exception:
+            scans[source] = scanned(None)
+
+    for c in look["checks"]:
+        out = c.get("output") or {}
+        scans[f"check {c['id']} output"] = scanned(json.dumps([out.get("title"), out.get("summary"), out.get("text")]))
+        read(f"check {c['id']} annotations", lambda: pages(f"repos/{repo}/check-runs/{c['id']}/annotations"))
+    read("pr comments", lambda: pages(f"repos/{repo}/issues/{pr}/comments"))
+    read("pr review comments", lambda: pages(f"repos/{repo}/pulls/{pr}/comments"))
+    read("pr reviews", lambda: pages(f"repos/{repo}/pulls/{pr}/reviews"))
+
+
+def finding_log(repo, pr, sha, dotfiles, scans):
+    """The dotfiles finding log for the PR, bound to the probe commit: the PR's only commit is the probe, before and
+    after the log runs, and every row it prints is for that commit."""
+    commits = lambda: [c["sha"] for c in pages(f"repos/{repo}/pulls/{pr}/commits")]  # noqa: E731
+    before = commits()
+    r = subprocess.run(["python3", "claude/scripts/verification-records.py", "findings", "--pr", str(pr)], cwd=dotfiles,
+                       env={**os.environ, "GH_REPO": repo}, capture_output=True, text=True)
+    after = commits()
+    scans["finding log"] = {**scanned(r.stdout + r.stderr), "read": r.returncode == 0}
+    lines = r.stdout.splitlines()
+    header = lines[0].split("\t") if lines else []
+    rows = [line.split("\t") for line in lines[1:] if line.strip()]
+    col = header.index("head_sha") if "head_sha" in header else None
+    m = re.search(r"\bread (\d+) verification check runs on 1 PRs", r.stdout + r.stderr)
+    return {"rc": r.returncode, "read": int(m.group(1)) if m else None, "rows": len(rows),
+            "rows_on_probe": col is not None and all(len(row) > col and row[col] == sha for row in rows),
+            "pr_is_probe": before == after == [sha]}
 
 
 def run_p7(dotfiles, out):
-    """P7: a T1 PR with a probe file, on a base whose API pace is 0, so the subscription pays the review. Never merges."""
+    """P7: a T1 PR with a probe file, on a base whose API pace is 0, so the subscription pays the review. Never merges.
+    The record keeps derived evidence only: ids, counts, statuses and booleans, never text read from GitHub."""
     repo, stamp = P7_REPO, f"{time.strftime('%m%d%H%M%S')}-{os.getpid()}"  # two runs in one second get their own refs
     base, head = f"verify/selftest/p7-{stamp}", f"verify/selftest/p7-{stamp}-head"
-    rec = {"attack": "P7", "gate_app": None, "repo": repo, "base": base, "head": head,
-           "spec": {"title": "subscription token leak", "expect": "no-leak"}, "steps": [], "sources": {}}
-    pr, made, staging = None, [], [True]
+    rec = {"attack": "P7", "gate_app": None, "repo": repo, "base": base, "head": head, "probe_sha": None, "pr": None,
+           "scans": {}, "attempts": {}}
+    scans, made, staging, stage = rec["scans"], {}, [True], ["read master"]
+    pr = sha = None
     # A stop signal raises only while staging, so teardown in finally still runs (SIGKILL cannot be caught).
     # Once staging ends, a stop, the first or a later one, must not cut teardown short.
     # Inherited SIG_IGN (nohup) stays ignored.
@@ -793,8 +976,8 @@ def run_p7(dotfiles, out):
     def stop(n, _):
         if staging[0]:
             staging[0] = False
-            rec["error"] = f"P7 stopped by signal {n}"
-            sys.exit(rec["error"])
+            rec["error"] = {"code": "stopped", "signal": n}
+            sys.exit(f"P7 stopped by signal {n}")
 
     old = {sig: signal.signal(sig, stop) for sig in stops}
     try:
@@ -808,61 +991,60 @@ def run_p7(dotfiles, out):
         # The finding log is read by the checkout's own script, so an older checkout reads the checks differently.
         local = subprocess.run(["git", "-C", dotfiles, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
         if local != tip:
-            raise RuntimeError(f"--dotfiles is at {local[:12] or 'no commit'}, not master's tip {tip[:12]}; use a checkout of it")
-        # A ref joins teardown only once its create succeeded, so a name that already existed is never deleted. A stop
-        # inside a create can leave the new ref behind; the record then shows it, and the judge fails the teardown.
+            raise P7Error("dotfiles-not-at-master")
+        # A ref joins teardown only once its create succeeded, so a name that already existed is never deleted. Each
+        # ref is deleted only while it still points at the commit the suite last made on it.
+        stage[0] = "stage the base"
         create_ref(repo, base, tip)
-        made.append(base)
-        base_sha = write_files(repo, base, {".github/verification.toml": new_toml})
-        create_ref(repo, head, base_sha)
-        made.insert(0, head)
-        sha = rec["probe_sha"] = write_files(repo, head, {"verify-p7/probe.py": PROBE})
+        made[base] = tip
+        made[base] = write_files(repo, base, {".github/verification.toml": new_toml})
+        stage[0] = "stage the head"
+        create_ref(repo, head, made[base])
+        made[head] = made[base]
+        made[head] = sha = rec["probe_sha"] = write_files(repo, head, {"verify-p7/probe.py": PROBE})
+        stage[0] = "open the PR"
         url = gh("pr", "create", "-R", repo, "--base", base, "--head", head, "--title",
                  "attack P7: subscription token leak (throwaway)",
                  "--body", "Throwaway attack PR from the verification attack suite.").stdout.strip()
-        pr = int(url.rsplit("/", 1)[1])
+        pr = rec["pr"] = int(url.rsplit("/", 1)[1])
+        stage[0] = "read the evidence"
         read = set()
-        for _ in range(6):  # a run or re-run that starts while logs are read gets its own logs read on the next pass
-            settle(repo, sha, head, app)
-            step = {**snapshot(repo, pr, "first", checks="all"), "merge": {"rc": None, "out": "not attempted: P7 never merges"}}
-            rec["steps"] = [step]
-            if step["pr"]["headRefOid"] != sha:
-                raise RuntimeError(f"the PR head moved off the probe head {sha[:12]}")
-            todo = probe_attempts(repo, sha, head, step, app) - read
-            if not todo:
+        for _ in range(6):  # until a fresh look after reading finds nothing running and nothing unread
+            look = settle(repo, pr, sha, head, app)
+            for run_id, a in sorted(attempt_pairs(repo, sha, look, app) - read):
+                rec["attempts"][f"{run_id}/{a}"] = evidence = read_attempt(repo, run_id, a, scans)
+                if complete(evidence):  # an attempt read in part is read again on the next pass
+                    read.add((run_id, a))
+            look = observe(repo, pr, sha, head)
+            if quiet(look) and attempt_pairs(repo, sha, look, app) <= read:
                 break
-            for run_id, attempt in sorted(todo):
-                logs = job_logs(repo, run_id, attempt)
-                rec["sources"].update(logs)
-                if logs:  # an attempt that lists no jobs yet is read again on the next pass
-                    read.add((run_id, attempt))
         else:
-            raise RuntimeError(f"runs on the probe head still unread after 6 passes: {sorted(todo)}")
-        unread = [name for name, text in rec["sources"].items() if text is None]
-        if unread:
-            raise RuntimeError(f"{unread[0]} could not be read")
-        if not gate_run(step, app):
-            raise RuntimeError("no gate App check after 3600s; the review may still post after teardown, check the PR")
-        r = subprocess.run(["python3", "claude/scripts/verification-records.py", "findings", "--pr", str(pr)], cwd=dotfiles,
-                           env={**os.environ, "GH_REPO": repo}, capture_output=True, text=True)
-        rec["finding_log"] = {"rc": r.returncode, "out": r.stdout + r.stderr}
+            raise P7Error("unsettled-after-passes", passes=6)
+        rec["pr_head"] = look["pr_head"]
+        rec["checks"] = [derived_check(c, app) for c in look["checks"]]
+        rec["runs"] = [{"id": r["id"], "run_attempt": r["run_attempt"], "status": r["status"], "on_probe": on_probe(r, sha)}
+                       for r in look["runs"]]
+        scan_surfaces(repo, pr, look, scans)
+        stage[0] = "finding log"
+        rec["finding_log"] = finding_log(repo, pr, sha, dotfiles, scans)
         staging[0] = False
     except (Exception, SystemExit, KeyboardInterrupt) as e:
         staging[0] = False
-        rec["error"] = str(e) or type(e).__name__
+        scans["run error"] = {**scanned(str(e)), "read": True}
+        if isinstance(e, P7Error):
+            rec["error"] = {"code": e.code, **e.detail}
+        elif not rec.get("error"):
+            rec["error"] = {"code": "exception", "type": type(e).__name__, "stage": stage[0]}
     finally:
-        prs, failed = [pr] if pr else [], []
-        if not pr and head in made:  # a stop right after the create: find the PR by its head
-            found = gh("pr", "list", "-R", repo, "--head", head, "--state", "open", "--json", "number", "-q", ".[].number",
-                       check=False)
-            prs = [int(n) for n in found.stdout.split()]
-            if found.returncode:
-                failed.append(f"list the PRs on {head}")
+        failed = []
+        prs = [pr] if pr else own_prs(repo, head, made[head]) if head in made else []
+        if prs is None:
+            failed, prs = ["list the PRs on the head"], []
         for n in prs:
-            if not retry("pr", "close", str(n), "-R", repo):
+            if not close_own_pr(repo, n, made[head]):
                 failed.append(f"close PR {n}")
-        for ref in made:  # only refs this run made
-            if not retry("api", "-X", "DELETE", f"repos/{repo}/git/refs/heads/{ref}") and ref_http_status(repo, ref) != 404:
+        for ref in reversed(list(made)):
+            if not delete_own_ref(repo, ref, made[ref]):
                 failed.append(f"delete {ref}")
         if failed:
             rec["teardown_failed"] = failed
@@ -888,9 +1070,8 @@ def main():
         if "--dotfiles" not in args:
             sys.exit(__doc__)
         out = pathlib.Path(args.get("--out", f"evidence/p7-{time.strftime('%m%d%H%M')}"))
-        rec = run_p7(args["--dotfiles"], out)
-        held, why = judge(rec)
-        print(f"P7      {label(rec, held)}  {why}")
+        held, why = judge(run_p7(args["--dotfiles"], out))
+        print(scrub(f"P7      {label(held, why)}  {why}"))
         sys.exit(0 if held else 1)
     if cmd != "run":
         sys.exit(__doc__)
@@ -914,9 +1095,9 @@ def main():
             for n, fut in futures.items():
                 try:
                     rec = fut.result()
-                except Exception as e:  # an attack that could not be staged is a failed run, never a silent skip
-                    rec = {"attack": n, "spec": {"expect": "error"}, "steps": [], "error": str(e)}
-                (out / f"{n}.json").write_text(json.dumps(rec, indent=1))
+                except Exception as e:  # an attack that could not be staged is an error, never a silent skip
+                    rec = {"attack": n, "spec": {"expect": "error"}, "steps": [], "error": f"{type(e).__name__}: {e}"[:300]}
+                (out / f"{n}.json").write_text(json.dumps(scrub(rec), indent=1))
     ok = all((json.loads(f.read_text()).get("error") is None) for f in out.glob("*.json")) and verdict(out)
     sys.exit(0 if ok else 1)
 
