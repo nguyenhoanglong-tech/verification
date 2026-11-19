@@ -1,5 +1,7 @@
 """D18 as amended 2026-11-19: when the API budget refuses, the review runs on the Claude subscription."""
+import io
 import json
+from contextlib import redirect_stdout
 import os
 import re
 import sys
@@ -409,6 +411,20 @@ class Argv(unittest.TestCase):
             for _ in range(2):
                 fakes.run(review.claude, ["--model", "m"], "PROMPT", "subscription", runner)
         self.assertEqual(len(set(cwds)), 2)
+
+    def test_a_call_that_times_out_returns_a_failure_instead_of_raising(self):
+        # Raised, a timeout skipped the billing step, so a hung subscription call never counted against its cap.
+        def run(cmd, timeout=None, **kw):
+            raise review.subprocess.TimeoutExpired(cmd, timeout)
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(review.subprocess, "run", run):
+            runner = review.Runner(token_file=Path(d) / "t", home=Path(d) / "home", cwd=Path(d) / "cwd", oauth=TOKEN)
+            runner.cwd.mkdir()
+            with redirect_stdout(io.StringIO()):
+                rc, stdout, stderr = review.claude(["--model", "m"], "PROMPT", "subscription", runner)
+        result, failure = review.outcome(rc, stdout, stderr, "subscription")
+        self.assertNotEqual(rc, 0)
+        self.assertIn("timed out", failure)
+        self.assertEqual(review.failure_kind(failure, "subscription"), "error")
 
     def test_a_claude_md_above_the_empty_cwd_refuses_the_subscription_call(self):
         with tempfile.TemporaryDirectory() as d:

@@ -239,7 +239,11 @@ def claude(args: list[str], prompt: str, billing: str, runner: Runner) -> tuple[
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(("ACTIONS_", "ANTHROPIC_", "CLAUDE_")) and k not in SCRUBBED}
     env.update(HOME=str(runner.home), CLAUDE_CONFIG_DIR=str(runner.home / ".claude"), **auth)
-    p = subprocess.run(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=1500)
+    try:
+        p = subprocess.run(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=1500)
+    except subprocess.TimeoutExpired:
+        # A failure, not an exception: main still bills the call, so a hung subscription call counts against its cap.
+        return 124, "", "claude timed out after 1500s"
     return p.returncode, p.stdout, p.stderr
 
 
