@@ -143,7 +143,7 @@ def decide(*, head_sha, base_sha, tiers, mode, switch_spec, machine, review, bud
         "schema": 1, "head_sha": head_sha, "base_sha": base_sha, "tier": tiers, "mode": mode,
         "verdict": verdict, "title": title, "switch_spec": bool(switch_spec), "machine": machine,
         "findings": findings, "spec": (review or {}).get("spec"), "cost_usd": float((review or {}).get("cost_usd") or 0),
-        "billing": (review or {}).get("billing"),
+        "billing": (review or {}).get("billing"), "refused": (review or {}).get("refused"),
         "subscription_cost_usd": float((review or {}).get("subscription_cost_usd") or 0),
         "budget": budget, "error": "; ".join(errors) or None,
     }
@@ -168,7 +168,8 @@ def summary(record: dict, stamp_text: str, reasons: str, run_url: str) -> str:
     lines = [f"Verified-by: {stamp_text} head={record['head_sha']}", "",
              f"verdict: {record['verdict']}", f"tiers: {record['tier']} ({reasons})", f"base: {record['base_sha']}",
              f"mode: {record['mode']}", f"spec call: {'yes' if record['switch_spec'] else 'no'}",
-             f"billing: {record.get('billing') or 'none'}",
+             f"billing: {record.get('billing') or 'none'}"
+             + (f" (API refused: {record['refused']})" if record.get("refused") else ""),
              f"cost_usd: {record['cost_usd']:.4f}" + (f" (subscription, notional: {record['subscription_cost_usd']:.4f})"
                                                        if record.get("subscription_cost_usd") else ""),
              "budget: " + (BUDGET_SKIPPED + "".join(f" ({record['budget'][k]})" for k in ("limit", "read_error", "spec_skipped")

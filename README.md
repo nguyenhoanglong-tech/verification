@@ -27,18 +27,20 @@ toml and this month's records:
 | Route | When | How the call runs |
 | --- | --- | --- |
 | `api` | API-paid reviews today < `reviews_per_day` and API spend this month < `budget_month_usd` | `claude --bare -p`, the federation token through `apiKeyHelper`, cwd = the base checkout |
-| `subscription` | an API limit is reached, `[subscription] fallback = true`, the caller passed `claude_code_oauth_token`, and subscription reviews today < `[subscription] reviews_per_day` | `claude -p --safe-mode --strict-mcp-config`, the token in that process's env only, cwd = an empty dir with no `CLAUDE.md` or `.claude` above it |
-| none | neither may run, or the budget could not be read | no paid call: `review skipped: budget (<the limits hit>)` |
+| `subscription` | an API limit is reached, `[subscription] fallback = true`, the caller passed `claude_code_oauth_token`, and subscription reviews today < `[subscription] reviews_per_day` | `claude -p --safe-mode --strict-mcp-config`, the token in that process's env only, cwd = a fresh empty dir per call, with no `CLAUDE.md` or `.claude` above it |
+| none | neither may run, the budget could not be read, or the plan's own usage limit is reached | no paid call: `review skipped: budget (<the limits hit>)` |
 
 `--bare` reads no OAuth token, so the subscription call rebuilds its isolation; `tests/test_isolation.py` runs
 the pinned CLI on both routes against a fake API and checks that the head's config, the secret dir and the
-process env never reach the model, and that both routes send the same system prompt and tools. An API call
+process env never reach the model, and that both routes send the same system prompt and tools, for the Bugs and the Spec call. An API call
 refused by the spend limit or for credit is retried once on the subscription when that route may run. A
-rejected subscription token is an ERROR, never a budget skip.
+rejected subscription token is an ERROR, never a budget skip. Both routes Read the base checkout by its own path,
+and the prompts name that path. The record's `refused` says when the API refused a call (`api spend limit` or
+`api credit`).
 
 Each record says `billing` (`api`, `subscription`, `api+subscription` or null). `cost_usd`,
 `budget.reviews_today` and `budget.month_usd` count the API only; `budget.subscription_today` counts
-subscription reviews, and `subscription_cost_usd` is the notional cost the subscription paid. Records written
+subscription reviews (a subscription call counts once it ran, failed or not), and `subscription_cost_usd` is the notional cost the subscription paid. Records written
 before this field read as API, with no subscription reviews.
 
 The caller grants `actions: read` (the budget reads the caller's own runs this month), `contents: read`,

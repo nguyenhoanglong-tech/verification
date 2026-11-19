@@ -137,6 +137,13 @@ class Judge(unittest.TestCase):
         b = record["budget"]
         self.assertEqual((b["reviews_today"], b["month_usd"], b["subscription_today"]), (4, 30.5, 5))
 
+    def test_the_record_says_the_api_refused(self):
+        record, body, _ = self.judge({"findings": [], "spec": None, "cost_usd": 0.0, "subscription_cost_usd": 0.4,
+                                      "billing": "subscription", "refused": "api spend limit", "error": None,
+                                      "budget_refused": False})
+        self.assertEqual(record["refused"], "api spend limit")
+        self.assertIn("billing: subscription (API refused: api spend limit)", body["output"]["summary"])
+
     def test_a_skip_names_the_limit(self):
         tier_budget = {**CAPS, "skipped": True, "limit": "API daily pace 5/5; subscription fallback off"}
         record = verdict.decide(head_sha="h", base_sha="b", tiers="T1", mode="shadow", switch_spec=False, machine=[],
@@ -203,6 +210,12 @@ SPEND_LIMIT = json.dumps({"is_error": True, "subtype": "success", "total_cost_us
                           "API Error: 400 You have reached your specified API usage limits. You will regain access on 2026-12-01."})
 CREDIT = json.dumps({"is_error": False, "subtype": "success", "total_cost_usd": 0, "result": "Credit balance is too low"})
 OK_BUGS = json.dumps({"is_error": False, "result": "```json\n[]\n```", "total_cost_usd": 0.4})
+OK_SPEC = json.dumps({"is_error": False, "result": "done", "total_cost_usd": 0.3,
+                      "structured_output": {"answer": "Yes", "items": [{"n": 1, "item": "a", "status": "Yes"}]}})
+PLAN_LIMITS = (json.dumps({"is_error": True, "subtype": "success", "total_cost_usd": 0,
+                           "result": "Claude AI usage limit reached|1763600000"}),
+               json.dumps({"is_error": False, "subtype": "success", "total_cost_usd": 0,
+                           "result": "You\u2019ve hit your limit \u00b7 resets 3pm (UTC)"}))
 REJECTED = json.dumps({"is_error": True, "subtype": "success", "total_cost_usd": 0,
                        "result": 'Failed to authenticate. API Error: 401 {"type":"error","error":{"type":"authentication_error",'
                                  '"message":"OAuth access token is invalid."}}'})
@@ -211,13 +224,23 @@ REJECTED = json.dumps({"is_error": True, "subtype": "success", "total_cost_usd":
 class MidRun(unittest.TestCase):
     """An API call refused for spend or credit is retried once on the subscription when the subscription may run."""
 
-    def run_main(self, replies, pace=None, prior=totals(5, 1.0, 0), token=TOKEN, spec=False):
-        calls = []
+    def run_main(self, replies, pace=None, prior=totals(5, 1.0, 0), token=TOKEN, spec=False, reads=None):
+        calls, self.prompts, self.args = [], [], []
 
         def claude(args, prompt, billing, runner):
             calls.append(billing)
-            return 0, replies[len(calls) - 1], ""
+            self.prompts.append(prompt)
+            self.args.append(args)
+            reply = replies[len(calls) - 1]
+            return (1, *reply) if isinstance(reply, tuple) else (0, reply, "")
         when = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        reads = iter(reads or [])
+
+        def month_records(*a):
+            outcome = next(reads, None)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return [(when, {"budget": prior})]
         env = {"BASE_SHA": "b", "ANTHROPIC": "{}", "MODEL": "m", "EFFORT": "medium", "GITHUB_REPOSITORY": "o/r",
                "GITHUB_WORKFLOW_REF": "o/r/.github/workflows/c.yml@refs/heads/main",
                "PACE": json.dumps(pace or {**CAPS, "route": "api"}), "SUBSCRIPTION_TOKEN": token,
@@ -225,7 +248,7 @@ class MidRun(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {**env, "RUNNER_TEMP": tmp, "HEAD_DIR": tmp}), \
                 mock.patch.object(review, "prepare"), mock.patch.object(review, "exchange", return_value=""), \
                 mock.patch.object(review, "claude", claude), \
-                mock.patch.object(fakes.github, "month_records", lambda *a: [(when, {"budget": prior})], create=True):
+                mock.patch.object(fakes.github, "month_records", month_records, create=True):
             out, log = fakes.run(review.main)
             self.assertNotIn("SUBSCRIPTION_TOKEN", os.environ, "the token leaves the process env before any call")
         return calls, out, log
@@ -273,7 +296,56 @@ class MidRun(unittest.TestCase):
         self.assertEqual(calls, ["api", "subscription"])
         self.assertFalse(out["budget_refused"])
         self.assertIn("subscription token rejected", out["error"])
-        self.assertIsNone(out["billing"])
+
+    def test_a_failed_subscription_call_still_counts_against_its_cap(self):
+        failed = json.dumps({"is_error": True, "subtype": "error_max_budget_usd", "result": "", "total_cost_usd": 0.2})
+        for reply in (failed, json.dumps({"is_error": False, "result": "prose, no block", "total_cost_usd": 0.2})):
+            _, out, _ = self.run_main([reply], pace={**CAPS, "route": "subscription"})
+            self.assertTrue(out["error"])
+            self.assertEqual((out["billing"], out["subscription_cost_usd"]), ("subscription", 0.2))
+
+    def test_a_refused_api_call_is_not_billed_to_the_api(self):
+        _, out, _ = self.run_main([SPEND_LIMIT, OK_BUGS])
+        self.assertEqual(out["billing"], "subscription")
+
+    def test_an_api_refusal_with_401_or_oauth_in_its_stderr_still_retries(self):
+        for stderr in ("upstream said 401 earlier", "OAuth token refresh skipped"):
+            calls, out, _ = self.run_main([(SPEND_LIMIT, stderr), OK_BUGS])
+            self.assertEqual((calls, out["error"]), (["api", "subscription"], None), stderr)
+
+    def test_a_spent_subscription_plan_is_a_budget_skip_not_an_error(self):
+        for reply in PLAN_LIMITS:
+            _, out, _ = self.run_main([reply], pace={**CAPS, "route": "subscription"})
+            self.assertEqual((out["budget_refused"], out["error"]), (True, None), reply)
+            self.assertIn("subscription plan limit", out["limit"])
+        _, out, _ = self.run_main([SPEND_LIMIT, PLAN_LIMITS[0]])
+        self.assertEqual((out["budget_refused"], out["error"]), (True, None))
+        self.assertIn("API spend limit refused the call", out["limit"])
+        self.assertIn("subscription plan limit", out["limit"])
+
+    def test_the_spec_call_stays_off_the_api_after_the_bugs_call_was_refused(self):
+        calls, out, _ = self.run_main([SPEND_LIMIT, OK_BUGS, OK_SPEC], prior=totals(0, 0.0, 0), spec=True)
+        self.assertEqual(calls, ["api", "subscription", "subscription"])
+        self.assertEqual((out["error"], out["billing"], out["refused"]), (None, "subscription", "api spend limit"))
+
+    def test_the_refusal_survives_a_failed_budget_reread(self):
+        _, out, _ = self.run_main([SPEND_LIMIT], reads=[RuntimeError("503")])
+        self.assertTrue(out["budget_refused"])
+        self.assertIn("API spend limit refused the call", out["limit"])
+        self.assertIn("budget read failed", out["limit"])
+        self.assertEqual(out["refused"], "api spend limit")
+        _, out, _ = self.run_main([CREDIT, OK_BUGS])
+        self.assertEqual(out["refused"], "api credit")
+
+    def test_the_prompts_name_where_the_base_is_on_every_route(self):
+        for pace in ({**CAPS, "route": "api"}, {**CAPS, "route": "subscription"}):
+            self.run_main([OK_BUGS, OK_SPEC], pace=pace, prior=totals(0 if pace["route"] == "api" else 5, 0.0, 0),
+                          spec=True)
+            base = str(Path.cwd())
+            for prompt, args in zip(self.prompts, self.args):
+                self.assertNotIn("working directory", prompt)
+                self.assertIn(f"checked out at {base}", prompt)
+                self.assertIn(f"Read(/{base}/**)", args[args.index("--allowedTools") + 1])
 
     def test_spec_call_rechecks_the_subscription_cap_on_that_route(self):
         calls, out, _ = self.run_main([OK_BUGS], pace={**CAPS, "route": "subscription"}, prior=totals(5, 1.0, 30),
@@ -298,7 +370,7 @@ class Argv(unittest.TestCase):
                                    oauth=TOKEN)
             runner.cwd.mkdir()
             fakes.run(review.claude, ["--model", "m"], "PROMPT", billing, runner)
-            seen["cwd_dir"], seen["cwd_entries"] = runner.cwd, list(runner.cwd.iterdir())
+            seen["cwd_dir"] = runner.cwd
         return seen
 
     def test_subscription_argv_and_env(self):
@@ -310,10 +382,10 @@ class Argv(unittest.TestCase):
         self.assertFalse(any("apiKeyHelper" in a for a in cmd))
         self.assertFalse(any(TOKEN in a for a in cmd), "the token never reaches argv")
         self.assertEqual(env["CLAUDE_CODE_OAUTH_TOKEN"], TOKEN)
+        self.assertEqual(env["ENABLE_TOOL_SEARCH"], "false")
         for gone in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "GH_TOKEN", "ACTIONS_ID_TOKEN_REQUEST_TOKEN"):
             self.assertNotIn(gone, env)
-        self.assertEqual(Path(seen["cwd"]), seen["cwd_dir"])
-        self.assertEqual(seen["cwd_entries"], [])
+        self.assertEqual(Path(seen["cwd"]).parent, seen["cwd_dir"], "each call gets its own dir under the cwd root")
         self.assertEqual(env["CLAUDE_CONFIG_DIR"], str(Path(env["HOME"]) / ".claude"))
 
     def test_api_argv_keeps_bare_and_never_sees_the_token(self):
@@ -322,6 +394,21 @@ class Argv(unittest.TestCase):
         self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", seen["env"])
         self.assertNotIn("ANTHROPIC_API_KEY", seen["env"])
         self.assertFalse(any(TOKEN in a for a in seen["cmd"]))
+
+    def test_two_subscription_calls_in_a_row_each_get_an_empty_cwd(self):
+        cwds = []
+
+        def run(cmd, cwd=None, **kw):
+            self.assertEqual(list(Path(cwd).iterdir()), [])
+            cwds.append(cwd)
+            (Path(cwd) / ".claude").mkdir()  # whatever a call leaves behind
+            return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(review.subprocess, "run", run):
+            runner = review.Runner(token_file=Path(d) / "t", home=Path(d) / "home", cwd=Path(d) / "cwd", oauth=TOKEN)
+            runner.cwd.mkdir()
+            for _ in range(2):
+                fakes.run(review.claude, ["--model", "m"], "PROMPT", "subscription", runner)
+        self.assertEqual(len(set(cwds)), 2)
 
     def test_a_claude_md_above_the_empty_cwd_refuses_the_subscription_call(self):
         with tempfile.TemporaryDirectory() as d:

@@ -1,7 +1,8 @@
 """The subscription call runs without --bare (which reads no OAuth token), so it must rebuild --bare's isolation.
 
-This runs review.main() with the pinned CLI against a fake Messages API on 127.0.0.1, once per billing route. The fake
-model asks to Read a head file, the secret token and /proc/self/environ, then returns no findings. The test checks
+This runs review.main() with the pinned CLI against a fake Messages API on 127.0.0.1, once per billing route, with both
+the Bugs and the Spec call. The fake model asks to Read a head file, a base file, the secret token and the process
+environ, then answers: no findings, and a Spec table through the StructuredOutput tool. The test checks
 what reached the model: nothing from the head's CLAUDE.md, AGENTS.md, skills, hooks or MCP config, no token, and the
 same system prompt and tools on both routes. Skipped unless CLAUDE_ISOLATION_CLI names a CLI binary (test.yml sets it).
 """
@@ -56,11 +57,16 @@ class FakeApi:
                 body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
                 api.requests.append({"path": self.path, "headers": dict(self.headers), "body": body})
                 # Any tool result ends the turn: --max-budget-usd appends a system message after it.
-                answered = any(isinstance(m.get("content"), list) and any(c.get("type") == "tool_result" for c in m["content"])
-                               for m in body.get("messages") or [])
-                if any(t.get("name") == "Read" for t in body.get("tools") or []) and not answered:
+                blocks = [c for m in body.get("messages") or [] if isinstance(m.get("content"), list) for c in m["content"]]
+                answered = any(c.get("type") == "tool_result" for c in blocks)
+                structured = any(c.get("type") == "tool_use" and c.get("name") == "StructuredOutput" for c in blocks)
+                tools = {t.get("name") for t in body.get("tools") or []}
+                if "Read" in tools and not answered:
                     data = sse([{"type": "tool_use", "id": f"toolu_{i}", "name": "Read", "input": {"file_path": p}}
                                 for i, p in enumerate(reads)], "tool_use")
+                elif "StructuredOutput" in tools and not structured:
+                    table = {"answer": "Yes", "items": [{"n": 1, "item": "a", "status": "Yes", "evidence": "x.py:1"}]}
+                    data = sse([{"type": "tool_use", "id": "toolu_s", "name": "StructuredOutput", "input": table}], "tool_use")
                 else:
                     data = sse([{"type": "text", "text": "```json\n[]\n```"}], "end_turn")
                 self.send_response(200)
@@ -94,6 +100,7 @@ def plant(head: Path, marks: Path) -> None:
 class Isolation(unittest.TestCase):
     def run_route(self, billing: str) -> tuple[dict, list[dict], Path]:
         tmp = Path(tempfile.mkdtemp()).resolve()  # the engine resolves the standards path; macOS /tmp is a link
+        self.addCleanup(os.chdir, os.getcwd())
         self.addCleanup(subprocess.run, ["rm", "-rf", str(tmp)])
         review_dir, marks = tmp / "review", tmp / "marks"
         marks.mkdir()
@@ -103,6 +110,7 @@ class Isolation(unittest.TestCase):
         (review_dir / "secret").mkdir(parents=True)
         (tmp / "base").mkdir()
         (tmp / "base/CODING_STANDARDS.md").write_text("R1 STANDARDS_CONTENT\n")
+        os.chdir(tmp / "base")  # the review step runs in the base checkout
         api = FakeApi([str(head / "sub/x.py"), str(tmp / "base/CODING_STANDARDS.md"), str(review_dir / "secret/token"),
                        "/proc/self/environ"])
         self.addCleanup(api.server.shutdown)
@@ -116,12 +124,16 @@ class Isolation(unittest.TestCase):
             token_file.write_text(API)
             return ""
         env = {"RUNNER_TEMP": str(tmp), "HEAD_DIR": str(head), "BASE_SHA": "b", "ANTHROPIC": "{}",
-               "MODEL": "claude-opus-5-5", "EFFORT": "medium", "SPEC_TEXT": '""', "STANDARDS": str(tmp / "base/CODING_STANDARDS.md"),
-               "PACE": json.dumps({"route": billing}), "SUBSCRIPTION_TOKEN": OAUTH, "ANTHROPIC_API_KEY": API}
+               "MODEL": "claude-opus-5-5", "EFFORT": "medium", "SPEC_TEXT": json.dumps("## Done when\n- a\n"), "STANDARDS": str(tmp / "base/CODING_STANDARDS.md"),
+               "PACE": json.dumps({"route": billing, "reviews_per_day": 5 if billing == "api" else 0, "budget_month_usd": 100,
+                                   "subscription_fallback": True, "subscription_per_day": 5}),
+               "GITHUB_REPOSITORY": "o/r", "SUBSCRIPTION_TOKEN": OAUTH, "ANTHROPIC_API_KEY": API}
         with mock.patch.dict(os.environ, env), mock.patch.object(review, "prepare"), \
-                mock.patch.object(review, "exchange", exchange), mock.patch.object(review.subprocess, "run", run):
+                mock.patch.object(review, "exchange", exchange), mock.patch.object(review.subprocess, "run", run), \
+                mock.patch.object(review.github, "month_records", lambda *a: []):
             out, log = fakes.run(review.main)
         self.assertEqual((out["error"], out["billing"], out["findings"]), (None, billing, []), log[-2000:])
+        self.assertEqual(out["spec"]["answer"], "Yes", "the second call ran too")
         return out, api.requests, marks
 
     def check_route(self, billing: str) -> list[dict]:
@@ -130,10 +142,12 @@ class Isolation(unittest.TestCase):
         sent = json.dumps([r["body"] for r in requests])
         self.assertEqual([c for c in CANARIES if c in sent], [], "nothing from the head's config or any token reaches the model")
         self.assertIn("HEAD_FILE_CONTENT", sent, "the fake model's Read of a head file went through")
-        self.assertIn("STANDARDS_CONTENT", sent, "the base's standards file is readable")
+        self.assertIn("STANDARDS_CONTENT", sent, "the base checkout is readable by its own path")
         self.assertNotIn("HOME=", sent, "/proc/self/environ was not read")
         self.assertEqual(list(marks.iterdir()), [], "no head hook ran and no head MCP server started")
-        self.assertEqual({t["name"] for r in requests for t in r["body"].get("tools") or []}, {"Read"})
+        # The Spec call's --json-schema adds StructuredOutput; the CLI adds a placeholder for its deferred tools.
+        self.assertLessEqual({t["name"] for r in requests for t in r["body"].get("tools") or []},
+                             {"Read", "StructuredOutput", "DeferredToolPlaceholder"})
         return requests
 
     def test_the_subscription_call_sends_what_the_bare_call_sends(self):
@@ -148,6 +162,8 @@ class Isolation(unittest.TestCase):
             text = "\n".join(s.get("text", "") for s in requests[0]["body"].get("system") or [])
             return re.sub(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", "<uuid>", text)
         self.assertEqual(system(sub), system(api))
+        tools = lambda requests: [sorted(t["name"] for t in r["body"].get("tools") or []) for r in requests]
+        self.assertEqual(sorted(map(tuple, tools(sub))), sorted(map(tuple, tools(api))))
 
 
 if __name__ == "__main__":
