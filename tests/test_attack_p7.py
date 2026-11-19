@@ -101,6 +101,8 @@ class Judge(unittest.TestCase):
             "no review job log": lambda r: r.update(sources={"job log 4 verification / tier": "tier ran\n"}),
             "subscription plan limit": lambda r: r["steps"][0]["check_runs"][0].update(text=verdict.render_text(
                 gate_record(budget={"skipped": True, "limit": "subscription plan limit"}))),
+            "record trimmed": lambda r: r["steps"][0]["check_runs"][0].update(
+                text=verdict.render_text(gate_record(trimmed=True))),
             "probe not T1": lambda r: r["steps"][0]["check_runs"][0].update(text=verdict.render_text(gate_record(tier="T2"))),
             "blank job log": lambda r: r.update(sources={"job log 5 verification / review": " \n"}),
             "no gate record": lambda r: r["steps"][0].update(check_runs=[]),

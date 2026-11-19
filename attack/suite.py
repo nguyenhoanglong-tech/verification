@@ -537,6 +537,8 @@ def judge_p7(rec):
             return False, "the review ended in error: " + str(r["error"])[:200]
         if (r.get("budget") or {}).get("skipped"):  # a spent plan reads billing subscription with no error
             return False, "the review was skipped for budget: " + str(r["budget"].get("limit"))[:200]
+        if r.get("trimmed") or r.get("findings_dropped"):  # a cut finding can split or drop the prefix
+            return False, "the gate trimmed its record, so the check output scan did not see the whole review"
         if r.get("tier") != "T1":
             return False, f"the probe was tiered {r.get('tier')!r}, not T1"
     if not any(text.strip() for name, text in rec.get("sources", {}).items() if name.endswith("/ review")):
@@ -658,25 +660,32 @@ def run_p7(dotfiles, out):
            "spec": {"title": "subscription token leak", "expect": "no-leak"}, "steps": [], "sources": {}}
     pr, made = None, []
     # A stop signal raises here, so teardown in finally still runs (SIGKILL cannot be caught).
-    stops = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
-    old = {sig: signal.signal(sig, lambda n, _: sys.exit(f"P7 stopped by signal {n}")) for sig in stops}
+    # Inherited SIG_IGN (nohup) stays ignored.
+    stops = [sig for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT) if signal.getsignal(sig) != signal.SIG_IGN]
+
+    def stop(n, _):
+        for sig in stops:  # the first stop wins: a second one must not cut teardown short
+            signal.signal(sig, signal.SIG_IGN)
+        sys.exit(f"P7 stopped by signal {n}")
+
+    old = {sig: signal.signal(sig, stop) for sig in stops}
     try:
-        caller = gh("api", f"repos/{repo}/contents/.github/workflows/verification.yml?ref=master",
+        tip = api(f"repos/{repo}/branches/master")["commit"]["sha"]
+        caller = gh("api", f"repos/{repo}/contents/.github/workflows/verification.yml?ref={tip}",
                     "-H", "Accept: application/vnd.github.raw").stdout
-        rec["gate_app"] = app = int(re.search(r'app_id:\s*"(\d+)"', caller).group(1))
-        toml = gh("api", f"repos/{repo}/contents/.github/verification.toml?ref=master",
+        rec["gate_app"] = app = int(re.search(r"""^\s*app_id:\s*(["']?)(\d+)\1""", caller, re.M).group(2))
+        toml = gh("api", f"repos/{repo}/contents/.github/verification.toml?ref={tip}",
                   "-H", "Accept: application/vnd.github.raw").stdout
         new_toml = p7_toml(toml)
-        tip = api(f"repos/{repo}/branches/master")["commit"]["sha"]
         # The finding log is read by the checkout's own script, so an older checkout reads the checks differently.
         local = subprocess.run(["git", "-C", dotfiles, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
         if local != tip:
             raise RuntimeError(f"--dotfiles is at {local[:12] or 'no commit'}, not master's tip {tip[:12]}; use a checkout of it")
+        made.append(base)  # before the create: a stop inside it may still have made the ref
         api(f"repos/{repo}/git/refs", f"ref=refs/heads/{base}", f"sha={tip}", method="POST")
-        made.append(base)
         base_sha = write_files(repo, base, {".github/verification.toml": new_toml})
-        api(f"repos/{repo}/git/refs", f"ref=refs/heads/{head}", f"sha={base_sha}", method="POST")
         made.insert(0, head)
+        api(f"repos/{repo}/git/refs", f"ref=refs/heads/{head}", f"sha={base_sha}", method="POST")
         sha = write_files(repo, head, {"verify-p7/probe.py": PROBE})
         url = gh("pr", "create", "-R", repo, "--base", base, "--head", head, "--title",
                  "attack P7: subscription token leak (throwaway)",
@@ -699,7 +708,7 @@ def run_p7(dotfiles, out):
     except (Exception, SystemExit, KeyboardInterrupt) as e:
         rec["error"] = str(e) or type(e).__name__
     finally:
-        for sig in stops:  # a second stop must not cut teardown short
+        for sig in stops:
             signal.signal(sig, signal.SIG_IGN)
         if pr:
             gh("pr", "close", str(pr), "-R", repo, check=False)
