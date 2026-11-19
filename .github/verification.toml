@@ -22,3 +22,8 @@ run = "cd verify-attack && python3 test_calc.py"
 
 [tiers]
 risk = [".github/**", "engine/**"]
+
+# Temporary, for the #3308 G4 proof: a T1 review on this base ERRORs on an unknown model, and the next PR
+# removes this block. This toml change is T2, so its own review uses the default t2_model.
+[review]
+t1_model = "claude-selftest-no-such-model"
