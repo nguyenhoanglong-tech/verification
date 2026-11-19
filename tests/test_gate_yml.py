@@ -91,6 +91,16 @@ class GateApp(unittest.TestCase):
         self.assertIn("permission-checks: write", self.gate)
         self.assertIn("GATE_TOKEN: ${{ steps.app.outputs.token }}", self.gate)
 
+    def test_each_secret_is_read_only_by_jobs_in_its_own_environment(self):
+        """dotfiles#3408: the subscription token sits in its own environment, so the review job, which reads PR
+        content, can reach no gate App key, and the gate job no token."""
+        envs = {"tier": "verification-subscription", "review": "verification-subscription", "gate": "verification-gate"}
+        for name in ("start", "tier", "head_archive", "checks", "review", "gate"):
+            text = job(self.gate_yml, name)
+            self.assertEqual(re.findall(r"\n    environment: ([a-z-]+)", text), [envs[name]] if name in envs else [], name)
+            self.assertEqual("secrets.claude_code_oauth_token" in text, name in ("tier", "review"), name)
+            self.assertEqual("secrets.VERIFICATION_APP_KEY" in text, name == "gate", name)
+
     def test_no_check_run_is_written_outside_the_gate_job(self):
         for name in ("start", "tier", "head_archive", "checks", "review"):
             self.assertNotIn("check-runs", job(self.gate_yml, name), name)
