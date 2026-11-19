@@ -400,7 +400,7 @@ def attack(fake, name, hooks=()):
     with mock.patch.object(suite, "gh", fake.gh), mock.patch.object(suite, "time", FakeClock()):
         rec = suite.run_attack("o/r", "verify/attack-base", name, suite.ATTACKS[name], "1119", 5828645)
     held, why = suite.judge(rec)
-    return rec, ("HELD" if held else "ERROR" if why.startswith("error:") or rec.get("error") else "FAILED")
+    return rec, ("HELD" if held else "ERROR" if why.startswith("error:") else "FAILED")
 
 
 ON_WAIT = lambda a: a[0] == "api" and "check-runs?per_page=100" in a[1]  # noqa: E731  wait_verification's read
@@ -417,6 +417,13 @@ class C2Attacks(unittest.TestCase):
     def test_c2_a_gate_refusal_holds(self):
         _, result = attack(self.engine(), "P2")
         self.assertEqual(result, "HELD")
+
+    def test_a_merged_breach_is_failed_even_when_the_gate_never_settled(self):
+        fake = FakeGitHub()  # no gate check ever posts, so the wait records an error
+        fake.merge_answer = (0, "merged")
+        rec, result = attack(fake, "P2")
+        self.assertTrue(rec.get("error"))
+        self.assertEqual(result, "FAILED")
 
     def test_c2_a_moved_head_is_an_error(self):
         fake = self.engine()

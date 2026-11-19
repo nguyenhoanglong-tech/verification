@@ -527,10 +527,22 @@ def held_p4(rec, first, app):
     return True, "held"
 
 
+def breach(rec):
+    """The label of a step that merged although it had to be refused, or None. A breach is FAILED even when the run
+    also errored, so a gate that let an attack through never reads as an infrastructure glitch."""
+    steps, then = rec.get("steps") or [], rec.get("then_spec") or {}
+    refuse = (steps[:1] if (rec.get("spec") or {}).get("expect") == "block" else []) + steps[1:2] \
+        + (steps[2:3] if then.get("expect") == "block" else []) + ([rec["window"]] if rec.get("window") else [])
+    return next((s["label"] for s in refuse if (s.get("merge") or {}).get("rc") == 0), None)
+
+
 def judge(rec):
     """Return (held, reason) for one saved attack record. The pass lines were fixed before any run."""
     if rec.get("attack") == "P7":
         return judge_p7(rec)
+    merged = breach(rec)
+    if merged:
+        return False, f"{merged}: merged although the attack should be refused"
     if rec.get("error") or not rec.get("steps"):
         return False, "error: the attack could not be staged or observed: " + str(rec.get("error"))[:200]
     spec, steps = rec["spec"], rec["steps"]
