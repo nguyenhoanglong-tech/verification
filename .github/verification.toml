@@ -22,3 +22,7 @@ run = "cd verify-attack && python3 test_calc.py"
 
 [tiers]
 risk = [".github/**", "engine/**"]
+
+# DELIBERATE and temporary: an unknown model so the next T1 self-test review ERRORs (#3308 G4 proof). A follow-up PR removes this block.
+[review]
+t1_model = "claude-not-a-model-3308"
