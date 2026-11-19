@@ -291,10 +291,15 @@ def main() -> dict:
     runner = Runner(token_file=secret / "token", home=home, cwd=cwd, oauth=oauth)
     pace = json.loads(e.get("PACE") or "{}")
     billing, exchanged, used, refused = pace.get("route") or "api", False, [], ""
-    base = Path.cwd()
+    base = Path.cwd().resolve()
     spec_text = json.loads(e.get("SPEC_TEXT") or '""')
     items = done_items(spec_text)
-    standards = str(Path(e.get("STANDARDS", "CODING_STANDARDS.md")).resolve())
+    standards = (base / e.get("STANDARDS", "CODING_STANDARDS.md")).resolve()
+    # The path comes from the base toml; every call is allowed to Read it, so it must stay inside the base checkout.
+    if not standards.is_relative_to(base):
+        out["error"] = f"the standards file {standards} is outside the base checkout {base}"
+        return out
+    standards = str(standards)
     common = ["--model", e["MODEL"], "--effort", e["EFFORT"], "--max-budget-usd", e.get("BUDGET_USD", "3"),
               # The base and the standards file are named by their own paths: the subscription call's cwd is empty.
               "--tools", "Read", "--allowedTools", f"Read(/{data}/**),Read(/{base}/**),Read(/{standards})",

@@ -244,6 +244,22 @@ def fit(record: dict) -> tuple[dict, str]:
     return record, text
 
 
+def review_problem(review) -> str:
+    """Why the review job's result cannot be judged, or "" when it can. A result that is not an object, has no findings
+    list, or holds a security entry of the wrong shape is never read as "no findings"."""
+    def rows(items) -> bool:
+        return isinstance(items, list) and all(isinstance(x, dict) and x.get("severity") in ("P0", "P1") for x in items)
+    if not isinstance(review, dict) or not review:
+        return "empty or not an object"
+    if not rows(review.get("findings")):
+        return "has no findings list"
+    security = review.get("security")
+    if security is not None and not (isinstance(security, dict) and isinstance(security.get("ran"), bool)
+                                     and rows(security.get("findings"))):
+        return "has a malformed security entry"
+    return ""
+
+
 def check_names(checks: str) -> list[str] | None:
     """The machine check names the tier job read from the base config (its `checks` output); None when unreadable."""
     try:
@@ -306,8 +322,11 @@ def from_needs(needs: dict, head_sha: str) -> tuple[dict, list[str], list[str]]:
     if review_out:
         try:
             review = json.loads(review_out.get("result") or "")
+            problem = review_problem(review)
         except ValueError:
-            errors.append("review job output unreadable")
+            problem = "unreadable"
+        if problem:
+            errors.append(f"review job output {problem}")
             review = None
         # The org's spend limit refused a call, or the pace was reached before the Spec call: that is the budget,
         # not an error (coordinator, 2026-11-18).
@@ -325,7 +344,7 @@ def from_needs(needs: dict, head_sha: str) -> tuple[dict, list[str], list[str]]:
     mode = out.get("mode") if out.get("mode") in ("shadow", "enforce") else None
     inputs = dict(tiers=out.get("tiers", ""), base_sha=out.get("base_sha", ""), mode=mode,
                   switch_spec=out.get("switch_spec") == "true", machine=machine, review=review, budget=budget,
-                  security_owed=tier_ok and out.get("security") == "true")
+                  security_owed=out.get("security") == "true")
     return inputs, ran, errors
 
 
@@ -401,12 +420,15 @@ def post() -> int:
         print(reason)
     start = needs.get("start", {}).get("outputs") or {}
     mode = (record or {}).get("mode") or fallback_mode(base_config(github, repo, start.get("base_sha") or base_ref), base_ref)
-    failed = decide(head_sha=head_sha, base_sha=start.get("base_sha", ""), tiers=(record or {}).get("tier", ""), mode=mode,
-                    switch_spec=False, machine=[], review={"cost_usd": (record or {}).get("cost_usd", 0)},
-                    budget=(record or {}).get("budget", {}), errors=[reason], prior=[])
+    judged = record or {}
+    # What the judge already found stays: the fallback is never weaker than the record it could not post.
+    failed = decide(head_sha=head_sha, base_sha=start.get("base_sha", ""), tiers=judged.get("tier", ""), mode=mode,
+                    switch_spec=False, machine=[], budget=judged.get("budget", {}), errors=[reason], prior=[],
+                    review={k: judged.get(k) for k in ("cost_usd", "findings", "security") if judged.get(k) is not None},
+                    security_owed=((needs.get("tier") or {}).get("outputs") or {}).get("security") == "true")
     failed.update(own_run())
     body = {"status": "completed", "conclusion": conclusion(failed),
-            "output": {"title": failed["title"], "text": render_text(failed), "summary": f"verdict: ERROR\nerror: {reason}\n\nrun: {run_url}"}}
+            "output": {"title": failed["title"], "text": render_text(failed), "summary": f"verdict: {failed['verdict']}\nerror: {reason}\n\nrun: {run_url}"}}
     write_check(github, repo, head_sha, body)
     return 1 if body["conclusion"] == "failure" else 0
 

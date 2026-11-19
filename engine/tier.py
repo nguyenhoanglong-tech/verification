@@ -249,15 +249,19 @@ def tier_outputs(repo: str, base_sha: str, head_sha: str, base_ref: str, config:
     budget = {k: s[k] for k in ("reviews_per_day", "budget_month_usd", "subscription_fallback", "subscription_per_day")}
     budget.update(skipped=False, route=None)
     review = code and s["live_checks"] == "owed"
+    read_error = ""
     if code and not review:
         skip = "machine only"
     if review:
         now = datetime.now(timezone.utc)
         try:
             totals = verdict.budget_base(github.month_records(repo, os.environ.get("GITHUB_WORKFLOW_REF", ""), now), now)
-        except Exception as x:  # fail closed: no paid call, on either billing, on a budget nobody could read
-            print(f"::warning::budget read failed, so the paid review is skipped: {x}")
-            budget.update(skipped=True, read_error=f"budget read failed: {x}"[:300])
+        except Exception as x:
+            # Fail closed: no paid call on either billing. A budget nobody could read is no refusal, so the verdict is
+            # ERROR, never a budget skip.
+            read_error = f"budget read failed: {x}"[:300]
+            print(f"::error::{read_error}; no paid review runs")
+            budget.update(read_error=read_error)
         else:
             # The caller's token reaches this job only as this boolean, never as its value.
             token = os.environ.get("SUBSCRIPTION_TOKEN_SET") == "true"
@@ -267,11 +271,13 @@ def tier_outputs(repo: str, base_sha: str, head_sha: str, base_ref: str, config:
                   f"${totals['month_usd']:.2f} this month of ${s['budget_month_usd']:.2f}, "
                   f"{totals['subscription_today']} subscription reviews today of {s['subscription_per_day']}; "
                   f"billing {billing or 'none'}" + (f" ({limit})" if limit else ""))
-        if budget["skipped"]:
+        if read_error:
+            review, skip = False, "budget unreadable"
+        elif budget["skipped"]:
             review, skip = False, verdict.BUDGET_SKIPPED
         else:
             spec = switch(*closing_issues(repo, int(os.environ["PR_NUMBER"])))
-    return {
+    outputs = {
         "base_sha": base_sha,
         "mode": s["mode"],
         "tiers": " ".join(result.tiers),
@@ -292,6 +298,9 @@ def tier_outputs(repo: str, base_sha: str, head_sha: str, base_ref: str, config:
         "has_checks": "true" if config.get("check") else "false",
         "anthropic": json.dumps(config.get("anthropic", {})),
     }
+    if read_error:
+        outputs["error"] = read_error
+    return outputs
 
 
 def github_main() -> None:

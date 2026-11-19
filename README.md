@@ -39,7 +39,8 @@ toml and this month's records:
 | --- | --- | --- |
 | `api` | API-paid reviews today < `reviews_per_day` and API spend this month < `budget_month_usd` | `claude --bare -p`, the federation token through `apiKeyHelper`, cwd = the base checkout |
 | `subscription` | an API limit is reached, `[subscription] fallback = true`, the caller passed `claude_code_oauth_token`, and subscription reviews today < `[subscription] reviews_per_day` | `claude -p --safe-mode --strict-mcp-config`, the token in that process's env only, cwd = a fresh empty dir per call, with no `CLAUDE.md` or `.claude` above it |
-| none | neither may run, the budget could not be read, or the plan's own usage limit is reached | no paid call: `review skipped: budget (<the limits hit>)` |
+| none | neither may run, or the plan's own usage limit is reached | no paid call: `review skipped: budget (<the limits hit>)` |
+| none | the tier job could not read the budget | no paid call, and the verdict is ERROR: a read failure is no refusal |
 
 `--bare` reads no OAuth token, so the subscription call rebuilds its isolation; `tests/test_isolation.py` runs
 the pinned CLI on both routes against a fake API and checks that the head's config, the secret dir and the

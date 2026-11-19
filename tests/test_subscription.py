@@ -284,14 +284,18 @@ class MidRun(unittest.TestCase):
     def test_the_standards_file_is_readable_on_every_route(self):
         """The subscription call's cwd is empty, so the base's standards file is allowed by its own path."""
         seen = []
+        self.addCleanup(os.chdir, os.getcwd())
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {
                 "RUNNER_TEMP": tmp, "HEAD_DIR": tmp, "BASE_SHA": "b", "ANTHROPIC": "{}", "MODEL": "m", "EFFORT": "medium",
-                "STANDARDS": "/base/CODING_STANDARDS.md", "PACE": json.dumps({**CAPS, "route": "subscription"}),
+                "STANDARDS": "docs/CODING_STANDARDS.md", "PACE": json.dumps({**CAPS, "route": "subscription"}),
                 "SUBSCRIPTION_TOKEN": TOKEN}), mock.patch.object(review, "prepare"), \
                 mock.patch.object(review, "claude", lambda args, *a: seen.append(args) or (0, OK_BUGS, "")):
+            base = Path(tmp).resolve() / "base"
+            base.mkdir()
+            os.chdir(base)  # the review step runs in the base checkout
             fakes.run(review.main)
         allowed = seen[0][seen[0].index("--allowedTools") + 1]
-        self.assertIn("Read(//base/CODING_STANDARDS.md)", allowed)
+        self.assertIn(f"Read(/{base}/docs/CODING_STANDARDS.md)", allowed)
 
     def test_a_rejected_token_is_an_error_not_a_budget_skip(self):
         calls, out, _ = self.run_main([SPEND_LIMIT, REJECTED])
