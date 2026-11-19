@@ -26,7 +26,5 @@ jobs:
       engine_ref: dev
       runner: ${{ vars.VERIFICATION_RUNNER || 'ubuntu-24.04' }}
       app_id: "5828645"
-      # The last `verification` check the gate posted here as GitHub Actions, at 2026-11-19T02:57:10Z.
-      legacy_cutover: "135303833179"
     secrets:
       VERIFICATION_APP_KEY: ${{ secrets.VERIFICATION_APP_KEY }}

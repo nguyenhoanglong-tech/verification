@@ -74,24 +74,21 @@ class Sticky(unittest.TestCase):
         out.append({"id": 100, "status": "in_progress", "conclusion": None, "output": {"text": None}})
         return out
 
-    def test_only_checks_the_gate_posted_count(self):
-        """#3383: every workflow posts as GitHub Actions, a PR's own included. A FAIL from the gate App or from GitHub
-        Actions at or below the cut-over sticks; a forged one above the cut-over, or from another app, does not."""
+    def test_only_checks_the_gate_app_posted_count(self):
+        """#3383: every workflow posts as GitHub Actions, a PR's own included, and can rewrite any GitHub Actions check.
+        Only a FAIL from the gate App sticks."""
         failed, _ = run(mode="enforce", machine=[("unit", "fail")])
-        cases = {(fakes.GATE_APP, 900): ["FAIL"], (fakes.github.ACTIONS_APP, fakes.CUTOVER): ["FAIL"],
-                 (fakes.github.ACTIONS_APP, fakes.CUTOVER + 1): [], (1210556, 900): []}
+        cases = {(fakes.GATE_APP, 900): ["FAIL"], (fakes.ACTIONS_APP, 1): [], (1210556, 900): []}
         for (app, id), want in cases.items():
             fake = fakes.GitHub(checks={"h": [fakes.check(id, failed, app=app)]})
             with fakes.installed(fake):
                 self.assertEqual(prior_verdicts(fakes.github.verification_runs("o/r", "h")), want, (app, id))
 
-    def test_a_missing_gate_app_trusts_no_app_and_a_bad_cutover_raises(self):
+    def test_a_missing_gate_app_trusts_no_app(self):
         failed, _ = run(mode="enforce", machine=[("unit", "fail")])
         fake = fakes.GitHub(checks={"h": [fakes.check(900, failed)]})
-        with fakes.installed(fake, GATE_APP_ID="", LEGACY_CUTOVER="0"):
+        with fakes.installed(fake, GATE_APP_ID=""):
             self.assertEqual(fakes.github.verification_runs("o/r", "h"), [])
-        with fakes.installed(fake, LEGACY_CUTOVER="2026-11-19"), self.assertRaises(ValueError):
-            fakes.github.verification_runs("o/r", "h")
 
     def test_fail_stays_fail_after_a_passing_rerun(self):
         failed, _ = run(mode="enforce", machine=[("unit", "fail")])
@@ -187,14 +184,13 @@ class MonthRecords(unittest.TestCase):
             got = fakes.github.month_records("o/r", fakes.ENV["GITHUB_WORKFLOW_REF"], datetime(2026, 11, 1, 1, 0, tzinfo=timezone.utc))
         self.assertEqual(budget_base(got, datetime(2026, 11, 1, 1, 0, tzinfo=timezone.utc)), (1, 2.0))
 
-    def test_a_forged_actions_record_above_the_cutover_cannot_reset_the_budget(self):
-        """#3383 budget forge: a PR's own workflow posts a newer `verification` record saying nothing was spent."""
+    def test_a_forged_actions_record_cannot_reset_the_budget(self):
+        """#3383 budget forge: a PR's own workflow posts, or rewrites, a newer `verification` record saying nothing
+        was spent."""
         fake = fakes.GitHub(workflow_runs=[{"head_sha": "pr", "created_at": "2026-11-18T12:00:00Z"},
                                            {"head_sha": "old", "created_at": "2026-11-18T09:00:00Z"}],
-                            checks={"pr": [fakes.check(fakes.CUTOVER + 1, self.paid(0, 0.0), "2026-11-18T14:00:00Z",
-                                                       app=fakes.github.ACTIONS_APP)],
-                                    "old": [fakes.check(fakes.CUTOVER, self.paid(4, 44.0), "2026-11-18T09:30:00Z",
-                                                        app=fakes.github.ACTIONS_APP)]})
+                            checks={"pr": [fakes.check(2, self.paid(0, 0.0), "2026-11-18T14:00:00Z", app=fakes.ACTIONS_APP)],
+                                    "old": [fakes.check(1, self.paid(4, 44.0), "2026-11-18T09:30:00Z")]})
         with fakes.installed(fake):
             got = fakes.github.month_records("o/r", fakes.ENV["GITHUB_WORKFLOW_REF"], Budget.NOW)
         self.assertEqual(budget_base(got, Budget.NOW), (4, 44.0))

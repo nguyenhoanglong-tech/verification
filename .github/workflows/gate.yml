@@ -23,14 +23,6 @@ on:
         type: string
         required: false
         default: ""
-      legacy_cutover:
-        description: >-
-          The highest check-run id of a `verification` check the gate posted as GitHub Actions before the gate App.
-          Those records still count for the sticky rule and the budget; any later GitHub Actions one is ignored.
-          A check-run id, never a time: a poster sets its own started_at and completed_at.
-        type: string
-        required: false
-        default: "0"
     secrets:
       VERIFICATION_APP_KEY:
         description: The gate App's private key, from the caller's `verification-gate` environment, passed by name.
@@ -41,7 +33,6 @@ env:
   BASE_REF: ${{ github.event.pull_request.base.ref }}
   PR_NUMBER: ${{ github.event.pull_request.number }}
   GATE_APP_ID: ${{ inputs.app_id }}
-  LEGACY_CUTOVER: ${{ inputs.legacy_cutover }}
 jobs:
   start:
     runs-on: ${{ inputs.runner }}

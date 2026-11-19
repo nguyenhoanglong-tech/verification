@@ -29,9 +29,10 @@ The gate App posts the check. Each repo's own App (`checks: write`, nothing else
 alone, and its private key is `VERIFICATION_APP_KEY` in the caller repo's environment `verification-gate`,
 whose branch rule names the default branch only: under `pull_request_target` that is the ref every run
 carries, and head code naming the environment is refused. The caller passes `app_id`, the key by name
-(`secrets: VERIFICATION_APP_KEY: ${{ secrets.VERIFICATION_APP_KEY }}`), and `legacy_cutover`, the highest
-check-run id of the gate's own GitHub Actions checks from before the App, which the sticky rule and the budget
-still read. With no App id or no key the gate job ends red and posts nothing.
+(`secrets: VERIFICATION_APP_KEY: ${{ secrets.VERIFICATION_APP_KEY }}`). The sticky rule and the budget read the
+App's records only: any job holding `checks: write`, a PR's own included, can rewrite a GitHub Actions check run,
+so the gate's records from before the App count for nothing. With no App id or no key the gate job ends red and
+posts nothing.
 
 Tests: `python3 -m unittest discover -s tests`.
 
