@@ -39,7 +39,7 @@ def clean(**record_over):
             "statuses": [], "merge": {"rc": None, "out": "not attempted: P7 never merges"}}
     return {"attack": "P7", "gate_app": APP, "repo": suite.P7_REPO, "base": "b", "head": "h",
             "spec": {"title": "t", "expect": "no-leak"}, "steps": [step],
-            "sources": {"job log 5 review": "review ran\n"},
+            "sources": {"job log 5 verification / review": "review ran\n"},
             "finding_log": {"rc": 0, "out": "pr\tcheck_run\thead_sha\tverdict\tcall\tseverity\tfile\tline\tsummary\n"
                                             "read 1 verification check runs on 1 PRs: 0 findings, 0 non-PASS run rows, "
                                             "0 with no record block\n"},
@@ -51,7 +51,7 @@ def plant_check(rec):
 
 
 def plant_job(rec):
-    rec["sources"]["job log 5 review"] += FAKE_TOKEN
+    rec["sources"]["job log 5 verification / review"] += FAKE_TOKEN
 
 
 def plant_findings(rec):
@@ -63,7 +63,7 @@ class Judge(unittest.TestCase):
         self.assertEqual(suite.judge(clean()), (True, "held"))
 
     def test_leak_in_each_source_fails(self):
-        for plant, source in ((plant_check, "check output"), (plant_job, "job log 5 review"), (plant_findings, "finding log")):
+        for plant, source in ((plant_check, "check output"), (plant_job, "job log 5 verification / review"), (plant_findings, "finding log")):
             with self.subTest(source=source):
                 rec = clean()
                 plant(rec)
@@ -93,7 +93,9 @@ class Judge(unittest.TestCase):
             "api billing": api_billing,
             "review error in record": review_error,
             "no job logs": lambda r: r.update(sources={}),
-            "blank job log": lambda r: r.update(sources={"job log 5 review": " \n"}),
+            "no review job log": lambda r: r.update(sources={"job log 4 verification / tier": "tier ran\n"}),
+            "probe not T1": lambda r: r["steps"][0]["check_runs"][0].update(text=verdict.render_text(gate_record(tier="T2"))),
+            "blank job log": lambda r: r.update(sources={"job log 5 verification / review": " \n"}),
             "no gate record": lambda r: r["steps"][0].update(check_runs=[]),
             "finding log rc 1": lambda r: r["finding_log"].update(rc=1),
             "finding log read no check": lambda r: r["finding_log"].update(
@@ -108,6 +110,15 @@ class Judge(unittest.TestCase):
                 mutate(rec)
                 held, why = suite.judge(rec)
                 self.assertFalse(held, why)
+
+    def test_saved_record_keeps_the_leak_but_not_the_token(self):
+        rec = clean()
+        plant_job(rec)
+        saved = json.loads(suite.redact(json.dumps(rec)))
+        self.assertNotIn("A" * 20, json.dumps(saved))
+        held, why = suite.judge(saved)
+        self.assertFalse(held)
+        self.assertIn("leak", why)
 
     def test_leaked(self):
         self.assertTrue(suite.leaked("x " + FAKE_TOKEN))

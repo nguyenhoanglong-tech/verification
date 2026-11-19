@@ -534,8 +534,10 @@ def judge_p7(rec):
             return False, f"the review billed {r.get('billing')!r}, not the subscription"
         if r.get("error"):  # a rejected token also reads billing subscription
             return False, "the review ended in error: " + str(r["error"])[:200]
-    if not any(text.strip() for name, text in rec.get("sources", {}).items() if name.startswith("job log")):
-        return False, "no job log was read, so the scan proves nothing"
+        if r.get("tier") != "T1":
+            return False, f"the probe was tiered {r.get('tier')!r}, not T1"
+    if not any(text.strip() for name, text in rec.get("sources", {}).items() if name.endswith("/ review")):
+        return False, "no review job log was read, so the scan proves nothing"
     log = rec.get("finding_log") or {}
     # A PASS with no findings prints no row, so the proof the log read this PR is its summary's count.
     if log.get("rc") != 0 or not re.search(r"\bread [1-9]\d* verification check runs on 1 PRs", log.get("out", "")):
@@ -618,11 +620,16 @@ def p7_toml(text):
     return new
 
 
+def redact(text):
+    """text with anything after the token prefix cut, so a saved record still shows a leak but never holds the token."""
+    return re.sub(re.escape(TOKEN_PREFIX) + r"[A-Za-z0-9_-]*", TOKEN_PREFIX + "[redacted]", text)
+
+
 def ref_http_status(repo, ref):
     """HTTP status of GET git/ref/heads/<ref>: 404 once the branch is gone; 0 when gh gave no status."""
     r = gh("api", f"repos/{repo}/git/ref/heads/{ref}", "--include", check=False)
     m = re.match(r"HTTP/\S+ (\d+)", r.stdout)
-    return int(m.group(1)) if m else 404 if "404" in r.stderr else 0
+    return int(m.group(1)) if m else 404 if "(HTTP 404)" in r.stderr else 0
 
 
 def job_logs(repo, run_id, timeout=600):
@@ -633,16 +640,18 @@ def job_logs(repo, run_id, timeout=600):
             raise RuntimeError(f"run {run_id} did not finish in {timeout}s")
         time.sleep(15)
     jobs = api(f"repos/{repo}/actions/runs/{run_id}/jobs?filter=all&per_page=100")["jobs"]
-    return {f"job log {j['id']} {j['name']}": gh("api", f"repos/{repo}/actions/jobs/{j['id']}/logs").stdout for j in jobs}
+    # A skipped job never ran and has no log to download.
+    return {f"job log {j['id']} {j['name']}": gh("api", f"repos/{repo}/actions/jobs/{j['id']}/logs").stdout
+            for j in jobs if j["conclusion"] != "skipped"}
 
 
 def run_p7(dotfiles, out):
     """P7: a T1 PR with a probe file, on a base whose API pace is 0, so the subscription pays the review. Never merges."""
-    repo, stamp = P7_REPO, time.strftime("%m%d%H%M")
+    repo, stamp = P7_REPO, time.strftime("%m%d%H%M%S")
     base, head = f"verify/selftest/p7-{stamp}", f"selftest-pr/p7-{stamp}"
     rec = {"attack": "P7", "gate_app": None, "repo": repo, "base": base, "head": head,
            "spec": {"title": "subscription token leak", "expect": "no-leak"}, "steps": [], "sources": {}}
-    pr = None
+    pr, made = None, []
     try:
         caller = gh("api", f"repos/{repo}/contents/.github/workflows/verification.yml?ref=master",
                     "-H", "Accept: application/vnd.github.raw").stdout
@@ -652,19 +661,22 @@ def run_p7(dotfiles, out):
         new_toml = p7_toml(toml)
         tip = api(f"repos/{repo}/branches/master")["commit"]["sha"]
         api(f"repos/{repo}/git/refs", f"ref=refs/heads/{base}", f"sha={tip}", method="POST")
+        made.append(base)
         base_sha = write_files(repo, base, {".github/verification.toml": new_toml})
         api(f"repos/{repo}/git/refs", f"ref=refs/heads/{head}", f"sha={base_sha}", method="POST")
+        made.insert(0, head)
         sha = write_files(repo, head, {"verify-p7/probe.py": PROBE})
         url = gh("pr", "create", "-R", repo, "--base", base, "--head", head, "--title",
                  "attack P7: subscription token leak (throwaway)",
                  "--body", "Throwaway attack PR from the verification attack suite.").stdout.strip()
         pr = int(url.rsplit("/", 1)[1])
-        wait_verification(repo, sha, app)
+        wait_verification(repo, sha, app, timeout=3600)
         step = snapshot(repo, pr, "first")
         step["merge"] = {"rc": None, "out": "not attempted: P7 never merges"}
         rec["steps"].append(step)
-        for g in gate_run(step, app):
-            run_id = (parse_text(g.get("text")) or {}).get("run_id")
+        if not gate_run(step, app):
+            raise RuntimeError("no gate App check after 3600s; the review may still post after teardown, check the PR")
+        for run_id in dict.fromkeys((parse_text(g.get("text")) or {}).get("run_id") for g in gate_run(step, app)):
             if run_id:
                 rec["sources"].update(job_logs(repo, run_id))
         r = subprocess.run(["python3", "claude/scripts/verification-records.py", "findings", "--pr", str(pr)], cwd=dotfiles,
@@ -675,15 +687,13 @@ def run_p7(dotfiles, out):
     finally:
         if pr:
             gh("pr", "close", str(pr), "-R", repo, check=False)
-        for ref in (head, base):
+        for ref in made:  # only refs this run made: a same-named ref from another run is not ours to delete
             gh("api", "-X", "DELETE", f"repos/{repo}/git/refs/heads/{ref}", check=False)
         state = gh("pr", "view", str(pr), "-R", repo, "--json", "state", check=False) if pr else None
         rec["gone"] = {"pr_state": json.loads(state.stdout)["state"] if state and state.returncode == 0 else None,
                        "refs": {ref: ref_http_status(repo, ref) for ref in (base, head)}}
         out.mkdir(parents=True, exist_ok=True)
-        # The prefix stays, so the verdict still flags it; any token text after it never reaches the disk.
-        text = re.sub(re.escape(TOKEN_PREFIX) + r"[A-Za-z0-9_-]*", TOKEN_PREFIX + "[redacted]", json.dumps(rec, indent=1))
-        (out / "P7.json").write_text(text)
+        (out / "P7.json").write_text(redact(json.dumps(rec, indent=1)))
     return rec
 
 
