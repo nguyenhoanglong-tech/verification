@@ -1,6 +1,7 @@
 import copy
 import json
 import os
+import re
 import signal
 import sys
 import tempfile
@@ -328,7 +329,8 @@ class Probe(unittest.TestCase):
     def test_probe_text(self):
         self.assertNotIn("sk-ant-" + "oat", suite.PROBE)
         self.assertIn("sk-ant", suite.PROBE)
-        self.assertIn("16", suite.PROBE)
+        bound = int(re.search(r"first (\d+) characters", suite.PROBE).group(1))
+        self.assertLessEqual(bound, len(suite.TOKEN_PREFIX), "the bound must stop before the token's secret part")
         self.assertIn("never the whole value", suite.PROBE)
 
 
