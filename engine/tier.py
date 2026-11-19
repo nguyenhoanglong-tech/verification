@@ -104,6 +104,26 @@ class ConfigError(Exception):
     pass
 
 
+def subscription(config: dict) -> tuple[bool, int]:
+    """(fallback, reviews_per_day) from the [subscription] table (D18). No table: the fallback is off. A wrong type,
+    an unknown key, or fallback = true with no daily cap is an error, never a default."""
+    block = config.get("subscription", {})
+    if not isinstance(block, dict):
+        raise ConfigError(f"[subscription] must be a table, got {block!r}")
+    unknown = sorted(set(block) - {"fallback", "reviews_per_day"})
+    if unknown:
+        raise ConfigError(f"[subscription] has unknown keys: {', '.join(unknown)}")
+    fallback = block.get("fallback", False)
+    if not isinstance(fallback, bool):
+        raise ConfigError(f"[subscription] fallback must be true or false, got {fallback!r}")
+    per_day = block.get("reviews_per_day", 0)
+    if fallback and "reviews_per_day" not in block:
+        raise ConfigError("[subscription] fallback = true needs reviews_per_day, the subscription reviews per UTC day")
+    if isinstance(per_day, bool) or not isinstance(per_day, int) or per_day < 0:
+        raise ConfigError(f"[subscription] reviews_per_day must be a whole number >= 0, got {per_day!r}")
+    return fallback, per_day
+
+
 def settings(config: dict, base_ref: str) -> dict:
     """mode, enforcement and live_checks from the base toml (D10, D27). An unknown value is an error, never a default."""
     mode = config.get("mode", "shadow")
@@ -119,12 +139,15 @@ def settings(config: dict, base_ref: str) -> dict:
         raise ConfigError(f'live_checks must be "machine" or "owed", got {live!r}')
     enforce = mode == "enforce" or base_ref in config.get("enforce_branches", [])
     review = config.get("review", {})
+    fallback, subscription_per_day = subscription(config)
     return {
         "mode": "enforce" if enforce else "shadow",
         # An enforced base always runs every owed check.
         "live_checks": "owed" if enforce else live,
         "reviews_per_day": int(config.get("reviews_per_day", 5)),
         "budget_month_usd": float(config.get("budget_month_usd", 100)),
+        "subscription_fallback": fallback,
+        "subscription_per_day": subscription_per_day,
         "standards": review.get("standards", "CODING_STANDARDS.md"),
     }
 
@@ -222,21 +245,27 @@ def tier_outputs(repo: str, base_sha: str, head_sha: str, base_ref: str, config:
     code = t2 or "T1" in result.tiers
     review_cfg = config.get("review", {})
     skip, spec = "", ""
-    budget = {"reviews_per_day": s["reviews_per_day"], "budget_month_usd": s["budget_month_usd"], "skipped": False}
+    budget = {k: s[k] for k in ("reviews_per_day", "budget_month_usd", "subscription_fallback", "subscription_per_day")}
+    budget.update(skipped=False, route=None)
     review = code and s["live_checks"] == "owed"
     if code and not review:
         skip = "machine only"
     if review:
         now = datetime.now(timezone.utc)
         try:
-            today, month = verdict.budget_base(github.month_records(repo, os.environ.get("GITHUB_WORKFLOW_REF", ""), now), now)
-        except Exception as x:  # fail closed: no paid call on a budget nobody could read
+            totals = verdict.budget_base(github.month_records(repo, os.environ.get("GITHUB_WORKFLOW_REF", ""), now), now)
+        except Exception as x:  # fail closed: no paid call, on either billing, on a budget nobody could read
             print(f"::warning::budget read failed, so the paid review is skipped: {x}")
             budget.update(skipped=True, read_error=f"budget read failed: {x}"[:300])
         else:
-            budget.update(reviews_today=today, month_usd=month,
-                          skipped=not verdict.budget_allows(today, month, s["reviews_per_day"], s["budget_month_usd"]))
-            print(f"budget: {today} paid reviews today of {s['reviews_per_day']}, ${month:.2f} this month of ${s['budget_month_usd']:.2f}")
+            # The caller's token reaches this job only as this boolean, never as its value.
+            token = os.environ.get("SUBSCRIPTION_TOKEN_SET") == "true"
+            billing, limit = verdict.route(totals, budget, token)
+            budget.update(**totals, route=billing, skipped=billing is None, limit=limit)
+            print(f"budget: {totals['reviews_today']} paid reviews today of {s['reviews_per_day']}, "
+                  f"${totals['month_usd']:.2f} this month of ${s['budget_month_usd']:.2f}, "
+                  f"{totals['subscription_today']} subscription reviews today of {s['subscription_per_day']}; "
+                  f"billing {billing or 'none'}" + (f" ({limit})" if limit else ""))
         if budget["skipped"]:
             review, skip = False, verdict.BUDGET_SKIPPED
         else:

@@ -6,9 +6,16 @@ jobs:
   unit:
     runs-on: ${{ vars.VERIFICATION_RUNNER || 'ubuntu-24.04' }}
     container: python:3.12-bookworm@sha256:4209fae09a3e20afd863e528bfddc235da5fd5977983e1996cd54cc9a72e6267
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
+      # tests/test_isolation.py runs the CLI version the review pins against a fake API on 127.0.0.1.
+      - name: Install the pinned Claude Code
+        run: |
+          version=$(sed -n 's/^ *CLAUDE_CODE_VERSION: "\(.*\)"$/\1/p' engine/claude-job/action.yml)
+          for i in 1 2 3; do curl -fsSL https://claude.ai/install.sh | bash -s -- "$version" && break; sleep 5; done
+          test "$("$HOME/.local/bin/claude" --version | cut -d' ' -f1)" = "$version"
+          echo "CLAUDE_ISOLATION_CLI=$HOME/.local/bin/claude" >> "$GITHUB_ENV"
       - run: python3 -m unittest discover -s tests

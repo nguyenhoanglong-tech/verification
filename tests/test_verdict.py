@@ -8,10 +8,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "engine"))
 import verdict  # noqa: E402
-from verdict import conclusion, decide, from_needs, parse_text, prior_verdicts, render_text, budget_base, budget_allows, stamp  # noqa: E402
+from verdict import conclusion, decide, from_needs, parse_text, prior_verdicts, render_text, budget_base, stamp  # noqa: E402
 import fakes  # noqa: E402
 
 BUDGET = {"reviews_today": 0, "month_usd": 0.0, "reviews_per_day": 5, "budget_month_usd": 100.0, "skipped": False}
+
+
+def totals(today, month, sub=0):
+    return {"reviews_today": today, "month_usd": month, "subscription_today": sub}
 
 
 def bug(severity):
@@ -124,21 +128,15 @@ class Budget(unittest.TestCase):
 
     def test_newest_record_carries_the_totals(self):
         records = [("2026-11-18T10:00:00Z", self.rec(2, 30.0)), ("2026-11-18T12:00:00Z", self.rec(3, 33.5))]
-        self.assertEqual(budget_base(records, self.NOW), (3, 33.5))
+        self.assertEqual(budget_base(records, self.NOW), totals(3, 33.5))
 
     def test_a_record_without_totals_does_not_reset_them(self):
         records = [("2026-11-18T10:00:00Z", self.rec(2, 30.0)), ("2026-11-18T12:00:00Z", {"budget": {}})]
-        self.assertEqual(budget_base(records, self.NOW), (2, 30.0))
+        self.assertEqual(budget_base(records, self.NOW), totals(2, 30.0))
 
     def test_day_and_month_reset(self):
-        self.assertEqual(budget_base([("2026-11-17T23:00:00Z", self.rec(5, 40.0))], self.NOW), (0, 40.0))
-        self.assertEqual(budget_base([("2026-10-31T23:00:00Z", self.rec(5, 99.0))], self.NOW), (0, 0.0))
-
-    def test_caps(self):
-        self.assertFalse(budget_allows(0, 0, 0, 100))      # reviews_per_day = 0 turns paid reviews off
-        self.assertFalse(budget_allows(5, 0, 5, 100))
-        self.assertFalse(budget_allows(0, 100.0, 5, 100))  # the month already sums to budget_month_usd
-        self.assertTrue(budget_allows(4, 99.9, 5, 100))
+        self.assertEqual(budget_base([("2026-11-17T23:00:00Z", self.rec(5, 40.0))], self.NOW), totals(0, 40.0))
+        self.assertEqual(budget_base([("2026-10-31T23:00:00Z", self.rec(5, 99.0))], self.NOW), totals(0, 0.0))
 
 
 class MonthRecords(unittest.TestCase):
@@ -161,7 +159,7 @@ class MonthRecords(unittest.TestCase):
             fail={"GET commits/gone/": [fakes.http_error(422)]})
         with fakes.installed(fake):
             got = fakes.github.month_records("o/r", fakes.ENV["GITHUB_WORKFLOW_REF"], Budget.NOW)
-        self.assertEqual(budget_base(got, Budget.NOW), (3, 30.0))
+        self.assertEqual(budget_base(got, Budget.NOW), totals(3, 30.0))
         paths = [p for _, p, _ in fake.calls]
         self.assertIn("repos/o/r/actions/workflows/caller.yml/runs?created=%3E%3D2026-10-31T18:00:00Z&per_page=100&page=1", paths)
         self.assertFalse(any("commits/old/" in p for p in paths), "runs older than the span are not read")
@@ -174,7 +172,7 @@ class MonthRecords(unittest.TestCase):
                             checks={head: [fakes.check(1, self.paid(4, 40.0), "2026-11-18T12:20:00Z")]})
         with fakes.installed(fake):
             got = fakes.github.month_records("o/r", fakes.ENV["GITHUB_WORKFLOW_REF"], Budget.NOW)
-        self.assertEqual(budget_base(got, Budget.NOW), (4, 40.0))
+        self.assertEqual(budget_base(got, Budget.NOW), totals(4, 40.0))
 
     def test_a_run_started_before_the_month_still_counts(self):
         """A run created at 23:55 on the last day posts its record (and its spend) after midnight."""
@@ -182,7 +180,7 @@ class MonthRecords(unittest.TestCase):
                             checks={"late": [fakes.check(1, self.paid(1, 2.0), "2026-11-01T00:05:00Z")]})
         with fakes.installed(fake):
             got = fakes.github.month_records("o/r", fakes.ENV["GITHUB_WORKFLOW_REF"], datetime(2026, 11, 1, 1, 0, tzinfo=timezone.utc))
-        self.assertEqual(budget_base(got, datetime(2026, 11, 1, 1, 0, tzinfo=timezone.utc)), (1, 2.0))
+        self.assertEqual(budget_base(got, datetime(2026, 11, 1, 1, 0, tzinfo=timezone.utc)), totals(1, 2.0))
 
     def test_a_forged_actions_record_cannot_reset_the_budget(self):
         """#3383 budget forge: a PR's own workflow posts, or rewrites, a newer `verification` record saying nothing
@@ -193,7 +191,7 @@ class MonthRecords(unittest.TestCase):
                                     "old": [fakes.check(1, self.paid(4, 44.0), "2026-11-18T09:30:00Z")]})
         with fakes.installed(fake):
             got = fakes.github.month_records("o/r", fakes.ENV["GITHUB_WORKFLOW_REF"], Budget.NOW)
-        self.assertEqual(budget_base(got, Budget.NOW), (4, 44.0))
+        self.assertEqual(budget_base(got, Budget.NOW), totals(4, 44.0))
 
     def test_an_unreadable_workflow_ref_raises(self):
         with self.assertRaises(RuntimeError):

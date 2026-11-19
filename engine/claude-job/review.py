@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""The review (D8, D16): the Bugs call, then the Spec call when the switch is on, each as `claude --bare -p`.
+"""The review (D8, D16): the Bugs call, then the Spec call when the switch is on.
 
-The working directory is the base checkout. The head never sits inside it: its files and diff are copied to
-$RUNNER_TEMP/review and read as data, so no head CLAUDE.md, command, skill or setting can load (amendment item 9).
-Writes one JSON `result` output: {findings, spec, cost_usd, error, budget_refused, credit_error}.
+Each call is billed to the API (`claude --bare -p`, the federation token through apiKeyHelper) or, when the API budget
+refuses, to the Claude subscription (D18 as amended 2026-11-19). The tier job picks the first route; a call the API
+refuses for spend or credit is retried once on the subscription when the subscription may run.
+The head never sits in a working directory: its files and diff are copied to $RUNNER_TEMP/review/data and read as data,
+so no head CLAUDE.md, command, skill or setting can load (amendment item 9).
+Writes one JSON `result` output: {findings, spec, cost_usd, subscription_cost_usd, billing, error, budget_refused}.
 
   review.py
 """
@@ -14,8 +17,10 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -23,16 +28,22 @@ ENGINE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ENGINE))
 import github  # noqa: E402
 from tier import done_items  # noqa: E402
-from verdict import budget_allows, budget_base, log_data  # noqa: E402
+from verdict import budget_base, log_data, route  # noqa: E402
 
 # The org's Console spend limit refuses with this text (HTTP 400, invalid_request_error). It is the budget, not an error.
 SPEND_LIMIT = re.compile(r"You have reached your specified (?:workspace )?API usage limits")
 CREDIT = re.compile(r"credit balance is too low", re.I)
+# On the subscription route only. The plan's own usage limit is the budget: "Claude AI usage limit reached",
+# "You've hit your limit · resets 3pm". A token the CLI cannot use is an error: "Not logged in", or a 401.
+PLAN_LIMIT = re.compile(r"Claude AI usage limit reached|You[’']ve hit your (?:\w+ )?limit", re.I)
+AUTH = re.compile(r"Not logged in|authentication_error|OAuth (?:access )?token|\b401\b", re.I)
 SEVERITIES = ("P0", "P1")
 STATUSES = ("Yes", "Partly", "No")
 
 
-def failure_kind(text: str) -> str:
+def failure_kind(text: str, billing: str = "api") -> str:
+    if billing == "subscription":
+        return "plan" if PLAN_LIMIT.search(text) else "auth" if AUTH.search(text) else "error"
     if SPEND_LIMIT.search(text):
         return "budget"
     return "credit" if CREDIT.search(text) else "error"
@@ -123,7 +134,7 @@ def spec_table(result: dict) -> dict:
                                                "evidence": i.get("evidence", "")} for i in out["items"]]}
 
 
-def outcome(proc_rc: int, stdout: str, stderr: str) -> tuple[dict | None, str]:
+def outcome(proc_rc: int, stdout: str, stderr: str, billing: str = "api") -> tuple[dict | None, str]:
     """(CLI result, failure text). Failure text is empty when the call ran and returned a result."""
     result = last_json(stdout)
     if not isinstance(result, dict):
@@ -136,7 +147,7 @@ def outcome(proc_rc: int, stdout: str, stderr: str) -> tuple[dict | None, str]:
     # the refusal reports total_cost_usd 0, the same sentence written by the model 0.00064).
     text = str(result.get("result", ""))
     if (not result.get("structured_output") and not result.get("total_cost_usd")
-            and (text.startswith("API Error") or failure_kind(text) != "error")):
+            and (text.startswith("API Error") or failure_kind(text, billing) != "error")):
         return result, f"{result.get('subtype', '')} {text} {stderr[-300:]}".strip()
     return result, ""
 
@@ -186,54 +197,107 @@ def prepare(head: Path, base_sha: str, data: Path) -> None:
     shutil.rmtree(head)
 
 
-def claude(args: list[str], prompt: str, token_file: Path, home: Path) -> tuple[int, str, str]:
-    settings = json.dumps({"apiKeyHelper": f"cat '{token_file}'"})
-    cmd = [str(Path.home() / ".local/bin/claude"), "--bare", "-p", "--no-session-persistence", "--settings", settings,
-           *args, prompt]
-    print("claude command:", " ".join(json.dumps(a) if " " in a or not a else a for a in cmd[:-1]), "<prompt>")
+@dataclass
+class Runner:
+    token_file: Path  # the API token, written by exchange(); apiKeyHelper reads it
+    home: Path        # fresh HOME and CLAUDE_CONFIG_DIR: no user config
+    cwd: Path         # holds one fresh empty working directory per subscription call
+    oauth: str = ""   # the subscription token; only the subscription call's env carries it
+
+
+def isolated_cwd(cwd: Path) -> Path:
+    """cwd, once it is empty with no CLAUDE.md or .claude in it or above it. Without --bare the CLI loads every
+    CLAUDE.md it finds walking up from its cwd; --safe-mode skips them as well, and this check does not rest on that."""
+    if any(cwd.iterdir()):
+        raise RuntimeError(f"the subscription call's cwd {cwd} is not empty")
+    for d in (cwd, *cwd.parents):
+        for name in ("CLAUDE.md", "CLAUDE.local.md", ".claude"):
+            if (d / name).exists():
+                raise RuntimeError(f"{d / name} sits on the subscription call's cwd path")
+    return cwd
+
+
+SCRUBBED = ("GITHUB_TOKEN", "GH_TOKEN", "SUBSCRIPTION_TOKEN")
+
+
+def claude(args: list[str], prompt: str, billing: str, runner: Runner) -> tuple[int, str, str]:
+    if billing == "api":
+        head = ["--bare", "-p", "--no-session-persistence", "--settings",
+                json.dumps({"apiKeyHelper": f"cat '{runner.token_file}'"})]
+        cwd, auth = None, {}
+    else:
+        # --bare reads no OAuth token ("Not logged in"), so this call runs without it and rebuilds what --bare turned
+        # off: --safe-mode (no CLAUDE.md, skills, plugins, hooks or MCP from any settings), --strict-mcp-config, an
+        # empty cwd and a fresh HOME. Measured on 2.1.326: /code-review still resolves under --safe-mode.
+        head = ["-p", "--no-session-persistence", "--safe-mode", "--strict-mcp-config"]
+        cwd = isolated_cwd(Path(tempfile.mkdtemp(dir=runner.cwd)))
+        auth = {"CLAUDE_CODE_OAUTH_TOKEN": runner.oauth, "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+                "ENABLE_TOOL_SEARCH": "false"}  # else the Spec call gets a deferred-tool placeholder --bare does not
+    cmd = [str(Path.home() / ".local/bin/claude"), *head, *args, prompt]
+    print(f"claude command ({billing}):", " ".join(json.dumps(a) if " " in a or not a else a for a in cmd[:-1]), "<prompt>")
     log_data(f"prompt: {prompt}")
-    env = {k: v for k, v in os.environ.items() if not k.startswith("ACTIONS_") and k not in ("GITHUB_TOKEN", "GH_TOKEN")}
-    env["HOME"] = str(home)  # fresh: no user config
-    p = subprocess.run(cmd, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=1500)
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("ACTIONS_", "ANTHROPIC_", "CLAUDE_")) and k not in SCRUBBED}
+    env.update(HOME=str(runner.home), CLAUDE_CONFIG_DIR=str(runner.home / ".claude"), **auth)
+    try:
+        p = subprocess.run(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=1500)
+    except subprocess.TimeoutExpired:
+        # A failure, not an exception: main still bills the call, so a hung subscription call counts against its cap.
+        return 124, "", "claude timed out after 1500s"
     return p.returncode, p.stdout, p.stderr
 
 
-def spec_budget(pace: dict, spent: float) -> str:
-    """Empty when the Spec call may run, else why not. Read again just before the call: other gate runs may have
-    paid since the tier job read it. This run already counts as one paid review."""
+def reroute(pace: dict, api_spent: float, token: bool, refused: str = "") -> tuple[str | None, str]:
+    """(billing, why) for the next call, from the budget read again: other gate runs may have paid since the tier job
+    read it. This run already counts as one review on whichever route it used. A failed read allows no paid call."""
     now = datetime.now(timezone.utc)
     try:
-        today, month = budget_base(github.month_records(os.environ["GITHUB_REPOSITORY"],
-                                                        os.environ.get("GITHUB_WORKFLOW_REF", ""), now), now)
+        totals = budget_base(github.month_records(os.environ["GITHUB_REPOSITORY"],
+                                                  os.environ.get("GITHUB_WORKFLOW_REF", ""), now), now)
     except Exception as x:
-        return f"budget read failed: {x}"[:300]
-    per_day, cap = int(pace.get("reviews_per_day", 0)), float(pace.get("budget_month_usd", 0))
-    print(f"budget before the Spec call: {today} other paid reviews today of {per_day}, ${month + spent:.2f} this month of ${cap:.2f}")
-    return "" if budget_allows(today, month + spent, per_day, cap) else "the daily pace or the month cap is reached"
+        return None, "; ".join(filter(None, [refused, f"budget read failed: {x}"[:300]]))
+    totals["month_usd"] += api_spent
+    billing, why = route(totals, pace, token, refused)
+    print(f"budget re-read: {totals['reviews_today']} other paid reviews today of {pace.get('reviews_per_day')}, "
+          f"${totals['month_usd']:.2f} this month of ${float(pace.get('budget_month_usd', 0)):.2f}, "
+          f"{totals['subscription_today']} other subscription reviews today of {pace.get('subscription_per_day', 0)}; "
+          f"billing {billing or 'none'}" + (f" ({why})" if why else ""))
+    return billing, why
+
+
+def empty_result() -> dict:
+    return {"findings": [], "spec": None, "cost_usd": 0.0, "subscription_cost_usd": 0.0, "billing": None, "error": None,
+            "budget_refused": False}
 
 
 def main() -> dict:
     e = os.environ
+    # Out of this process's env before any subprocess starts; only the subscription call's env gets it back.
+    # The step's bash and this process keep it in /proc/<pid>/environ, which a Read-only call cannot reach.
+    oauth = e.pop("SUBSCRIPTION_TOKEN", "")
+    if oauth:
+        print(f"::add-mask::{oauth}")
     tmp = Path(e["RUNNER_TEMP"]) / "review"
-    data, secret, home = tmp / "data", tmp / "secret", tmp / "home"
-    for d in (data, secret, home):
+    data, secret, home, cwd = tmp / "data", tmp / "secret", tmp / "home", tmp / "cwd"
+    for d in (data, secret, home, cwd):
         d.mkdir(parents=True, exist_ok=True)
     secret.chmod(0o700)
-    out = {"findings": [], "spec": None, "cost_usd": 0.0, "error": None, "budget_refused": False, "credit_error": False}
+    out = empty_result()
     prepare(Path(e["HEAD_DIR"]), e["BASE_SHA"], data)
-    token_file = secret / "token"
-    err = exchange(json.loads(e["ANTHROPIC"]), token_file)
-    if err:
-        out["error"] = err
-        return out
+    runner = Runner(token_file=secret / "token", home=home, cwd=cwd, oauth=oauth)
+    pace = json.loads(e.get("PACE") or "{}")
+    billing, exchanged, used, refused = pace.get("route") or "api", False, [], ""
+    base = Path.cwd()
     spec_text = json.loads(e.get("SPEC_TEXT") or '""')
     items = done_items(spec_text)
     standards = str(Path(e.get("STANDARDS", "CODING_STANDARDS.md")).resolve())
     common = ["--model", e["MODEL"], "--effort", e["EFFORT"], "--max-budget-usd", e.get("BUDGET_USD", "3"),
-              "--tools", "Read", "--allowedTools", f"Read(/{data}/**)",
+              # The base and the standards file are named by their own paths: the subscription call's cwd is empty.
+              "--tools", "Read", "--allowedTools", f"Read(/{data}/**),Read(/{base}/**),Read(/{standards})",
               "--disallowedTools", "Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch,Task,Agent", f"Read(/{secret}/**)",
               "--permission-mode", "dontAsk", "--output-format", "json"]
-    fill = lambda t: (t.replace("{{BASE_SHA}}", e["BASE_SHA"]).replace("{{DIFF}}", str(data / "diff.patch"))
+    fill = lambda t: (t.replace("{{BASE_SHA}}", e["BASE_SHA"]).replace("{{BASE}}", str(base))
+                      .replace("{{DIFF}}", str(data / "diff.patch"))
                       .replace("{{HEAD}}", str(data / "head")).replace("{{STANDARDS}}", standards)
                       .replace("{{SPEC}}", spec_text)
                       .replace("{{ITEMS}}", "\n".join(f"{n}. {i}" for n, i in enumerate(items, 1)) or
@@ -247,21 +311,51 @@ def main() -> dict:
                       fill((ENGINE / "prompts/spec.md").read_text())))
     for name, args, prompt in calls:
         if name == "spec":
-            why = spec_budget(json.loads(e.get("PACE") or "{}"), out["cost_usd"])
-            if why:
+            billing, why = reroute(pace, out["cost_usd"], bool(oauth), refused)
+            if billing is None:
                 print(f"Spec call skipped: {why}")
                 out["spec_skipped"] = why
                 return out
-        rc, stdout, stderr = claude(args, prompt, token_file, home)
-        result, failure = outcome(rc, stdout, stderr)
-        out["cost_usd"] = round(out["cost_usd"] + float((result or {}).get("total_cost_usd") or 0), 6)
-        print(f"{name}: exit {rc}, cost ${float((result or {}).get('total_cost_usd') or 0):.4f}")
-        if failure or result is None:
-            kind = failure_kind(failure)
-            out["budget_refused"] |= kind == "budget"
-            out["credit_error"] |= kind == "credit"
-            if kind != "budget":
-                out["error"] = f"{name} call: {' '.join(failure.split())[:400]}"
+        retried = False
+        while True:
+            if billing == "api" and not exchanged:
+                err = exchange(json.loads(e["ANTHROPIC"]), runner.token_file)
+                if err:
+                    out["error"] = err
+                    return out
+                exchanged = True
+            rc, stdout, stderr = claude(args, prompt, billing, runner)
+            result, failure = outcome(rc, stdout, stderr, billing)
+            cost = float((result or {}).get("total_cost_usd") or 0)
+            spent = "cost_usd" if billing == "api" else "subscription_cost_usd"
+            out[spent] = round(out[spent] + cost, 6)
+            # A subscription call counts against its daily cap once it ran, whatever came back; an API call is
+            # billed when it cost something or returned a result.
+            if billing not in used and (billing == "subscription" or cost or not failure):
+                used.append(billing)
+                out["billing"] = "+".join(used)
+            print(f"{name} ({billing}): exit {rc}, cost ${cost:.4f}"
+                  + (" (notional: the subscription pays)" if billing == "subscription" else ""))
+            if not failure and result is not None:
+                break
+            kind = failure_kind(failure, billing)
+            text = " ".join(failure.split())[:400]
+            if billing == "api" and kind in ("budget", "credit") and not retried:
+                retried = True
+                out["refused"] = "api spend limit" if kind == "budget" else "api credit"
+                refused = "API spend limit refused the call" if kind == "budget" else "API credit balance too low"
+                billing, why = reroute(pace, out["cost_usd"], bool(oauth), refused)
+                if billing == "subscription":
+                    print(f"{name} call: retried on the subscription ({why})")
+                    continue
+                if kind == "budget":
+                    out.update(budget_refused=True, limit=why)
+                    return out
+            if kind == "plan":
+                out.update(budget_refused=True, limit="; ".join(filter(None, [refused, "subscription plan limit"])))
+                return out
+            reason = "subscription token rejected: " if kind == "auth" and billing == "subscription" else ""
+            out["error"] = f"{name} call: {reason}{text}"
             return out
         try:
             if name == "bugs":
@@ -281,12 +375,10 @@ if __name__ == "__main__":
     try:
         result = main()
     except Exception as x:  # a runner fault is an ERROR verdict, never a crash that hides the cost
-        result = {"findings": [], "spec": None, "cost_usd": 0.0, "error": f"review job fault: {type(x).__name__}: {x}"[:400],
-                  "budget_refused": False, "credit_error": False}
+        result = {**empty_result(), "error": f"review job fault: {type(x).__name__}: {x}"[:400]}
     finally:
         shutil.rmtree(Path(os.environ["RUNNER_TEMP"]) / "review" / "secret", ignore_errors=True)
     log_data(json.dumps(result, indent=1))
     with open(os.environ["GITHUB_OUTPUT"], "a") as f:
         f.write(f"result={json.dumps(result)}\n")
-        f.write(f"credit_error={'true' if result['credit_error'] else 'false'}\n")
     sys.exit(0)

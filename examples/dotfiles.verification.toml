@@ -2,8 +2,12 @@
 mode = "shadow"                         # shadow | enforce (D10, D27)
 enforce_branches = ["verify/attack-base"]   # the attack suite's guarded base
 live_checks = "owed"                    # machine | owed: what a base that is not enforced runs (D27)
-reviews_per_day = 5                     # paid reviews per UTC day; 0 turns paid reviews off (D21)
+reviews_per_day = 5                     # API-paid reviews per UTC day; 0 sends every review to [subscription] (D21)
 budget_month_usd = 100                  # the gate's own review spend per calendar month (D21)
+
+[subscription]                          # D18: when the API budget refuses, review on the Claude subscription
+fallback = true                         # needs the caller to pass claude_code_oauth_token; no table means off
+reviews_per_day = 30                    # subscription reviews per UTC day, counted apart from the API's
 
 [anthropic]                             # personal org (D17)
 federation_rule_id = "fdrl_011Xnhp64qZrrs3D8z49fbSJ"
