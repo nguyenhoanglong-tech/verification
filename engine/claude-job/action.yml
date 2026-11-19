@@ -1,20 +1,20 @@
-name: verification claude job
-description: Runs one Claude check (review, blast or tp) on a PR head checked out as data, and scores its structured output.
+name: verification review
+description: The Bugs call and, when the switch is on, the Spec call, each as `claude --bare -p` with the PR head read as data (D8, D16).
 inputs:
-  kind: {required: true, description: "review | blast | tp"}
   model: {required: true, description: Claude model id}
   effort: {required: true, description: reasoning effort}
   level: {required: false, default: medium, description: /code-review level}
+  base_sha: {required: true, description: the base branch tip the tier job resolved}
   anthropic: {required: true, description: "JSON with federation_rule_id, organization_id, service_account_id, workspace_id"}
-  prompt_files: {required: false, default: "", description: "comma-separated prompt files the tier job found (tp only)"}
-  allowed_bots: {required: false, default: "", description: bots allowed to trigger the action}
-  github_token: {required: true, description: the workflow's GITHUB_TOKEN}
-  budget: {required: false, default: "3", description: max USD for this run}
+  spec_text: {required: false, default: '""', description: "JSON string: the done-when sections the Spec call checks; empty means no Spec call"}
+  standards: {required: false, default: CODING_STANDARDS.md, description: the coding standards file at base}
+  budget: {required: false, default: "3", description: max USD per call}
+  pace: {required: false, default: "{}", description: "JSON: the tier job's budget (reviews_per_day, budget_month_usd); the Spec call reads the budget again against it"}
+  subscription_fallback: {required: false, default: "false", description: "D18: retry on a credit error with the subscription token. Off until built."}
+  claude_code_oauth_token: {required: false, default: "", description: "D18: the subscription token for that retry"}
 outputs:
-  ok: {description: "true when the run produced a structured result with no blocking finding", value: "${{ steps.score.outputs.ok }}"}
-  head: {description: head SHA the check ran on, value: "${{ steps.score.outputs.head }}"}
-  cost: {description: total cost in USD, value: "${{ steps.score.outputs.cost }}"}
-  summary: {description: one-line result, value: "${{ steps.score.outputs.summary }}"}
+  result: {description: "JSON: findings, spec, cost_usd, error, budget_refused, credit_error", value: "${{ steps.review.outputs.result }}"}
+  head: {description: head SHA the review ran on, value: "${{ steps.head.outputs.head }}"}
 runs:
   using: composite
   steps:
@@ -24,88 +24,37 @@ runs:
         path: pr-head
         fetch-depth: 0
         persist-credentials: false
-    - id: prep
+    - id: head
+      shell: bash
+      run: echo "head=$(git -c safe.directory="*" -C pr-head rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+    - name: Install Claude Code
       shell: bash
       env:
-        KIND: ${{ inputs.kind }}
+        CLAUDE_CODE_VERSION: "2.1.326"
+      run: |
+        for i in 1 2 3; do curl -fsSL https://claude.ai/install.sh | bash -s -- "$CLAUDE_CODE_VERSION" && break; sleep 5; done
+        test "$("$HOME/.local/bin/claude" --version | cut -d' ' -f1)" = "$CLAUDE_CODE_VERSION"
+    - id: review
+      shell: bash
+      env:
+        HEAD_DIR: pr-head
+        BASE_SHA: ${{ inputs.base_sha }}
         MODEL: ${{ inputs.model }}
         EFFORT: ${{ inputs.effort }}
         LEVEL: ${{ inputs.level }}
-        BUDGET: ${{ inputs.budget }}
-        PR: ${{ github.event.pull_request.number }}
-        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        BASE_SHA: ${{ github.sha }}
-        ENGINE: ${{ github.action_path }}/..
-        PROMPT_FILES: ${{ inputs.prompt_files }}
-      run: |
-        echo "head=$(git -C pr-head rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-        git -C pr-head reset -q --soft "$(git -C pr-head merge-base HEAD "$BASE_SHA")"
-        git -C pr-head diff --cached --stat | tail -1
-        # The files the result must say it read: every changed file, or for tp every prompt file.
-        if [ "$KIND" = tp ]; then tr , '\n' <<<"$PROMPT_FILES"; else git -C pr-head diff --cached --name-only; fi \
-          | grep . | sort -u > "$RUNNER_TEMP/$KIND-owed.txt" || true
-        python3 - "$ENGINE" > "$RUNNER_TEMP/prompt.md" <<'PY'
-        import os, sys
-        e = sys.argv[1] + "/prompts/"
-        text = open(e + os.environ["KIND"] + ".md").read() + "\n" + open(e + "common.md").read()
-        for k, v in {"PR": os.environ["PR"], "REPO": os.environ["GITHUB_REPOSITORY"], "HEAD_SHA": os.environ["HEAD_SHA"],
-                     "LEVEL": os.environ["LEVEL"], "PROMPT_FILES": os.environ.get("PROMPT_FILES", "")}.items():
-            text = text.replace("{{" + k + "}}", v)
-        print(text)
-        PY
-        schema=$(jq -c . "$ENGINE/schema/$KIND.json")
-        # Comma-separated: the action splits --allowedTools on commas. dontAsk denies every tool not listed,
-        # so instructions planted in the diff cannot get anything run beyond reads and git queries.
-        tools='Read,Grep,Glob,Bash(git -C pr-head diff:*),Bash(git -C pr-head log:*),Bash(git -C pr-head show:*),Bash(git -C pr-head status:*),Bash(git -C pr-head ls-files:*)'
-        {
-          echo "args=--model $MODEL --effort $EFFORT --max-budget-usd $BUDGET --add-dir pr-head --permission-mode dontAsk --allowedTools \"$tools\" --disallowedTools \"Edit,Write,NotebookEdit,WebFetch,WebSearch,Task\" --json-schema '$schema'"
-          d="EOF_$(openssl rand -hex 16)"
-          echo "prompt<<$d"; cat "$RUNNER_TEMP/prompt.md"; echo "$d"
-        } >> "$GITHUB_OUTPUT"
-    - name: OIDC claims the federation rule sees (claims only, never the token)
-      shell: bash
-      run: |
-        t=$(curl -fsS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://api.anthropic.com" | jq -r .value)
-        cut -d. -f2 <<<"$t" | tr '_-' '/+' | base64 -d 2>/dev/null | jq -c '{sub, aud, repository_owner, repository_owner_id, job_workflow_ref, event_name}' || true
-    - id: claude
-      continue-on-error: true
-      uses: anthropics/claude-code-action@cc98b3ae241b0fcfb6a42a2690751afffecb4452
-      with:
-        prompt: ${{ steps.prep.outputs.prompt }}
-        claude_args: ${{ steps.prep.outputs.args }}
-        github_token: ${{ inputs.github_token }}
-        allowed_bots: ${{ inputs.allowed_bots }}
-        anthropic_federation_rule_id: ${{ fromJSON(inputs.anthropic).federation_rule_id }}
-        anthropic_organization_id: ${{ fromJSON(inputs.anthropic).organization_id }}
-        anthropic_service_account_id: ${{ fromJSON(inputs.anthropic).service_account_id }}
-        anthropic_workspace_id: ${{ fromJSON(inputs.anthropic).workspace_id }}
-    - id: score
-      if: always()
+        ANTHROPIC: ${{ inputs.anthropic }}
+        SPEC_TEXT: ${{ inputs.spec_text }}
+        STANDARDS: ${{ inputs.standards }}
+        BUDGET_USD: ${{ inputs.budget }}
+        PACE: ${{ inputs.pace }}
+        GH_TOKEN: ${{ github.token }}
+      run: python3 "$GITHUB_ACTION_PATH/review.py"
+    # D18: the subscription fallback goes here. It stays off: the input defaults to false and the retry is not built.
+    - name: subscription fallback on a credit error (D18, off)
+      if: inputs.subscription_fallback == 'true' && steps.review.outputs.credit_error == 'true'
       shell: bash
       env:
-        HEAD_SHA: ${{ steps.prep.outputs.head }}
-        KIND: ${{ inputs.kind }}
-        OUTCOME: ${{ steps.claude.outcome }}
-        STRUCTURED: ${{ steps.claude.outputs.structured_output }}
-        EXEC_FILE: ${{ steps.claude.outputs.execution_file }}
+        CLAUDE_CODE_OAUTH_TOKEN: ${{ inputs.claude_code_oauth_token }}
       run: |
-        cost=$( [ -s "$EXEC_FILE" ] && jq '[.[] | select(.type == "result")][-1].total_cost_usd // 0' "$EXEC_FILE" || echo 0)
-        # A pass needs a successful run, a structured result, and that result naming every owed file as read.
-        if [ "$OUTCOME" = success ] && [ -n "$STRUCTURED" ] \
-           && jq -e '(.findings | type == "array") and (.files_reviewed | type == "array")' <<<"$STRUCTURED" >/dev/null 2>&1; then
-          blocking=$(jq '[.findings[] | select(.severity == "blocking")] | length' <<<"$STRUCTURED")
-          minor=$(jq '[.findings[] | select(.severity == "minor")] | length' <<<"$STRUCTURED")
-          unread=$(jq -r '.files_reviewed[]' <<<"$STRUCTURED" | sort -u | comm -23 "$RUNNER_TEMP/$KIND-owed.txt" - | wc -l | tr -d ' ')
-          ok=$([ "$blocking" = 0 ] && [ "$unread" = 0 ] && [ -s "$RUNNER_TEMP/$KIND-owed.txt" ] && echo true || echo false)
-          summary="$KIND: $blocking blocking, $minor minor, $unread owed files not reported read"
-          jq -r '.findings[] | "- [\(.severity)] \(.file):\(.line // "") \(.summary)"' <<<"$STRUCTURED" > "$RUNNER_TEMP/$KIND-findings.md"
-        else
-          ok=false
-          err=$( [ -s "$EXEC_FILE" ] && jq -r '[.[] | select(.type == "result")][-1].result // ""' "$EXEC_FILE" | head -c 300 | tr '\n' ' ' || true)
-          summary="$KIND: no structured result (action outcome $OUTCOME): $err"
-          : > "$RUNNER_TEMP/$KIND-findings.md"
-        fi
-        echo "$summary cost=$cost head=$HEAD_SHA"
-        cat "$RUNNER_TEMP/$KIND-findings.md"
-        { echo "ok=$ok"; echo "head=$HEAD_SHA"; echo "cost=$cost"; echo "summary=$summary"; } >> "$GITHUB_OUTPUT"
-        { echo "### $summary"; cat "$RUNNER_TEMP/$KIND-findings.md"; } >> "$GITHUB_STEP_SUMMARY"
+        echo "::error::the D18 subscription retry is not built"
+        exit 1

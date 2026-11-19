@@ -8,13 +8,17 @@ Usage:
   tier.py classify < files.json        # [{"filename", "previous_filename"?, "additions", "deletions"}]
   tier.py github                       # in Actions: reads env, writes $GITHUB_OUTPUT
 """
+import base64
 import json
 import os
 import re
-import subprocess
 import sys
 import tomllib
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+
+import github
+import verdict
 
 DEFAULT_RULES = {
     "t2_lines": 300,
@@ -96,61 +100,186 @@ def classify(files: list[dict], rules: dict, truncated: bool = False) -> Result:
     return Result(tiers, code_lines, reasons, prompt_files)
 
 
-def gh_api(path: str, raw: bool = False) -> str:
-    cmd = ["gh", "api", path]
-    if raw:
-        cmd += ["-H", "Accept: application/vnd.github.raw"]
-    return subprocess.run(cmd, check=True, capture_output=True, text=True).stdout
+class ConfigError(Exception):
+    pass
+
+
+def settings(config: dict, base_ref: str) -> dict:
+    """mode, enforcement and live_checks from the base toml (D10, D27). An unknown value is an error, never a default."""
+    mode = config.get("mode", "shadow")
+    if mode == "observe":
+        raise ConfigError('mode "observe" was renamed to "shadow" (shadow trial): set mode = "shadow" in .github/verification.toml')
+    if mode not in ("shadow", "enforce"):
+        raise ConfigError(f'mode must be "shadow" or "enforce", got {mode!r}')
+    for check in config.get("check", []):
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", str(check.get("name", ""))) or not check.get("run"):
+            raise ConfigError(f"each [[check]] needs a plain name (A-Z a-z 0-9 . _ -) and a run command: {check}")
+    live = config.get("live_checks", "owed")
+    if live not in ("machine", "owed"):
+        raise ConfigError(f'live_checks must be "machine" or "owed", got {live!r}')
+    enforce = mode == "enforce" or base_ref in config.get("enforce_branches", [])
+    review = config.get("review", {})
+    return {
+        "mode": "enforce" if enforce else "shadow",
+        # An enforced base always runs every owed check.
+        "live_checks": "owed" if enforce else live,
+        "reviews_per_day": int(config.get("reviews_per_day", 5)),
+        "budget_month_usd": float(config.get("budget_month_usd", 100)),
+        "standards": review.get("standards", "CODING_STANDARDS.md"),
+    }
+
+
+DONE_WHEN = re.compile(r"^(#{1,6})\s+.*\b(done[ -]when|acceptance criteria)\b", re.I | re.M)
+DONE_WHEN_BOLD = re.compile(r"^\*\*\s*(?:done[ -]when|acceptance criteria)\s*:?\s*\*\*\s*:?[ \t]*$", re.I | re.M)
+ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(?:\[[ xX]\]\s+)?")
+
+
+def done_when(body: str) -> str:
+    """The done-when or acceptance-criteria section of an issue body, heading included; empty when there is none.
+    The heading is a Markdown heading, or a bold line followed by a list (the section is that list)."""
+    body = (body or "").replace("\r\n", "\n")
+    m = DONE_WHEN.search(body)
+    if m:
+        level = len(m.group(1))
+        rest = body[m.end():]
+        nxt = re.search(r"^#{1,%d}\s" % level, rest, re.M)
+        return (body[m.start():m.end()] + (rest[:nxt.start()] if nxt else rest)).strip()
+    m = DONE_WHEN_BOLD.search(body)
+    if not m:
+        return ""
+    lines = []
+    for line in body[m.end():].lstrip("\n").split("\n"):
+        if ITEM.match(line) or (lines and (not line.strip() or line[:1] in " \t")):
+            lines.append(line)
+        else:
+            break
+    return (m.group(0) + "\n" + "\n".join(lines)).strip() if any(ITEM.match(l) for l in lines) else ""
+
+
+def done_items(spec_text: str) -> list[str]:
+    """The list items of the done-when sections, in order: the rows the Spec table owes."""
+    return [ITEM.sub("", line).strip() for line in (spec_text or "").split("\n") if ITEM.match(line) and ITEM.sub("", line).strip()]
+
+
+def body_at(issue: dict, when: str) -> str:
+    """The issue body as it stood at `when`. GitHub keeps every version in userContentEdits, newest first."""
+    for edit in issue.get("edits", []):
+        if edit.get("diff") is not None and edit["editedAt"] <= when:
+            return edit["diff"]
+    return issue["body"] if not issue.get("edits") else ""
+
+
+def switch(pr_created_at: str, issues: list[dict]) -> str:
+    """D8: the done-when sections of the closed issues created before the PR, as their bodies stood when it opened."""
+    parts = []
+    for issue in issues:
+        if issue["createdAt"] < pr_created_at:
+            section = done_when(body_at(issue, pr_created_at))
+            if section:
+                parts.append(f"Issue #{issue['number']}:\n{section}")
+    return "\n\n".join(parts)
+
+
+CLOSING = """query($owner: String!, $name: String!, $pr: Int!) { repository(owner: $owner, name: $name) {
+  pullRequest(number: $pr) { createdAt closingIssuesReferences(first: 10) { nodes {
+    number createdAt body userContentEdits(first: 100) { nodes { editedAt diff } } } } } } }"""
+
+
+def closing_issues(repo: str, pr: int) -> tuple[str, list[dict]]:
+    owner, name = repo.split("/")
+    data = github.graphql(CLOSING, owner=owner, name=name, pr=pr)["repository"]["pullRequest"]
+    issues = [{**i, "edits": i["userContentEdits"]["nodes"]} for i in data["closingIssuesReferences"]["nodes"]]
+    return data["createdAt"], issues
 
 
 def load_config(repo: str, base_sha: str) -> dict:
-    # No fallback: a config that cannot be read fails this job, and the gate fails closed on it.
-    return tomllib.loads(gh_api(f"repos/{repo}/contents/.github/verification.toml?ref={base_sha}", raw=True))
+    # No fallback: a config that cannot be read is an ERROR verdict.
+    return tomllib.loads(github.api(f"repos/{repo}/contents/.github/verification.toml?ref={base_sha}", raw=True))
 
 
 def compare_files(repo: str, base_sha: str, head_sha: str) -> tuple[list[dict], bool]:
     # The compare API returns at most 300 files, all on the first page (per_page pages commits, not files).
     # A list that reaches 300 may be cut short, so the caller owes every tier.
-    files = json.loads(gh_api(f"repos/{repo}/compare/{base_sha}...{head_sha}")).get("files", [])
+    files = github.api(f"repos/{repo}/compare/{base_sha}...{head_sha}").get("files", [])
     return files, len(files) >= 300
 
 
-def github_main() -> None:
-    repo, base_sha, head_sha = os.environ["GITHUB_REPOSITORY"], os.environ["BASE_SHA"], os.environ["HEAD_SHA"]
-    base_ref = os.environ.get("BASE_REF", "")
-    config = load_config(repo, base_sha)
-    files, truncated = compare_files(repo, base_sha, head_sha)
-    result = classify(files, config.get("tiers", {}), truncated)
-    enforce = config.get("mode", "observe") == "enforce" or base_ref in config.get("enforce_branches", [])
-    review = config.get("review", {})
-    t2 = "T2" in result.tiers
-    sample = int(config.get("observe_sample", 1))
-    pr = int(os.environ.get("PR_NUMBER", "0"))
-    sampled = enforce or sample <= 1 or pr % sample == 0
-    if not sampled:
-        result.reasons.append(f"observe: Claude checks run on 1 PR in {sample}; this one was not sampled")
-    outputs = {
-        "tiers": " ".join(result.tiers),
-        "code_lines": str(result.code_lines),
-        "reasons": "; ".join(result.reasons),
-        "enforce": "true" if enforce else "false",
-        "review": "true" if sampled and ("T1" in result.tiers or t2) else "false",
-        "blast": "true" if sampled and t2 else "false",
-        "tp": "true" if sampled and "TP" in result.tiers else "false",
-        "prompt_files": ",".join(re.sub(r"[^A-Za-z0-9/._-]", "", p) for p in result.prompt_files),
-        "sampled": "true" if sampled else "false",
-        "review_model": review.get("t2_model" if t2 else "t1_model", "claude-opus-5-5" if t2 else "claude-sonnet-5-5"),
-        "review_level": review.get("t2_level" if t2 else "t1_level", "high" if t2 else "medium"),
-        "review_effort": review.get("effort", "medium"),
-        "checks": json.dumps(config.get("check", [])),
-        "has_checks": "true" if config.get("check") else "false",
-        "anthropic": json.dumps(config.get("anthropic", {})),
-        "allowed_bots": ",".join(config.get("allowed_bots", [])),
-    }
-    print(json.dumps({"head": head_sha, "base": base_sha, **outputs}, indent=2))
+def b64(text: str) -> str:
+    return base64.b64encode(text.encode()).decode()
+
+
+def write_outputs(outputs: dict) -> None:
     with open(os.environ["GITHUB_OUTPUT"], "a") as out:
         for k, v in outputs.items():
             out.write(f"{k}={' '.join(v.split())}\n")  # file names may hold newlines; one line per output
+
+
+def tier_outputs(repo: str, base_sha: str, head_sha: str, base_ref: str, config: dict) -> dict:
+    s = settings(config, base_ref)
+    files, truncated = compare_files(repo, base_sha, head_sha)
+    result = classify(files, config.get("tiers", {}), truncated)
+    t2 = "T2" in result.tiers
+    code = t2 or "T1" in result.tiers
+    review_cfg = config.get("review", {})
+    skip, spec = "", ""
+    budget = {"reviews_per_day": s["reviews_per_day"], "budget_month_usd": s["budget_month_usd"], "skipped": False}
+    review = code and s["live_checks"] == "owed"
+    if code and not review:
+        skip = "machine only"
+    if review:
+        now = datetime.now(timezone.utc)
+        try:
+            today, month = verdict.budget_base(github.month_records(repo, os.environ.get("GITHUB_WORKFLOW_REF", ""), now), now)
+        except Exception as x:  # fail closed: no paid call on a budget nobody could read
+            print(f"::warning::budget read failed, so the paid review is skipped: {x}")
+            budget.update(skipped=True, read_error=f"budget read failed: {x}"[:300])
+        else:
+            budget.update(reviews_today=today, month_usd=month,
+                          skipped=not verdict.budget_allows(today, month, s["reviews_per_day"], s["budget_month_usd"]))
+            print(f"budget: {today} paid reviews today of {s['reviews_per_day']}, ${month:.2f} this month of ${s['budget_month_usd']:.2f}")
+        if budget["skipped"]:
+            review, skip = False, verdict.BUDGET_SKIPPED
+        else:
+            spec = switch(*closing_issues(repo, int(os.environ["PR_NUMBER"])))
+    return {
+        "base_sha": base_sha,
+        "mode": s["mode"],
+        "tiers": " ".join(result.tiers),
+        "code_lines": str(result.code_lines),
+        "reasons": "; ".join(result.reasons),
+        "review": "true" if review else "false",
+        "skip": skip,
+        "switch_spec": "true" if spec else "false",
+        "spec_text": json.dumps(spec),
+        "budget": json.dumps(budget),
+        "standards": re.sub(r"[^A-Za-z0-9/._-]", "", s["standards"]),
+        "review_model": review_cfg.get("t2_model" if t2 else "t1_model", "claude-opus-5-5"),
+        "review_level": review_cfg.get("t2_level" if t2 else "t1_level", "medium"),
+        "review_effort": review_cfg.get("effort", "medium"),
+        # name:command pairs, each base64, so the checks job (docker CLI image, no jq) can read them.
+        "checks": " ".join(f"{b64(c['name'])}:{b64(c['run'])}" for c in config.get("check", [])),
+        "has_checks": "true" if config.get("check") else "false",
+        "anthropic": json.dumps(config.get("anthropic", {})),
+    }
+
+
+def github_main() -> None:
+    """Exits 0 on every handled error, with the error in the `error` output: the gate posts ERROR, neutral in shadow
+    trial, and this job stays green so nothing blocks."""
+    repo, base_sha, head_sha = os.environ["GITHUB_REPOSITORY"], os.environ["BASE_SHA"], os.environ["HEAD_SHA"]
+    base_ref = os.environ.get("BASE_REF", "")
+    print(f"base {base_sha}")
+    config = None
+    try:
+        config = load_config(repo, base_sha)
+        outputs = tier_outputs(repo, base_sha, head_sha, base_ref, config)
+    except Exception as e:
+        message = str(e) if isinstance(e, ConfigError) else f"tier job: {type(e).__name__}: {e}"
+        print(f"::error::{message}")
+        outputs = {"base_sha": base_sha, "mode": verdict.fallback_mode(config, base_ref), "error": message[:400],
+                   "has_checks": "false", "review": "false", "budget": "{}"}
+    verdict.log_data(json.dumps({"head": head_sha, **outputs}, indent=2))
+    write_outputs(outputs)
 
 
 if __name__ == "__main__":

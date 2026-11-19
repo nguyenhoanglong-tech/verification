@@ -1,6 +1,8 @@
-# The verification gate (DECISIONS D6-D27 in chrislongnguyen/dotfiles claude/docs/verification).
+# The verification gate (DECISIONS D6-D28 in chrislongnguyen/dotfiles claude/docs/verification).
 # Called from a thin pull_request_target caller on each repo's default branch, pinned by SHA.
 # The PR head is data: no job that holds a token or id-token executes head code.
+# Every job runs on the caller's `runner` and inside an image pinned by digest (D13), so moving the gate to a
+# self-hosted runner is a change to one repo variable.
 name: gate
 on:
   workflow_call:
@@ -9,53 +11,91 @@ on:
         description: The engine commit the caller pins (the same SHA as in its `uses:` line).
         type: string
         required: true
+      runner:
+        description: The runner label every job runs on; callers set it from the VERIFICATION_RUNNER repo variable.
+        type: string
+        required: false
+        default: ubuntu-24.04
 permissions: {}
 env:
   HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-  # The base branch tip when this run started, not the PR event's recorded base, which can be stale.
-  BASE_SHA: ${{ github.sha }}
   BASE_REF: ${{ github.event.pull_request.base.ref }}
   PR_NUMBER: ${{ github.event.pull_request.number }}
 jobs:
   start:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
+    container: python:3.12-bookworm@sha256:4209fae09a3e20afd863e528bfddc235da5fd5977983e1996cd54cc9a72e6267
     timeout-minutes: 5
     permissions:
+      contents: read  # the base ref read, on a private caller repo
       checks: write
     outputs:
       check_id: ${{ steps.s.outputs.check_id }}
+      base_sha: ${{ steps.s.outputs.base_sha }}
     steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: nguyenhoanglong-tech/verification
+          ref: ${{ inputs.engine_ref }}
+          path: engine-src
+          persist-credentials: false
       - id: s
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -euo pipefail
-          id=$(gh api "repos/$GITHUB_REPOSITORY/check-runs" -f name=verification -f head_sha="$HEAD_SHA" \
-            -f status=in_progress -f "output[title]=running" -f "output[summary]=The verification gate is running on $HEAD_SHA." --jq .id)
-          echo "check_id=$id" >> "$GITHUB_OUTPUT"
+          python3 - <<'PY'
+          import os, sys
+          sys.path.insert(0, "engine-src/engine")
+          import github
+          repo, base_ref = os.environ["GITHUB_REPOSITORY"], os.environ["BASE_REF"]
+          # The base branch tip when this run started, resolved once here; every later job takes it from this output.
+          # Not github.sha: that is the default-branch tip under pull_request_target and the merge commit under
+          # pull_request. Not the PR event's base, which can be stale. A fault here ends the job green with no
+          # outputs: the tier job then reports the error and the gate posts it (neutral in shadow), never a red job.
+          try:
+              if not base_ref or not all(c.isalnum() or c in "._/-" for c in base_ref):
+                  raise ValueError(f"base ref name is not plain enough to look up: {base_ref}")
+              base_sha = github.api(f"repos/{repo}/git/ref/heads/{base_ref}")["object"]["sha"]
+              print(f"base {base_sha}")
+              run = github.api(f"repos/{repo}/check-runs", "POST", {
+                  "name": "verification", "head_sha": os.environ["HEAD_SHA"], "status": "in_progress",
+                  "output": {"title": "running", "summary": f"The verification gate is running on {os.environ['HEAD_SHA']}."}})
+          except Exception as x:
+              print(f"::error::start: {type(x).__name__}: {x}")
+          else:
+              open(os.environ["GITHUB_OUTPUT"], "a").write(f"check_id={run['id']}\nbase_sha={base_sha}\n")
+          PY
 
   tier:
-    runs-on: ubuntu-latest
+    needs: start
+    runs-on: ${{ inputs.runner }}
+    container: python:3.12-bookworm@sha256:4209fae09a3e20afd863e528bfddc235da5fd5977983e1996cd54cc9a72e6267
     timeout-minutes: 5
     permissions:
+      actions: read
       contents: read
+      checks: read
+      issues: read
+      pull-requests: read
     outputs:
+      base_sha: ${{ steps.t.outputs.base_sha }}
+      mode: ${{ steps.t.outputs.mode }}
+      error: ${{ steps.t.outputs.error }}
       tiers: ${{ steps.t.outputs.tiers }}
       code_lines: ${{ steps.t.outputs.code_lines }}
       reasons: ${{ steps.t.outputs.reasons }}
-      enforce: ${{ steps.t.outputs.enforce }}
       review: ${{ steps.t.outputs.review }}
-      blast: ${{ steps.t.outputs.blast }}
-      tp: ${{ steps.t.outputs.tp }}
-      prompt_files: ${{ steps.t.outputs.prompt_files }}
+      skip: ${{ steps.t.outputs.skip }}
+      switch_spec: ${{ steps.t.outputs.switch_spec }}
+      spec_text: ${{ steps.t.outputs.spec_text }}
+      budget: ${{ steps.t.outputs.budget }}
+      standards: ${{ steps.t.outputs.standards }}
       review_model: ${{ steps.t.outputs.review_model }}
       review_level: ${{ steps.t.outputs.review_level }}
       review_effort: ${{ steps.t.outputs.review_effort }}
       checks: ${{ steps.t.outputs.checks }}
       has_checks: ${{ steps.t.outputs.has_checks }}
       anthropic: ${{ steps.t.outputs.anthropic }}
-      allowed_bots: ${{ steps.t.outputs.allowed_bots }}
-      sampled: ${{ steps.t.outputs.sampled }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -66,16 +106,19 @@ jobs:
       - id: t
         env:
           GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ needs.start.outputs.base_sha }}
         run: python3 engine-src/engine/tier.py github
 
   head_archive:
     needs: tier
     if: needs.tier.outputs.has_checks == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
+    container: python:3.12-bookworm@sha256:4209fae09a3e20afd863e528bfddc235da5fd5977983e1996cd54cc9a72e6267
     timeout-minutes: 5
     permissions:
       contents: read
     steps:
+      - run: echo "base ${{ needs.tier.outputs.base_sha }}"
       - uses: actions/checkout@v6
         with:
           ref: ${{ github.event.pull_request.head.sha }}
@@ -84,60 +127,76 @@ jobs:
       - run: tar -czf head.tgz -C head .
       - uses: actions/upload-artifact@v4
         with:
-          name: head-${{ github.event.pull_request.head.sha }}
+          name: head-${{ github.event.pull_request.head.sha }}-${{ github.run_attempt }}
           path: head.tgz
           retention-days: 3
 
   checks:
-    # Runs head code, so it holds no token, no id-token and no secrets (D13).
+    # Runs head code, so it holds no token, no id-token and no secrets (D13). Each check runs in its own
+    # throwaway container with no network and no view of this job's files, so it cannot write this job's outputs
+    # or leave a process behind; only its exit code counts.
     needs: [tier, head_archive]
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
+    container:
+      image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
+      volumes:
+        - /var/run/docker.sock:/var/run/docker.sock
     timeout-minutes: 20
     permissions: {}
     outputs:
-      ok: ${{ steps.run.outputs.ok }}
+      results: ${{ steps.run.outputs.results }}
       head: ${{ steps.run.outputs.head }}
-      summary: ${{ steps.run.outputs.summary }}
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: head-${{ github.event.pull_request.head.sha }}
+          name: head-${{ github.event.pull_request.head.sha }}-${{ github.run_attempt }}
       - id: run
+        shell: sh
         env:
           CHECKS: ${{ needs.tier.outputs.checks }}
+          IMAGE: python:3.12-bookworm@sha256:4209fae09a3e20afd863e528bfddc235da5fd5977983e1996cd54cc9a72e6267
         run: |
+          echo "base ${{ needs.tier.outputs.base_sha }}"
           mkdir head && tar -xzf head.tgz -C head && rm head.tgz
-          ok=true; summary=""
-          n=$(jq length <<<"$CHECKS")
-          for i in $(seq 0 $((n - 1))); do
-            name=$(jq -r ".[$i].name" <<<"$CHECKS"); cmd=$(jq -r ".[$i].run" <<<"$CHECKS")
+          results=""
+          for item in $CHECKS; do
+            name=$(echo "${item%%:*}" | base64 -d); cmd=$(echo "${item#*:}" | base64 -d)
             echo "::group::$name: $cmd"
-            # Head code runs in a throwaway container with no network and no view of the runner's files,
-            # so it cannot write this job's outputs or leave a process behind; only its exit code counts.
-            rm -rf work && cp -a head work
-            if docker run --rm --network none -v "$PWD/work:/w" -w /w python:3.12-bookworm bash -c "$cmd"; then r=pass; else r=fail; ok=false; fi
+            cid=$(docker create --network none -w /w "$IMAGE" bash -c "$cmd")
+            docker cp head/. "$cid:/w"
+            # Head output must not reach the command parser: a mask command in it would drop this job's outputs.
+            stop=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+            echo "::stop-commands::$stop"
+            if docker start -a "$cid"; then r=pass; else r=fail; fi
+            echo "::$stop::"
+            docker rm -f "$cid" >/dev/null
             echo "::endgroup::"
-            echo "$name=$r"; summary="$summary $name=$r"
+            echo "$name=$r"
+            results="$results${results:+,}{\"name\":\"$name\",\"result\":\"$r\"}"
           done
-          { echo "ok=$ok"; echo "head=$HEAD_SHA"; echo "summary=checks:$summary"; } >> "$GITHUB_OUTPUT"
+          { echo "results=[$results]"; echo "head=$HEAD_SHA"; } >> "$GITHUB_OUTPUT"
 
   review:
     needs: tier
     if: needs.tier.outputs.review == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    runs-on: ${{ inputs.runner }}
+    container: python:3.12-bookworm@sha256:4209fae09a3e20afd863e528bfddc235da5fd5977983e1996cd54cc9a72e6267
+    timeout-minutes: 40
     permissions:
+      actions: read
+      checks: read
       contents: read
-      pull-requests: write
       id-token: write
     outputs:
-      ok: ${{ steps.c.outputs.ok }}
+      result: ${{ steps.c.outputs.result }}
       head: ${{ steps.c.outputs.head }}
-      cost: ${{ steps.c.outputs.cost }}
-      summary: ${{ steps.c.outputs.summary }}
     steps:
+      - run: echo "base ${{ needs.tier.outputs.base_sha }}"
+      # The working directory is the base at the SHA the tier job resolved. The review action checks the head
+      # out and moves it out of the working directory before any model call.
       - uses: actions/checkout@v6
         with:
+          ref: ${{ needs.tier.outputs.base_sha }}
           persist-credentials: false
       - uses: actions/checkout@v6
         with:
@@ -148,157 +207,41 @@ jobs:
       - id: c
         uses: ./.verification-engine/engine/claude-job
         with:
-          kind: review
           model: ${{ needs.tier.outputs.review_model }}
           effort: ${{ needs.tier.outputs.review_effort }}
           level: ${{ needs.tier.outputs.review_level }}
           anthropic: ${{ needs.tier.outputs.anthropic }}
-          allowed_bots: ${{ needs.tier.outputs.allowed_bots }}
-          github_token: ${{ github.token }}
-
-  blast:
-    needs: tier
-    if: needs.tier.outputs.blast == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      contents: read
-      pull-requests: write
-      id-token: write
-    outputs:
-      ok: ${{ steps.c.outputs.ok }}
-      head: ${{ steps.c.outputs.head }}
-      cost: ${{ steps.c.outputs.cost }}
-      summary: ${{ steps.c.outputs.summary }}
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      - uses: actions/checkout@v6
-        with:
-          repository: nguyenhoanglong-tech/verification
-          ref: ${{ inputs.engine_ref }}
-          path: .verification-engine
-          persist-credentials: false
-      - id: c
-        uses: ./.verification-engine/engine/claude-job
-        with:
-          kind: blast
-          model: ${{ needs.tier.outputs.review_model }}
-          effort: ${{ needs.tier.outputs.review_effort }}
-          anthropic: ${{ needs.tier.outputs.anthropic }}
-          allowed_bots: ${{ needs.tier.outputs.allowed_bots }}
-          github_token: ${{ github.token }}
-
-  tp:
-    needs: tier
-    if: needs.tier.outputs.tp == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      contents: read
-      pull-requests: write
-      id-token: write
-    outputs:
-      ok: ${{ steps.c.outputs.ok }}
-      head: ${{ steps.c.outputs.head }}
-      cost: ${{ steps.c.outputs.cost }}
-      summary: ${{ steps.c.outputs.summary }}
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      - uses: actions/checkout@v6
-        with:
-          repository: nguyenhoanglong-tech/verification
-          ref: ${{ inputs.engine_ref }}
-          path: .verification-engine
-          persist-credentials: false
-      - id: c
-        uses: ./.verification-engine/engine/claude-job
-        with:
-          kind: tp
-          prompt_files: ${{ needs.tier.outputs.prompt_files }}
-          model: claude-sonnet-5-5
-          effort: medium
-          anthropic: ${{ needs.tier.outputs.anthropic }}
-          allowed_bots: ${{ needs.tier.outputs.allowed_bots }}
-          github_token: ${{ github.token }}
+          base_sha: ${{ needs.tier.outputs.base_sha }}
+          spec_text: ${{ needs.tier.outputs.spec_text }}
+          standards: ${{ needs.tier.outputs.standards }}
+          pace: ${{ needs.tier.outputs.budget }}
 
   gate:
-    # The one result the ruleset reads. Posted as a check run named `verification` by GitHub Actions.
-    needs: [start, tier, head_archive, checks, review, blast, tp]
+    # The one result the ruleset reads. One gate at a time per head, so each reads the verdicts the one before it
+    # wrote. queue: max keeps every waiting gate (up to 100); without it a newer gate cancels the waiting one.
+    needs: [start, tier, checks, review]
     if: always()
-    # One gate at a time per head, so each reads the verdicts the one before it wrote. queue: max keeps every
-    # waiting gate (up to 100); without it a newer gate cancels the waiting one and that run never posts.
     concurrency:
       group: verification-gate-${{ github.repository }}-${{ github.event.pull_request.head.sha }}
       cancel-in-progress: false
       queue: max
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
+    container: python:3.12-bookworm@sha256:4209fae09a3e20afd863e528bfddc235da5fd5977983e1996cd54cc9a72e6267
     timeout-minutes: 5
     permissions:
+      actions: read
       checks: write
+      contents: read
     steps:
+      - run: echo "base ${{ needs.tier.outputs.base_sha }}"
+      - uses: actions/checkout@v6
+        with:
+          repository: nguyenhoanglong-tech/verification
+          ref: ${{ inputs.engine_ref }}
+          path: engine-src
+          persist-credentials: false
       - env:
           GH_TOKEN: ${{ github.token }}
           NEEDS: ${{ toJSON(needs) }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
-        run: |
-          set -uo pipefail
-          tier() { jq -r ".tier.outputs.$1 // empty" <<<"$NEEDS"; }
-          ok=true; why=(); prior_fail=false
-          [ "$(jq -r .start.result <<<"$NEEDS")" = success ] || { ok=false; why+=("start job $(jq -r .start.result <<<"$NEEDS")"); }
-          [ "$(jq -r .tier.result <<<"$NEEDS")" = success ] || { ok=false; why+=("tier job $(jq -r .tier.result <<<"$NEEDS")"); }
-          owed() { # job, flag
-            local job=$1 flag=$2 res; res=$(jq -r ".$job.result" <<<"$NEEDS")
-            if [ "$flag" = true ]; then
-              [ "$res" = success ] || { ok=false; why+=("$job $res"); return; }
-              [ "$(jq -r ".$job.outputs.head" <<<"$NEEDS")" = "$HEAD_SHA" ] || { ok=false; why+=("$job ran on another head"); }
-              [ "$(jq -r ".$job.outputs.ok" <<<"$NEEDS")" = true ] || { ok=false; why+=("$(jq -r ".$job.outputs.summary" <<<"$NEEDS")"); }
-            else
-              [ "$res" = skipped ] || { ok=false; why+=("$job ran but was not owed ($res)"); }
-            fi
-          }
-          owed checks "$(tier has_checks)"
-          owed review "$(tier review)"
-          owed blast "$(tier blast)"
-          owed tp "$(tier tp)"
-          cost=$(jq '[.review, .blast, .tp | .outputs.cost // "0" | tonumber] | add' <<<"$NEEDS")
-          ran=$(jq -r '[to_entries[] | select(.key != "start" and .value.result == "success") | .key] | join(",")' <<<"$NEEDS")
-          tiers=$(tier tiers); enforce=$(tier enforce)
-          # Same-head runs share one verdict: a failure on this head is never replaced by a later pass.
-          runs=$(gh api --paginate "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/check-runs?check_name=verification&filter=all&per_page=100" \
-            --jq '.check_runs[] | select(.app.id == 15368)' | jq -s .) || { echo "cannot list verification runs"; exit 1; }
-          if [ "$(jq '[.[] | select(.conclusion == "failure")] | length' <<<"$runs")" != 0 ]; then
-            ok=false; prior_fail=true; why+=("an earlier verification run on this head failed")
-          fi
-          # Observe (neutral) only when the tier job said so and no run on this head failed; anything else fails closed.
-          if $ok; then conclusion=success; title="$tiers passed"
-          elif ! $prior_fail && [ "$enforce" = false ] && [ "$(jq -r .tier.result <<<"$NEEDS")" = success ]; then
-            conclusion=neutral; title="$tiers would block (observe)"
-          else conclusion=failure; title="${tiers:-tier unknown} blocked"; fi
-          stamp="Verified-by: $( [ "$tiers" = T0 ] && echo none-T0 || echo "$ran") head=$HEAD_SHA sampled=$(tier sampled)"
-          details=$(jq -r '[.checks, .review, .blast, .tp | .outputs.summary // empty] | join("\n")' <<<"$NEEDS")
-          summary=$(printf '%s\n\ntiers: %s (%s)\ncode lines: %s\nenforce: %s\ncost_usd: %s\nreasons not passed: %s\n\n%s\n\nrun: %s' \
-            "$stamp" "$tiers" "$(tier reasons)" "$(tier code_lines)" "$enforce" "$cost" "${why[*]:-none}" "$details" "$RUN_URL")
-          echo "$summary"; echo "conclusion=$conclusion"
-          # Only a failure is copied onto other runs' checks. A pass touches this run's own check, so a sibling
-          # still in progress keeps blocking until its own gate has judged it.
-          if [ "$conclusion" = failure ]; then
-            ids=$(jq -r '.[].id' <<<"$runs"; jq -r '.start.outputs.check_id // empty' <<<"$NEEDS")
-          else
-            ids=$(jq -r '.start.outputs.check_id // empty' <<<"$NEEDS")
-          fi
-          ids=$(sort -u <<<"$ids" | grep . || true)
-          if [ -z "$ids" ]; then
-            gh api -X POST "repos/$GITHUB_REPOSITORY/check-runs" -f name=verification -f head_sha="$HEAD_SHA" \
-              -f status=completed -f conclusion="$conclusion" \
-              -f "output[title]=$title" -f "output[summary]=$summary" --jq '{id, app: .app.id, head_sha, conclusion}'
-          fi
-          for id in $ids; do
-            gh api -X PATCH "repos/$GITHUB_REPOSITORY/check-runs/$id" \
-              -f status=completed -f conclusion="$conclusion" \
-              -f "output[title]=$title" -f "output[summary]=$summary" --jq '{id, app: .app.id, head_sha, conclusion}'
-          done
-          [ "$conclusion" != failure ]
+        run: python3 engine-src/engine/verdict.py post
