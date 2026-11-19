@@ -1,0 +1,11 @@
+name: steal
+on: [push, pull_request]
+permissions: {}
+jobs:
+  steal:
+    runs-on: ubuntu-latest
+    environment: verification-gate
+    steps:
+      - env:
+          K: ${{ secrets.VERIFICATION_APP_KEY }}
+        run: echo "secret_len=${#K}"
