@@ -14,3 +14,7 @@ def sub(a, b):
 
 def sub(a, b):
     return a - b
+
+
+def sub_se(a, b):
+    return a - b
