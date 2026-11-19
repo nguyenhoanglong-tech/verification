@@ -1,0 +1,29 @@
+# Throwaway probe for chrislongnguyen/dotfiles#3383 P4g, deleted by the gate-App change.
+# Posts one failing check run named p4g-target as the gate App, on the commit it is given.
+name: p4g-probe
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        type: string
+        required: true
+permissions: {}
+jobs:
+  post:
+    runs-on: ubuntu-24.04
+    environment: verification-gate
+    permissions: {}
+    steps:
+      - id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510  # v3.3.0
+        with:
+          app-id: 5828645
+          private-key: ${{ secrets.VERIFICATION_APP_KEY }}
+          permission-checks: write
+      - env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          SHA: ${{ inputs.sha }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/check-runs" -f name=p4g-target -f head_sha="$SHA" -f status=completed \
+            -f conclusion=failure -f 'output[title]=p4g target' -f 'output[summary]=Posted by the gate App for P4g.' \
+            --jq '"target id=\(.id) app=\(.app.slug) app_id=\(.app.id) conclusion=\(.conclusion)"'
