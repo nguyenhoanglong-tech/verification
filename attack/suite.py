@@ -367,6 +367,16 @@ def gate_run(step, app):
             and r["head_sha"] == step["pr"]["headRefOid"]]
 
 
+def refused_by_gate(step):
+    """(held, why) for a step whose merge must be refused. A merge conflict also refuses it, and proves nothing
+    about the gate: the PR must have been mergeable but for the rules (BLOCKED), not DIRTY."""
+    if step["merge"]["rc"] == 0:
+        return False, f"{step['label']}: merged although the attack should be refused"
+    if step["pr"]["mergeStateStatus"] == "DIRTY":
+        return False, f"{step['label']}: refused for a merge conflict, not by the gate; re-run on a stable base"
+    return True, "held"
+
+
 def fakes_green(step):
     return [r for r in step["check_runs"] if r["name"] == "verification" and r["app_id"] == ACTIONS_APP
             and r["conclusion"] == "success"]
@@ -381,8 +391,9 @@ def held_p4(rec, first, app):
             return False, "the fake verification was never green in the window"
         if gate_run(w, app):
             return False, "window missed: the gate had already posted"
-        if w["merge"]["rc"] == 0:
-            return False, "merged in the window on the fake check alone"
+        held, why = refused_by_gate(w)
+        if not held:
+            return False, why
     if name == "P4c-rerun":
         if (rec.get("rerun") or {}).get("rc") != 0:
             return False, "the fake was not re-run: " + str((rec.get("rerun") or {}).get("out"))[:200]
@@ -437,8 +448,9 @@ def judge(rec):
         elif not merged:
             return False, "expected the merge to succeed: " + first["merge"]["out"]
     else:
-        if merged:
-            return False, "merged although the attack should be refused"
+        held, why = refused_by_gate(first)
+        if not held:
+            return False, why
         if spec.get("review_blocks") and not any(f["call"] == "bugs" and f["severity"] == "P0"
                                                  for g in gates for f in (parse_text(g.get("text")) or {}).get("findings", [])):
             return False, "the review itself did not block"
@@ -453,10 +465,14 @@ def judge(rec):
         early, late = steps[1], steps[2]
         if early["merge"]["rc"] == 0:
             return False, "merged right after the push, before the new head was verified"
+        if early["pr"]["mergeStateStatus"] == "DIRTY":
+            return False, "right-after-push: refused for a merge conflict, not by the gate; re-run on a stable base"
         late_gates = gate_run(late, app)
         want = rec["then_spec"]["expect"]
-        if want == "block" and late["merge"]["rc"] == 0:
-            return False, "second head merged although it should be refused"
+        if want == "block":
+            held, why = refused_by_gate(late)
+            if not held:
+                return False, why
         if "tiers" in rec["then_spec"] and not any((g["title"] or "").startswith(rec["then_spec"]["tiers"] + " ") for g in late_gates):
             return False, f"second head not re-tiered to {rec['then_spec']['tiers']}"
     return True, "held"
@@ -530,14 +546,18 @@ def main():
     out = pathlib.Path(args.get("--out", f"evidence/{stamp}"))
     out.mkdir(parents=True, exist_ok=True)
     from concurrent.futures import ThreadPoolExecutor
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        futures = {n: pool.submit(run_attack, repo, base, n, ATTACKS[n], stamp, app) for n in only}
-        for n, fut in futures.items():
-            try:
-                rec = fut.result()
-            except Exception as e:  # an attack that could not be staged is a failed run, never a silent skip
-                rec = {"attack": n, "spec": {"expect": "error"}, "steps": [], "error": str(e)}
-            (out / f"{n}.json").write_text(json.dumps(rec, indent=1))
+    # A row that merges changes the base under every PR still open, which then fails to merge for a conflict. So the
+    # merging rows go last, once every other PR is closed.
+    merging = [n for n in only if ATTACKS[n]["expect"] == "pass" and "then" not in ATTACKS[n]]
+    for wave in ([n for n in only if n not in merging], merging):
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {n: pool.submit(run_attack, repo, base, n, ATTACKS[n], stamp, app) for n in wave}
+            for n, fut in futures.items():
+                try:
+                    rec = fut.result()
+                except Exception as e:  # an attack that could not be staged is a failed run, never a silent skip
+                    rec = {"attack": n, "spec": {"expect": "error"}, "steps": [], "error": str(e)}
+                (out / f"{n}.json").write_text(json.dumps(rec, indent=1))
     ok = all((json.loads(f.read_text()).get("error") is None) for f in out.glob("*.json")) and verdict(out)
     sys.exit(0 if ok else 1)
 
