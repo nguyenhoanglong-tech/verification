@@ -14,12 +14,20 @@ proves nothing; the ruleset requires the gate App's (chrislongnguyen/dotfiles#33
 
 Each gate run writes one verdict record (`engine/verdict.py`) into the `verification` check run's output
 text: head and base SHA, tiers, mode, `verdict` (PASS, FAIL or ERROR), the Spec switch, machine check
-results, every review finding with its P0 or P1 severity, the Spec table, cost and budget state. The sticky
+results, every review finding with its P0 or P1 severity, the security pass under its own `security` key
+(null when not owed), the Spec table, cost and budget state. The sticky
 rule, the budget pace and the dotfiles finding log read that record.
 
-The review (`engine/claude-job`) makes two calls at most: `/code-review` on the diff, then the Spec call when
-the PR closes an issue whose done-when section existed when the PR opened. The head's files and diff are
-copied out of the working directory and read as data.
+The review (`engine/claude-job`) makes three calls at most: `/code-review` on the diff; the security call when
+the PR touches a `[tiers] risk` path of the base toml (or the file list is cut short); then the Spec call when the
+PR closes an issue whose done-when section existed when the PR opened. The head's files and diff are copied out of
+the working directory and read as data.
+
+The security call (dotfiles#3408) runs `engine/prompts/security.md` in the same sandbox, on the same route and with
+the same finding schema as the Bugs call. Its P0 fails the gate, and its error is an ERROR. A risk-path run whose
+review returns no security result is an ERROR too. It is not Claude Code's `/security-review`: that command runs
+`git status` and `git diff` through Bash before any model call, and this sandbox gives the model only Read. On CLI
+2.1.326 both routes stop with "Permission to use Bash has been denied" and send no request.
 
 Each call is billed to the API or to the Claude subscription (D18). The tier job picks the route from the base
 toml and this month's records:
@@ -32,7 +40,7 @@ toml and this month's records:
 
 `--bare` reads no OAuth token, so the subscription call rebuilds its isolation; `tests/test_isolation.py` runs
 the pinned CLI on both routes against a fake API and checks that the head's config, the secret dir and the
-process env never reach the model, and that both routes send the same system prompt and tools, for the Bugs and the Spec call. An API call
+process env never reach the model, and that both routes send the same system prompt and tools, for the Bugs, the security and the Spec call. An API call
 refused by the spend limit or for credit is retried once on the subscription when that route may run. A
 rejected subscription token is an ERROR, never a budget skip. Both routes Read the base checkout by its own path,
 and the prompts name that path. The record's `refused` says when the API refused a call (`api spend limit` or

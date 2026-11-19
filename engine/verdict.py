@@ -118,16 +118,21 @@ def spec_findings(spec: dict | None) -> list[dict]:
                   for n, item in enumerate(spec.get("sent", []), 1) if n not in judged]
 
 
-def decide(*, head_sha, base_sha, tiers, mode, switch_spec, machine, review, budget, errors, prior) -> dict:
+def decide(*, head_sha, base_sha, tiers, mode, switch_spec, machine, review, budget, errors, prior,
+           security_owed=False) -> dict:
     """Build the record. mode is "shadow" or "enforce"; post() settles it with fallback_mode when the tier job could not.
 
-    machine: [{name, result: pass|fail}]. review: None when no review ran, else {findings, spec, cost_usd, billing,
-    subscription_cost_usd}. cost_usd is API spend only; a subscription call's cost is notional and kept apart.
+    machine: [{name, result: pass|fail}]. review: None when no review ran, else {findings, security, spec, cost_usd,
+    billing, subscription_cost_usd}. cost_usd is API spend only, every call included; a subscription call's cost is
+    notional and kept apart. security_owed: the PR touches a risk path, so the record carries a security entry
+    {ran, findings, cost_usd, subscription_cost_usd}; it is None when the pass is not owed.
     errors: why this run could not judge (job failures, review errors). prior: verdicts of earlier runs on this head.
     """
     findings = list((review or {}).get("findings", [])) + spec_findings((review or {}).get("spec"))
-    fail = (any(m["result"] != "pass" for m in machine) or any(f["severity"] == "P0" for f in findings)
-            or "FAIL" in prior)
+    security = (review or {}).get("security") or (
+        {"ran": False, "findings": [], "cost_usd": 0.0, "subscription_cost_usd": 0.0} if security_owed else None)
+    fail = (any(m["result"] != "pass" for m in machine) or "FAIL" in prior
+            or any(f["severity"] == "P0" for f in findings + (security or {}).get("findings", [])))
     verdict = "FAIL" if fail else "ERROR" if errors else "PASS"
     shadow = mode == "shadow"
     label = tiers or "tier unknown"
@@ -142,7 +147,8 @@ def decide(*, head_sha, base_sha, tiers, mode, switch_spec, machine, review, bud
     return {
         "schema": 1, "head_sha": head_sha, "base_sha": base_sha, "tier": tiers, "mode": mode,
         "verdict": verdict, "title": title, "switch_spec": bool(switch_spec), "machine": machine,
-        "findings": findings, "spec": (review or {}).get("spec"), "cost_usd": float((review or {}).get("cost_usd") or 0),
+        "findings": findings, "security": security, "spec": (review or {}).get("spec"),
+        "cost_usd": float((review or {}).get("cost_usd") or 0),
         "billing": (review or {}).get("billing"), "refused": (review or {}).get("refused"),
         "subscription_cost_usd": float((review or {}).get("subscription_cost_usd") or 0),
         "budget": budget, "error": "; ".join(errors) or None,
@@ -168,6 +174,9 @@ def summary(record: dict, stamp_text: str, reasons: str, run_url: str) -> str:
     lines = [f"Verified-by: {stamp_text} head={record['head_sha']}", "",
              f"verdict: {record['verdict']}", f"tiers: {record['tier']} ({reasons})", f"base: {record['base_sha']}",
              f"mode: {record['mode']}", f"spec call: {'yes' if record['switch_spec'] else 'no'}",
+             "security pass: " + ("not owed" if not record.get("security") else
+                                  f"ran, cost_usd {record['security']['cost_usd']:.4f}" if record["security"]["ran"]
+                                  else "owed, did not run"),
              f"billing: {record.get('billing') or 'none'}"
              + (f" (API refused: {record['refused']})" if record.get("refused") else ""),
              f"cost_usd: {record['cost_usd']:.4f}" + (f" (subscription, notional: {record['subscription_cost_usd']:.4f})"
@@ -181,9 +190,10 @@ def summary(record: dict, stamp_text: str, reasons: str, run_url: str) -> str:
              "machine: " + (" ".join(f"{m['name']}={m['result']}" for m in record["machine"]) or "none")]
     if record["error"]:
         lines.append(f"error: {record['error']}")
-    if record["findings"]:
+    findings = record["findings"] + (record.get("security") or {}).get("findings", [])
+    if findings:
         lines += ["", "findings:"] + [f"- [{f['severity']}] {f['call']} {f['file']}:{f['line'] or ''} {f['summary']}"
-                                      for f in record["findings"]]
+                                      for f in findings]
     if record["spec"]:
         lines += ["", f"spec: {record['spec'].get('answer')}", "| item | status | evidence |", "| --- | --- | --- |"]
         lines += [f"| {i['item']} | {i['status']} | {i.get('evidence', '')} |".replace("\n", " ") for i in record["spec"]["items"]]
@@ -204,8 +214,9 @@ def fit(record: dict) -> tuple[dict, str]:
     record = json.loads(json.dumps(record))
     record["trimmed"] = True
     spec = record.get("spec") or {}
+    lists = [record["findings"]] + ([record["security"]["findings"]] if record.get("security") else [])
     for cap in (2000, 500, 200, 80, 20):
-        for f in record["findings"]:
+        for f in (f for rows in lists for f in rows):
             f.update(summary=cut(f["summary"], cap), failure=cut(f.get("failure"), cap), file=cut(f.get("file"), max(cap, 200)))
         for i in spec.get("items", []):
             i.update(item=cut(i["item"], cap), evidence=cut(i.get("evidence"), cap))
@@ -216,9 +227,11 @@ def fit(record: dict) -> tuple[dict, str]:
         if len(text) <= LIMIT:
             return record, text
     dropped = 0
-    while len(text) > LIMIT and record["findings"]:
-        drop = max(1, len(record["findings"]) // 10)
-        record["findings"], dropped = record["findings"][:-drop], dropped + drop
+    while len(text) > LIMIT and any(lists):
+        rows = max(lists, key=len)
+        drop = max(1, len(rows) // 10)
+        del rows[-drop:]
+        dropped += drop
         record["findings_dropped"] = dropped
         text = render_text(record)
     return record, text
@@ -245,7 +258,7 @@ def from_needs(needs: dict, head_sha: str) -> tuple[dict, list[str], list[str]]:
         errors.append(out["error"])
     tier_ok = tier.get("result") == "success" and not out.get("error")
     # An output Actions dropped reads as empty. Each of these says what is owed, so a missing one is an ERROR.
-    missing = [k for k in ("mode", "has_checks", "review", "budget") if not out.get(k)]
+    missing = [k for k in ("mode", "has_checks", "review", "security", "budget") if not out.get(k)]
     if tier_ok and missing:
         errors.append("tier outputs missing: " + ", ".join(missing))
         tier_ok = False
@@ -299,9 +312,13 @@ def from_needs(needs: dict, head_sha: str) -> tuple[dict, list[str], list[str]]:
                 budget["spec_skipped"] = f"Spec call: {review['spec_skipped']}"
         if review and review.get("error"):
             errors.append(f"review: {review['error']}")
+        elif (review and out.get("security") == "true" and not review.get("budget_refused")
+              and not (review.get("security") or {}).get("ran")):
+            errors.append("review: the security pass is owed but did not run")
     mode = out.get("mode") if out.get("mode") in ("shadow", "enforce") else None
     inputs = dict(tiers=out.get("tiers", ""), base_sha=out.get("base_sha", ""), mode=mode,
-                  switch_spec=out.get("switch_spec") == "true", machine=machine, review=review, budget=budget)
+                  switch_spec=out.get("switch_spec") == "true", machine=machine, review=review, budget=budget,
+                  security_owed=tier_ok and out.get("security") == "true")
     return inputs, ran, errors
 
 

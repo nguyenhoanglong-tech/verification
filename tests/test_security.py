@@ -112,5 +112,49 @@ class Security(unittest.TestCase):
         self.assertIsNone(judge(review_main("false")[0], security="false").get("security"), "not owed: no pass")
 
 
+class Edges(unittest.TestCase):
+    def test_a_spend_refusal_on_the_security_call_is_a_budget_skip_that_says_the_pass_did_not_run(self):
+        refused = reply("API Error: 400 You have reached your specified API usage limits.", 0)
+        with mock.patch.object(review, "reroute", return_value=(None, "API spend limit refused the call")):
+            out, calls = review_main("true", sec_reply=refused)
+        self.assertEqual((calls, out["budget_refused"], out["security"]["ran"]), (["bugs", "security"], True, False))
+        record = judge(out)
+        self.assertEqual((record["verdict"], record["budget"]["skipped"], record["security"]["ran"]), ("PASS", True, False))
+        self.assertTrue(record["title"].endswith("(review skipped: budget)"), record["title"])
+
+    def test_a_risk_path_review_skipped_for_budget_says_the_pass_was_owed(self):
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        spent = {"schema": 1, "verdict": "PASS", "budget": {"reviews_today": 5, "month_usd": 1.0}}
+        fake = fakes.GitHub(files=[f(".github/workflows/x.yml")], workflow_runs=[{"head_sha": "old", "created_at": now}],
+                            checks={"old": [fakes.check(1, spent, now)]})
+        with tempfile.NamedTemporaryFile("r", suffix=".out") as o, fakes.installed(fake, GITHUB_OUTPUT=o.name):
+            fakes.run(tier.github_main)
+            out = dict(line.split("=", 1) for line in Path(o.name).read_text().splitlines() if "=" in line)
+        self.assertEqual((out["review"], out["security"], out["skip"]), ("false", "true", "review skipped: budget"))
+        needs = {"start": {"result": "success", "outputs": {"base_sha": "b"}},
+                 "tier": {"result": "success", "outputs": out},
+                 "checks": {"result": "skipped", "outputs": {}}, "review": {"result": "skipped", "outputs": {}}}
+        inputs, _, errors = verdict.from_needs(needs, "h")
+        record = verdict.decide(head_sha="h", errors=errors, prior=[], **inputs)
+        self.assertEqual((record["verdict"], record["budget"]["skipped"], record["security"]["ran"], errors),
+                         ("PASS", True, False, []))
+
+    def test_a_long_security_report_is_trimmed_and_still_fails(self):
+        out, _ = review_main("true")
+        out["security"]["findings"] = [{**out["security"]["findings"][0], "summary": "x" * 3000}] * 60
+        record = judge(out)
+        self.assertEqual(record["verdict"], "FAIL")
+        self.assertTrue(record.get("trimmed"))
+        self.assertLessEqual(len(verdict.render_text(record)), verdict.LIMIT)
+        self.assertEqual(verdict.parse_text(verdict.render_text(record))["security"]["ran"], True)
+
+    def test_the_workflow_passes_the_decision_from_the_tier_job_to_the_review_step(self):
+        gate = (ROOT / ".github/workflows/gate.yml").read_text()
+        action = (ROOT / "engine/claude-job/action.yml").read_text()
+        self.assertIn("security: ${{ steps.t.outputs.security }}", gate)
+        self.assertIn("security: ${{ needs.tier.outputs.security }}", gate)
+        self.assertIn("SECURITY: ${{ inputs.security }}", action)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -59,6 +59,7 @@ class Result:
     code_lines: int
     reasons: list[str] = field(default_factory=list)
     prompt_files: list[str] = field(default_factory=list)
+    security: bool = False  # a risk path is touched, or the file list is cut short: the security pass is owed
 
 
 def classify(files: list[dict], rules: dict, truncated: bool = False) -> Result:
@@ -97,7 +98,7 @@ def classify(files: list[dict], rules: dict, truncated: bool = False) -> Result:
     if not tiers:
         tiers.append("T0")
         reasons.append("docs only")
-    return Result(tiers, code_lines, reasons, prompt_files)
+    return Result(tiers, code_lines, reasons, prompt_files, bool(risk_files) or truncated)
 
 
 class ConfigError(Exception):
@@ -277,6 +278,7 @@ def tier_outputs(repo: str, base_sha: str, head_sha: str, base_ref: str, config:
         "code_lines": str(result.code_lines),
         "reasons": "; ".join(result.reasons),
         "review": "true" if review else "false",
+        "security": "true" if result.security else "false",
         "skip": skip,
         "switch_spec": "true" if spec else "false",
         "spec_text": json.dumps(spec),

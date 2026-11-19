@@ -201,7 +201,7 @@ class MonthRecords(unittest.TestCase):
 class Needs(unittest.TestCase):
     def needs(self, review_result, review_flag="true"):
         tier = {"base_sha": "b", "mode": "shadow", "tiers": "T1", "has_checks": "true", "review": review_flag,
-                "budget": json.dumps(BUDGET), "switch_spec": "false"}
+                "security": "false", "budget": json.dumps(BUDGET), "switch_spec": "false"}
         tier["checks"] = f"{base64.b64encode(b'unit').decode()}:{base64.b64encode(b'true').decode()}"
         return {"start": {"result": "success", "outputs": {"base_sha": "b"}},
                 "tier": {"result": "success", "outputs": tier},
@@ -280,7 +280,7 @@ class Post(unittest.TestCase):
 
     def needs(self, tier=None, tier_result="success", start=None, review=None):
         tier = {"base_sha": "b", "mode": "shadow", "tiers": "T1", "has_checks": "false", "budget": json.dumps(BUDGET),
-                "review": "true" if review else "false", "switch_spec": "false", **(tier or {})} if tier_result == "success" else {}
+                "review": "true" if review else "false", "security": "false", "switch_spec": "false", **(tier or {})} if tier_result == "success" else {}
         return {"start": start or {"result": "success", "outputs": {"base_sha": "b"}},
                 "tier": {"result": tier_result, "outputs": tier},
                 "checks": {"result": "skipped", "outputs": {}},

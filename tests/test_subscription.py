@@ -106,7 +106,7 @@ class Judge(unittest.TestCase):
     def judge(self, review_result, prior=totals(3, 30.0, 4), budget_extra=None):
         budget = {**CAPS, "skipped": False, **(budget_extra or {})}
         tier_out = {"base_sha": "b", "mode": "shadow", "tiers": "T1", "has_checks": "false", "review": "true",
-                    "budget": json.dumps(budget), "switch_spec": "false", "reasons": "r"}
+                    "security": "false", "budget": json.dumps(budget), "switch_spec": "false", "reasons": "r"}
         needs = {"start": {"result": "success", "outputs": {"base_sha": "b"}},
                  "tier": {"result": "success", "outputs": tier_out},
                  "checks": {"result": "skipped", "outputs": {}},
