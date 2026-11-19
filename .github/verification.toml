@@ -4,6 +4,8 @@ enforce_branches = ["verify/attack-base"]
 allowed_bots = []
 # The attack suite stages about 13 reviewed heads in one run; the default 5 a day would skip its reviews.
 reviews_per_day = 50
+# Temporary, for the #3308 budget proof: at or below the $0.3829 already recorded this month.
+budget_month_usd = 0.38
 
 [anthropic]
 federation_rule_id = "fdrl_01WTdkUmqUXTurXtkDaerJwR"
