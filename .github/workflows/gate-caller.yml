@@ -1,0 +1,16 @@
+# Test only (dotfiles#3383): runs the real gate@dev on this throwaway base, because the pull_request_target caller on main lists only verify/attack-base.
+name: gate-caller
+on: pull_request
+permissions: {}
+jobs:
+  verification:
+    permissions:
+      actions: read
+      contents: read
+      checks: write
+      issues: read
+      pull-requests: write
+      id-token: write
+    uses: nguyenhoanglong-tech/verification/.github/workflows/gate.yml@dev
+    with:
+      engine_ref: dev
