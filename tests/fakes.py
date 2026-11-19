@@ -10,20 +10,25 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "engine"))
 import github  # noqa: E402
-from verdict import ACTIONS_APP, render_text  # noqa: E402
+from verdict import render_text  # noqa: E402
+
+GATE_APP = 777
+CUTOVER = 50
 
 ENV = {"GITHUB_REPOSITORY": "o/r", "HEAD_SHA": "h", "BASE_SHA": "b", "BASE_REF": "dev", "PR_NUMBER": "1",
        "RUN_URL": "https://example.invalid/run", "GITHUB_RUN_ID": "4242", "GITHUB_RUN_ATTEMPT": "2",
-       "GITHUB_WORKFLOW_REF": "o/r/.github/workflows/caller.yml@refs/heads/main"}
+       "GITHUB_WORKFLOW_REF": "o/r/.github/workflows/caller.yml@refs/heads/main",
+       "GATE_APP_ID": str(GATE_APP), "LEGACY_CUTOVER": str(CUTOVER), "GH_TOKEN": "actions-token", "GATE_TOKEN": "app-token"}
 
 
 def http_error(code: int) -> urllib.error.HTTPError:
     return urllib.error.HTTPError("https://api.github.com/x", code, "fake", {}, io.BytesIO(b""))
 
 
-def check(id: int, record: dict | None, completed_at="2026-11-18T10:00:00Z", status="completed", conclusion="neutral") -> dict:
+def check(id: int, record: dict | None, completed_at="2026-11-18T10:00:00Z", status="completed", conclusion="neutral",
+          app=GATE_APP) -> dict:
     return {"id": id, "status": status, "conclusion": conclusion, "completed_at": completed_at,
-            "app": {"id": ACTIONS_APP}, "output": {"text": render_text(record) if record else None}}
+            "app": {"id": app}, "output": {"text": render_text(record) if record else None}}
 
 
 class GitHub:
@@ -33,9 +38,12 @@ class GitHub:
         self.workflow_runs = list(workflow_runs)
         self.fail = fail or {}                # "METHOD path-fragment" -> exceptions raised in turn
         self.calls = []
+        self.tokens = []                      # the token each check-run write was sent with
 
-    def api(self, path, method="GET", body=None, raw=False):
+    def api(self, path, method="GET", body=None, raw=False, token=None):
         self.calls.append((method, path, body))
+        if method in ("PATCH", "POST") and "check-runs" in path:
+            self.tokens.append(token or os.environ["GH_TOKEN"])
         for key, errors in self.fail.items():
             verb, frag = key.split(" ", 1)
             if verb == method and frag in path and errors:

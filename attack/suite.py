@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Attack suite for the verification gate: one command, GitHub's own records as the judge.
 
-  suite.py run --repo OWNER/NAME [--base verify/attack-base] [--only P1,P2] [--out DIR]
+  suite.py run --repo OWNER/NAME --app ID [--base verify/attack-base] [--only P1,P2] [--out DIR]
   suite.py verdict DIR            # re-score saved records; exit 1 if any attack is not held
-  suite.py selftest DIR           # plant a bad record in a copy of DIR; the verdict must fail
+  suite.py selftest DIR           # plant bad records in a copy of DIR; the verdict must fail on each
 
 Each attack opens a PR into a base branch guarded by a ruleset that requires the `verification`
-check from GitHub Actions (app 15368). The base must carry the sandbox (verify-attack/) and a
+check from the gate App (--app, its id). The base must carry the sandbox (verify-attack/) and a
 verification.toml whose scripted check runs verify-attack/test_calc.py.
 """
 import base64
@@ -22,8 +22,9 @@ import time
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "engine"))
 from verdict import parse_text  # noqa: E402
 
-ACTIONS_APP = 15368
+ACTIONS_APP = 15368  # GitHub Actions: every workflow posts as this app, the PR's own fakes included
 CALC = "verify-attack/calc.py"
+REFUSED = "not allowed to deploy"
 
 BUG = '''
 
@@ -68,6 +69,71 @@ jobs:
       - run: exit 0
 """
 
+FAKE_PUSH = FAKE.replace("on: pull_request", "on: push")
+# P4f: head code that names the gate's environment, directly and through a pull_request caller of gate.yml.
+STEAL = """name: steal
+on: [push, pull_request]
+permissions: {}
+jobs:
+  steal:
+    runs-on: ubuntu-latest
+    environment: verification-gate
+    steps:
+      - env:
+          K: ${{ secrets.VERIFICATION_APP_KEY }}
+        run: echo "secret_len=${#K}"
+"""
+HEAD_CALLER = """name: head-caller
+on: pull_request
+permissions: {}
+jobs:
+  verification:
+    permissions:
+      actions: read
+      contents: read
+      checks: read
+      issues: read
+      pull-requests: write
+      id-token: write
+    uses: @REPO@/.github/workflows/gate.yml@dev
+    with:
+      engine_ref: dev
+      app_id: "@APP@"
+    secrets:
+      VERIFICATION_APP_KEY: ${{ secrets.VERIFICATION_APP_KEY }}
+"""
+# P4g: a head job holding checks: write as GitHub Actions waits for the gate App's check and PATCHes it green. The
+# control PATCHes a run the job made itself. It reports HTTP codes in a p4g-result check run's title.
+EDIT = """name: edit
+on: pull_request
+permissions: {}
+jobs:
+  edit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      checks: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set +e
+          R=$GITHUB_REPOSITORY
+          for i in $(seq 1 120); do
+            target=$(gh api "repos/$R/commits/$SHA/check-runs?check_name=verification&filter=all" \\
+              --jq '[.check_runs[] | select(.app.id == @APP@ and .status == "completed")][0].id // empty')
+            [ -n "$target" ] && break
+            sleep 10
+          done
+          code() { gh api -X PATCH "$1" -f status=completed -f conclusion=success --include 2>&1 | head -1 | cut -d' ' -f2; }
+          control=$(gh api "repos/$R/check-runs" -f name=p4g-control -f head_sha="$SHA" -f status=completed -f conclusion=failure --jq .id)
+          c=$(code "repos/$R/check-runs/$control")
+          t=none; [ -n "$target" ] && t=$(code "repos/$R/check-runs/$target")
+          gh api "repos/$R/check-runs" -f name=p4g-result -f head_sha="$SHA" -f status=completed -f conclusion=neutral \\
+            -f "output[title]=target=${target:-none} patch=$t control=$c" -f "output[summary]=P4g: PATCH of the gate App check as GitHub Actions."
+"""
+
 # Each attack: files to write (path -> content or callable(old) -> new), extra actions, and the pass line.
 ATTACKS = {
     "P1": dict(title="clean T1 change", files={CALC: lambda o: o + CLEAN}, expect="pass", tiers="T1"),
@@ -80,6 +146,15 @@ ATTACKS = {
                 expect="block", after=["checkrun"]),
     "P4c": dict(title="head adds a pull_request job named verification", expect="block",
                 files={CALC: lambda o: o + BREAK, ".github/workflows/fake.yml": FAKE}),
+    "P4c-window": dict(title="fake verification on push, merged before the gate posts", expect="block",
+                       files={CALC: lambda o: o + BREAK, ".github/workflows/fake.yml": FAKE_PUSH}, after=["window"]),
+    "P4c-rerun": dict(title="fake verification re-run after the gate finishes", expect="block",
+                      files={CALC: lambda o: o + BREAK, ".github/workflows/fake.yml": FAKE}, late=["rerun_fake"]),
+    "P4f": dict(title="head jobs name the gate environment to read the App key", expect="block",
+                files={CALC: lambda o: o + BREAK, ".github/workflows/steal.yml": STEAL,
+                       ".github/workflows/head-caller.yml": HEAD_CALLER}, late=["p4f"]),
+    "P4g": dict(title="head job with checks: write edits the gate App's check", expect="block",
+                files={CALC: lambda o: o + BREAK, ".github/workflows/edit.yml": EDIT}, late=["p4g"]),
     "P5": dict(title="docs only, then a code push", files={"verify-attack/NOTES.md": "Docs only.\n"},
                expect="pass", tiers="T0", then=dict(files={CALC: lambda o: o + BREAK}, expect="block", tiers="T1")),
     "P6": dict(title="push after green", files={CALC: lambda o: o + CLEAN.replace("sub", "sub2")}, expect="pass",
@@ -110,14 +185,14 @@ def api(path, *fields, method=None):
     return json.loads(gh(*args).stdout or "null")
 
 
-def write_files(repo, branch, files):
+def write_files(repo, branch, files, app=None):
     for path, content in files.items():
         cur = gh("api", f"repos/{repo}/contents/{path}?ref={branch}", check=False)
         old, sha = "", None
         if cur.returncode == 0:
             d = json.loads(cur.stdout)
             old, sha = base64.b64decode(d["content"]).decode(), d["sha"]
-        new = content(old) if callable(content) else content
+        new = content(old) if callable(content) else content.replace("@REPO@", repo).replace("@APP@", str(app))
         fields = [f"message=attack: {path}", f"branch={branch}", "content=" + base64.b64encode(new.encode()).decode()]
         if sha:
             fields.append(f"sha={sha}")
@@ -125,11 +200,11 @@ def write_files(repo, branch, files):
     return api(f"repos/{repo}/branches/{branch}")["commit"]["sha"]
 
 
-def wait_verification(repo, sha, timeout=1800):
+def wait_verification(repo, sha, app, timeout=1800):
     end = time.time() + timeout
     while time.time() < end:
         runs = api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100")["check_runs"]
-        mine = [r for r in runs if r["name"] == "verification" and r["app"]["id"] == ACTIONS_APP and r["status"] == "completed"]
+        mine = [r for r in runs if r["name"] == "verification" and r["app"]["id"] == app and r["status"] == "completed"]
         busy = [r for r in runs if r["name"].startswith("verification /") and r["status"] != "completed"]
         if mine and not busy:
             return
@@ -147,7 +222,7 @@ def snapshot(repo, pr, label):
     runs = api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100")["check_runs"]
     statuses = api(f"repos/{repo}/commits/{sha}/statuses?per_page=100")
     return {"label": label, "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "pr": pv,
-            "check_runs": [{"name": r["name"], "conclusion": r["conclusion"], "status": r["status"], "head_sha": r["head_sha"],
+            "check_runs": [{"id": r["id"], "name": r["name"], "conclusion": r["conclusion"], "status": r["status"], "head_sha": r["head_sha"],
                             "app_id": r["app"]["id"], "title": (r.get("output") or {}).get("title"),
                             "text": (r.get("output") or {}).get("text"),
                             "summary": (r.get("output") or {}).get("summary"), "url": r["html_url"]} for r in runs],
@@ -159,15 +234,58 @@ def try_merge(repo, pr):
     return {"rc": r.returncode, "out": (r.stdout + r.stderr).strip()[:500]}
 
 
-def run_attack(repo, base, name, spec, stamp):
+def runs_of(repo, sha, path):
+    """The Actions runs on this head from one workflow file, with each job and the annotations on it."""
+    out = []
+    for r in api(f"repos/{repo}/actions/runs?head_sha={sha}&per_page=100")["workflow_runs"]:
+        if r["path"] != path:
+            continue
+        jobs = [{"name": j["name"], "status": j["status"], "conclusion": j["conclusion"],
+                 "annotations": [a["message"] for a in api(f"repos/{repo}/check-runs/{j['id']}/annotations")]}
+                for j in api(f"repos/{repo}/actions/runs/{r['id']}/jobs")["jobs"]]
+        out.append({"id": r["id"], "event": r["event"], "status": r["status"], "jobs": jobs})
+    return out
+
+
+def wait_runs(repo, sha, paths, timeout=900):
+    end = time.time() + timeout
+    while time.time() < end:
+        found = {p: runs_of(repo, sha, p) for p in paths}
+        if all(found.values()) and all(r["status"] == "completed" for rs in found.values() for r in rs):
+            return found
+        time.sleep(15)
+    return found
+
+
+def posters(repo, step, app):
+    """For each gate App `verification` check: the workflow file and event of the Actions run its record names."""
+    out = []
+    for g in gate_run(step, app):
+        run_id = (parse_text(g.get("text")) or {}).get("run_id")
+        r = api(f"repos/{repo}/actions/runs/{run_id}") if run_id else {}
+        out.append({"check": g["id"], "run_id": run_id, "path": r.get("path"), "event": r.get("event")})
+    return out
+
+
+def wait_check(repo, sha, name, timeout=1800):
+    end = time.time() + timeout
+    while time.time() < end:
+        if any(r["name"] == name and r["status"] == "completed"
+               for r in api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100")["check_runs"]):
+            return
+        time.sleep(15)
+
+
+def run_attack(repo, base, name, spec, stamp, app):
     branch = f"verify/attack-{name.lower()}-{stamp}"
     base_sha = api(f"repos/{repo}/branches/{base}")["commit"]["sha"]
     api(f"repos/{repo}/git/refs", f"ref=refs/heads/{branch}", f"sha={base_sha}", method="POST")
-    sha = write_files(repo, branch, spec["files"])
+    sha = write_files(repo, branch, spec["files"], app)
     url = gh("pr", "create", "-R", repo, "--base", base, "--head", branch, "--title", f"attack {name}: {spec['title']} (throwaway)",
              "--body", "Throwaway attack PR from the verification attack suite.").stdout.strip()
     pr = int(url.rsplit("/", 1)[1])
-    record = {"attack": name, "spec": {k: v for k, v in spec.items() if k not in ("files", "then")}, "steps": []}
+    record = {"attack": name, "gate_app": app, "spec": {k: v for k, v in spec.items() if k not in ("files", "then")},
+              "steps": []}
     for action in spec.get("after", []):
         if action == "status":
             r = gh("api", f"repos/{repo}/statuses/{sha}", "-f", "state=success", "-f", "context=verification", check=False)
@@ -189,9 +307,39 @@ def run_attack(repo, base, name, spec, stamp):
                 time.sleep(10)
             record["cancelled_run"] = cancelled
             time.sleep(60)
+        if action == "window":
+            # The #47 shape: the fake is green and the gate has not posted yet. Merge right then.
+            for _ in range(100):
+                runs = api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100")["check_runs"]
+                if any(r["name"] == "verification" and r["app"]["id"] == ACTIONS_APP and r["conclusion"] == "success" for r in runs):
+                    break
+                time.sleep(3)
+            record["window"] = snapshot(repo, pr, "window")
+            record["window"]["merge"] = try_merge(repo, pr)
     if "cancel" not in spec.get("after", []):
-        wait_verification(repo, sha)
+        wait_verification(repo, sha, app)
+    for action in spec.get("late", []):
+        if action == "rerun_fake":
+            fake = [r for r in api(f"repos/{repo}/actions/runs?head_sha={sha}&per_page=100")["workflow_runs"]
+                    if r["path"] == ".github/workflows/fake.yml"]
+            r = gh("run", "rerun", str(fake[0]["id"]), "-R", repo, check=False) if fake else None
+            record["rerun"] = {"run": fake[0]["id"] if fake else None, "rc": r.returncode if r else None,
+                               "out": (r.stdout + r.stderr)[:300] if r else "no fake run on the head"}
+            for _ in range(60 if fake else 0):
+                time.sleep(10)
+                runs = api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100")["check_runs"]
+                gates = [r["id"] for r in runs if r["name"] == "verification" and r["app"]["id"] == app]
+                fakes = [r["id"] for r in runs if r["name"] == "verification" and r["app"]["id"] == ACTIONS_APP
+                         and r["conclusion"] == "success"]
+                if gates and fakes and max(fakes) > max(gates):
+                    break
+        if action == "p4f":
+            record["p4f_runs"] = wait_runs(repo, sha, [".github/workflows/steal.yml", ".github/workflows/head-caller.yml"])
+        if action == "p4g":
+            wait_check(repo, sha, "p4g-result")
     step = snapshot(repo, pr, "first")
+    if "p4f" in spec.get("late", []):
+        record["posters"] = posters(repo, step, app)
     then = spec.get("then")
     # A head that is followed by a push stays open: its pass shows as a mergeable PR, not a merge.
     step["merge"] = {"rc": None, "out": "not attempted: a push follows"} if then else try_merge(repo, pr)
@@ -203,7 +351,7 @@ def run_attack(repo, base, name, spec, stamp):
         early = snapshot(repo, pr, "right-after-push")
         early["merge"] = try_merge(repo, pr)
         record["steps"].append(early)
-        wait_verification(repo, sha2)
+        wait_verification(repo, sha2, app)
         late = snapshot(repo, pr, "second")
         late["merge"] = try_merge(repo, pr)
         record["steps"].append(late)
@@ -214,10 +362,57 @@ def run_attack(repo, base, name, spec, stamp):
     return record
 
 
-def gate_run(step):
-    runs = [r for r in step["check_runs"] if r["name"] == "verification" and r["app_id"] == ACTIONS_APP
+def gate_run(step, app):
+    return [r for r in step["check_runs"] if r["name"] == "verification" and r["app_id"] == app
             and r["head_sha"] == step["pr"]["headRefOid"]]
-    return runs
+
+
+def fakes_green(step):
+    return [r for r in step["check_runs"] if r["name"] == "verification" and r["app_id"] == ACTIONS_APP
+            and r["conclusion"] == "success"]
+
+
+def held_p4(rec, first, app):
+    """The P4c-window, P4c-rerun, P4f and P4g pass lines: the attack fired, and the gate App's check held."""
+    name = rec["attack"]
+    if name == "P4c-window":
+        w = rec.get("window")
+        if not w or not fakes_green(w):
+            return False, "the fake verification was never green in the window"
+        if gate_run(w, app):
+            return False, "window missed: the gate had already posted"
+        if w["merge"]["rc"] == 0:
+            return False, "merged in the window on the fake check alone"
+    if name == "P4c-rerun":
+        if (rec.get("rerun") or {}).get("rc") != 0:
+            return False, "the fake was not re-run: " + str((rec.get("rerun") or {}).get("out"))[:200]
+        gates, fakes = gate_run(first, app), fakes_green(first)
+        if not gates or not fakes or max(f["id"] for f in fakes) < max(g["id"] for g in gates):
+            return False, "no green fake newer than the gate's check"
+    if name == "P4f":
+        jobs = [j for path, runs in (rec.get("p4f_runs") or {}).items() for r in runs for j in r["jobs"]
+                if j["name"] == "steal" or j["name"].endswith("/ gate")]
+        events = {r["event"] for r in (rec.get("p4f_runs") or {}).get(".github/workflows/steal.yml", [])}
+        if not any(j["name"].endswith("/ gate") for j in jobs) or events != {"push", "pull_request"}:
+            return False, f"not every environment attack ran: steal events {sorted(events)}, jobs {[j['name'] for j in jobs]}"
+        for j in jobs:
+            if j["conclusion"] == "success" or not any(REFUSED in a for a in j["annotations"]):
+                return False, f"{j['name']} was not refused the environment: {j['conclusion']} {j['annotations'][:2]}"
+        if not rec.get("posters"):
+            return False, "the real gate posted no check to compare against"
+        for p in rec["posters"]:
+            if (p["path"], p["event"]) != (".github/workflows/selftest.yml", "pull_request_target"):
+                return False, f"a gate App check the real gate did not post: {p}"
+    if name == "P4g":
+        result = [r for r in first["check_runs"] if r["name"] == "p4g-result"]
+        title = dict(kv.split("=", 1) for kv in (result[0]["title"] if result else "").split() if "=" in kv)
+        if title.get("target", "none") == "none" or title.get("control") != "200":
+            return False, f"the attack did not fire: {title or 'no p4g-result'}"
+        if title.get("patch") not in ("403", "404"):
+            return False, f"PATCH of the gate App check returned {title.get('patch')}"
+        if any(g["conclusion"] == "success" for g in gate_run(first, app)):
+            return False, "the gate App check reads success"
+    return True, "held"
 
 
 def judge(rec):
@@ -226,13 +421,14 @@ def judge(rec):
         return False, "attack could not be staged: " + str(rec.get("error"))[:200]
     spec, steps = rec["spec"], rec["steps"]
     first = steps[0]
-    gates = gate_run(first)
+    app = rec["gate_app"]
+    gates = gate_run(first, app)
     merged = first["merge"]["rc"] == 0
     if spec["expect"] == "block" and any(g["conclusion"] == "success" for g in gates):
         return False, "verification passed on a head that should be refused"
     if spec["expect"] == "pass":
         if not gates or any(g["conclusion"] != "success" for g in gates):
-            return False, "expected a passing verification from app 15368"
+            return False, f"expected a passing verification from the gate App {app}"
         if "tiers" in spec and not (gates[0]["title"] or "").startswith(spec["tiers"] + " "):
             return False, f"expected tiers {spec['tiers']}, got {gates[0]['title']}"
         if "then_spec" in rec:
@@ -250,11 +446,14 @@ def judge(rec):
             return False, f"expected tiers {spec['tiers']}, got {gates[0]['title']}"
         if rec["attack"] == "P4b" and rec.get("checkrun_post", {}).get("rc") == 0:
             return False, "a user token created a check run"
+        held, why = held_p4(rec, first, app)
+        if not held:
+            return False, why
     if "then_spec" in rec:
         early, late = steps[1], steps[2]
         if early["merge"]["rc"] == 0:
             return False, "merged right after the push, before the new head was verified"
-        late_gates = gate_run(late)
+        late_gates = gate_run(late, app)
         want = rec["then_spec"]["expect"]
         if want == "block" and late["merge"]["rc"] == 0:
             return False, "second head merged although it should be refused"
@@ -273,17 +472,46 @@ def verdict(directory):
     return ok
 
 
+def plant_merged(rec):
+    rec["steps"][0]["merge"] = {"rc": 0, "out": "planted: merged"}
+
+
+def plant_window_gate(rec):
+    rec["window"]["check_runs"] += [r for r in rec["steps"][0]["check_runs"]
+                                    if r["name"] == "verification" and r["app_id"] == rec["gate_app"]]
+
+
+def plant_patched(rec):
+    for r in rec["steps"][0]["check_runs"]:
+        if r["name"] == "p4g-result":
+            r["title"] = r["title"].replace("patch=403", "patch=200").replace("patch=404", "patch=200")
+
+
+def plant_env_job_ran(rec):
+    next(iter(rec["p4f_runs"].values()))[0]["jobs"][-1].update(conclusion="success", annotations=[])
+
+
+PLANTS = {"P2": plant_merged, "P4c-window": plant_window_gate, "P4g": plant_patched, "P4f": plant_env_job_ran}
+
+
 def selftest(directory):
-    with tempfile.TemporaryDirectory() as tmp:
-        for f in pathlib.Path(directory).glob("*.json"):
-            shutil.copy(f, tmp)
-        target = pathlib.Path(tmp) / "P2.json"
-        rec = json.loads(target.read_text())
-        bad = copy.deepcopy(rec)
-        bad["steps"][0]["merge"] = {"rc": 0, "out": "planted: merged"}
-        target.write_text(json.dumps(bad))
-        caught = not verdict(tmp)
-    print("selftest:", "the planted bad record made the verdict fail" if caught else "PLANTED RECORD NOT CAUGHT")
+    """Each plant alone must make the verdict fail; a plant whose record is absent is reported, never passed."""
+    caught = True
+    for name, plant in PLANTS.items():
+        source = pathlib.Path(directory) / f"{name}.json"
+        if not source.exists():
+            print(f"selftest: {name}: no record to plant in")
+            caught = False
+            continue
+        with tempfile.TemporaryDirectory() as tmp:
+            for f in pathlib.Path(directory).glob("*.json"):
+                shutil.copy(f, tmp)
+            bad = copy.deepcopy(json.loads(source.read_text()))
+            plant(bad)
+            (pathlib.Path(tmp) / source.name).write_text(json.dumps(bad))
+            ok = not verdict(tmp)
+        print(f"selftest: {name}:", "the planted bad record made the verdict fail" if ok else "PLANTED RECORD NOT CAUGHT")
+        caught &= ok
     return caught
 
 
@@ -296,14 +524,14 @@ def main():
     if cmd != "run":
         sys.exit(__doc__)
     args = dict(zip(sys.argv[2::2], sys.argv[3::2]))
-    repo, base = args["--repo"], args.get("--base", "verify/attack-base")
+    repo, base, app = args["--repo"], args.get("--base", "verify/attack-base"), int(args["--app"])
     only = args["--only"].split(",") if "--only" in args else list(ATTACKS)
     stamp = time.strftime("%m%d%H%M")
     out = pathlib.Path(args.get("--out", f"evidence/{stamp}"))
     out.mkdir(parents=True, exist_ok=True)
     from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=4) as pool:
-        futures = {n: pool.submit(run_attack, repo, base, n, ATTACKS[n], stamp) for n in only}
+        futures = {n: pool.submit(run_attack, repo, base, n, ATTACKS[n], stamp, app) for n in only}
         for n, fut in futures.items():
             try:
                 rec = fut.result()

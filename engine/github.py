@@ -6,13 +6,17 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timedelta
 
-from verdict import ACTIONS_APP, parse_text
+from verdict import parse_text
+
+# GitHub Actions. Every workflow posts as this app, a PR's own included, so its `verification` check counts only at or
+# below the caller's cut-over id: the gate's own checks from before the gate App (chrislongnguyen/dotfiles#3383).
+ACTIONS_APP = 15368
 
 
-def api(path: str, method: str = "GET", body: dict | None = None, raw: bool = False):
+def api(path: str, method: str = "GET", body: dict | None = None, raw: bool = False, token: str | None = None):
     url = path if path.startswith("https://") else f"{os.environ.get('GITHUB_API_URL', 'https://api.github.com')}/{path}"
     req = urllib.request.Request(url, method=method, data=json.dumps(body).encode() if body is not None else None, headers={
-        "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+        "Authorization": f"Bearer {token or os.environ['GH_TOKEN']}",
         "Accept": "application/vnd.github.raw" if raw else "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     })
@@ -28,12 +32,20 @@ def graphql(query: str, **variables) -> dict:
     return out["data"]
 
 
+def gate_posted(run: dict) -> bool:
+    """A `verification` check run the gate posted: the gate App's (GATE_APP_ID), or GitHub Actions' at or below
+    LEGACY_CUTOVER. A bad value raises, and every reader fails closed."""
+    app, cutover = (run.get("app") or {}).get("id"), int(os.environ.get("LEGACY_CUTOVER") or 0)
+    gate = os.environ.get("GATE_APP_ID", "")
+    return (gate.isdigit() and app == int(gate)) or (app == ACTIONS_APP and run["id"] <= cutover)
+
+
 def verification_runs(repo: str, sha: str) -> list[dict]:
-    """Every `verification` check run on this commit from GitHub Actions, the only app the ruleset trusts."""
+    """Every `verification` check run on this commit that the gate posted (gate_posted)."""
     runs, page = [], 1
     while True:
         got = api(f"repos/{repo}/commits/{sha}/check-runs?check_name=verification&filter=all&per_page=100&page={page}")
-        runs += [r for r in got["check_runs"] if (r.get("app") or {}).get("id") == ACTIONS_APP]
+        runs += [r for r in got["check_runs"] if gate_posted(r)]
         if len(got["check_runs"]) < 100:
             return runs
         page += 1
