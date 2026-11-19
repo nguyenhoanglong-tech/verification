@@ -178,7 +178,7 @@ class RunP7(unittest.TestCase):
             self.addCleanup(signal.signal, sig, signal.getsignal(sig))
 
     def run_stubbed(self, wait=lambda: None, write_files=lambda *a, **k: "s" * 40, snapshots=(), logs=review_logs,
-                    on_close=lambda: None):
+                    on_close=lambda: None, run_attempts=None):
         calls, tip, snaps, read = [], "m" * 40, iter(snapshots), []
 
         def gh(*args, input=None, check=True):
@@ -201,7 +201,9 @@ class RunP7(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as out, \
                 mock.patch.object(suite, "gh", gh), \
-                mock.patch.object(suite, "api", lambda path, *f, method=None: {"commit": {"sha": tip}}), \
+                mock.patch.object(suite, "api", lambda path, *f, method=None: {
+                    "commit": {"sha": tip}, "run_attempt": (run_attempts or {}).get(int(path.rsplit("/", 1)[1]), 1)
+                    if "/actions/runs/" in path else None}), \
                 mock.patch.object(suite, "write_files", write_files), \
                 mock.patch.object(suite, "wait_verification", lambda *a, **k: wait()), \
                 mock.patch.object(suite, "snapshot", lambda *a: copy.deepcopy(next(snaps))), \
@@ -224,6 +226,21 @@ class RunP7(unittest.TestCase):
                 self.assertEqual(r.read, [(99, 1), late])
                 self.assertEqual(len(suite.gate_run(r.saved["steps"][0], APP)), 2)
                 self.assertEqual(suite.judge(r.saved), (True, "held"))
+
+    def test_an_attempt_with_no_gate_record_is_read_too(self):
+        # Attempt 1's gate never posted, attempt 2's did: attempt 1's review job still ran the probe.
+        r = self.run_stubbed(snapshots=[gate_step((99, 2)), gate_step((99, 2))], run_attempts={99: 2})
+        self.assertEqual(r.read, [(99, 1), (99, 2)])
+
+    def test_two_runs_in_one_second_name_different_refs(self):
+        with mock.patch.object(suite.time, "strftime", lambda *a: "1119220000"), \
+                mock.patch.object(suite.os, "getpid", lambda: 111):
+            first = self.run_stubbed(write_files=lambda *a, **k: 1 / 0).rec
+        with mock.patch.object(suite.time, "strftime", lambda *a: "1119220000"), \
+                mock.patch.object(suite.os, "getpid", lambda: 222):
+            second = self.run_stubbed(write_files=lambda *a, **k: 1 / 0).rec
+        self.assertNotEqual(first["base"], second["base"])
+        self.assertNotEqual(first["head"], second["head"])
 
     def test_sigterm_mid_run_still_tears_down(self):
         r = self.run_stubbed(wait=lambda: (os.kill(os.getpid(), signal.SIGTERM), time.sleep(5)))  # the sleep waits for delivery
@@ -265,9 +282,22 @@ class JobLogs(unittest.TestCase):
             ok = args[1].endswith("/jobs/5/logs")
             return SimpleNamespace(stdout="review ran\n" if ok else '{"message":"Not Found"}', stderr="", returncode=0 if ok else 1)
 
-        with mock.patch.object(suite, "api", api), mock.patch.object(suite, "gh", gh):
+        with mock.patch.object(suite, "api", api), mock.patch.object(suite, "gh", gh), \
+                mock.patch.object(suite.time, "sleep", lambda s: None):
             logs = suite.job_logs("o/r", 99, 2)
         self.assertEqual(logs, {"job log 99/2/5 verification / review": "review ran\n", "job log 99/2/6 verification / tier": None})
+
+    def test_a_log_not_yet_archived_is_fetched_again(self):
+        jobs, tries = {"jobs": [{"id": 5, "name": "verification / review", "conclusion": "success"}]}, []
+
+        def gh(*args, check=True):
+            tries.append(args)
+            ok = len(tries) > 1
+            return SimpleNamespace(stdout="review ran\n" if ok else '{"message":"Not Found"}', stderr="", returncode=0 if ok else 1)
+
+        with mock.patch.object(suite, "api", lambda path, *f, method=None: jobs if "jobs" in path else {"status": "completed"}), \
+                mock.patch.object(suite, "gh", gh), mock.patch.object(suite.time, "sleep", lambda s: None):
+            self.assertEqual(suite.job_logs("o/r", 99, 1), {"job log 99/1/5 verification / review": "review ran\n"})
 
 
 class Toml(unittest.TestCase):

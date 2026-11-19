@@ -653,14 +653,22 @@ def job_logs(repo, run_id, attempt, timeout=600):
     jobs = api(f"{path}/jobs?per_page=100")["jobs"]
     # A skipped job never ran and has no log to download.
     # A job cancelled before it started has no log either; the judge needs the review job's own log to be non-blank.
-    logs = {f"job log {run_id}/{attempt}/{j['id']} {j['name']}": gh("api", f"repos/{repo}/actions/jobs/{j['id']}/logs", check=False)
-            for j in jobs if j["conclusion"] != "skipped"}
-    return {name: r.stdout if r.returncode == 0 else None for name, r in logs.items()}  # a failed fetch prints its error body
+    logs = {}
+    for j in jobs:
+        if j["conclusion"] == "skipped":
+            continue
+        for _ in range(4):  # a log can 404 for a short while after its run completes, until GitHub archives it
+            r = gh("api", f"repos/{repo}/actions/jobs/{j['id']}/logs", check=False)
+            if r.returncode == 0:
+                break
+            time.sleep(15)
+        logs[f"job log {run_id}/{attempt}/{j['id']} {j['name']}"] = r.stdout if r.returncode == 0 else None  # not the error body
+    return logs
 
 
 def run_p7(dotfiles, out):
     """P7: a T1 PR with a probe file, on a base whose API pace is 0, so the subscription pays the review. Never merges."""
-    repo, stamp = P7_REPO, time.strftime("%m%d%H%M%S")
+    repo, stamp = P7_REPO, f"{time.strftime('%m%d%H%M%S')}-{os.getpid()}"  # two runs in one second get their own refs
     base, head = f"verify/selftest/p7-{stamp}", f"selftest-pr/p7-{stamp}"
     rec = {"attack": "P7", "gate_app": None, "repo": repo, "base": base, "head": head,
            "spec": {"title": "subscription token leak", "expect": "no-leak"}, "steps": [], "sources": {}}
@@ -705,7 +713,13 @@ def run_p7(dotfiles, out):
             step = {**snapshot(repo, pr, "first"), "merge": {"rc": None, "out": "not attempted: P7 never merges"}}
             rec["steps"] = [step]
             records = [parse_text(g.get("text")) or {} for g in gate_run(step, app)]
-            runs = {(r.get("run_id"), r.get("run_attempt")) for r in records if r.get("run_id") and r.get("run_attempt")} - read
+            last = {}
+            for r in records:
+                if r.get("run_id"):
+                    last[r["run_id"]] = max(last.get(r["run_id"], 0), r.get("run_attempt") or 0)
+            # Every attempt of a gate run ran the review job, also one whose gate never posted a record.
+            runs = {(run_id, attempt) for run_id, n in last.items()
+                    for attempt in range(1, max(n, api(f"repos/{repo}/actions/runs/{run_id}")["run_attempt"]) + 1)} - read
             if not runs:
                 break
             for run_id, attempt in sorted(runs):
