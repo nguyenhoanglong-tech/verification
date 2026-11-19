@@ -14,12 +14,32 @@ proves nothing; the ruleset requires the gate App's (chrislongnguyen/dotfiles#33
 
 Each gate run writes one verdict record (`engine/verdict.py`) into the `verification` check run's output
 text: head and base SHA, tiers, mode, `verdict` (PASS, FAIL or ERROR), the Spec switch, machine check
-results, every review finding with its P0 or P1 severity, the Spec table, cost and budget state. The sticky
+results, every review finding with its P0 or P1 severity, the security pass under its own `security` key
+(null when not owed), the Spec table, cost and budget state. The sticky
 rule, the budget pace and the dotfiles finding log read that record.
 
-The review (`engine/claude-job`) makes two calls at most: `/code-review` on the diff, then the Spec call when
-the PR closes an issue whose done-when section existed when the PR opened. The head's files and diff are
-copied out of the working directory and read as data.
+One rule in `verdict.decide()` sets the verdict. FAIL: a machine check failed, a review found a P0, or an earlier run on
+this head failed. PASS only when none of that holds, nothing went wrong, and every call the tier job owed (`bugs`,
+`security`, `spec`) is in the review job's `calls`, or a real budget cap refused the review (`budget_refused` is the
+bool `true`, or the tier job's own cap check skipped it): that is `review skipped: budget` (D18, D21), and the machine
+checks decide. Everything else is ERROR: a review result that fails
+`verdict.parse_review`'s schema, a budget or tier lookup that raised (before the Spec call or while posting), or an
+owed call that did not run. When posting the check fails, the fallback posts the verdict and P0 count the judge
+already computed, so a FAIL stays FAIL and stays sticky.
+
+The review (`engine/claude-job`) makes three calls at most: `/code-review` on the diff; the security call when
+the PR touches a `[tiers] risk` path of the base toml (or the file list is cut short); then the Spec call when the
+PR closes an issue whose done-when section existed when the PR opened. The head's files and diff are copied out of
+the working directory and read as data.
+
+The security call (dotfiles#3408) runs `engine/prompts/security.md` in the same sandbox, on the same route and with
+the same finding schema as the Bugs call. Its P0 fails the gate, and its error is an ERROR. A risk-path run whose
+review returns no security result is an ERROR too, unless the budget refused a call: that is a budget skip, as for
+the Bugs call, and the record's `security.ran` is false. It is not Claude Code's `/security-review`: that command runs
+`git status` and `git diff` through Bash before any model call, and this sandbox gives the model only Read. On CLI
+2.1.326 the API route stops with "Permission to use Bash has been denied" and sends no request. The subscription
+route, whose cwd is an empty directory that is not a git repository, sends the model only "/security-review needs to
+run inside a git repository"; given a git cwd, it stops with the same Bash refusal.
 
 Each call is billed to the API or to the Claude subscription (D18). The tier job picks the route from the base
 toml and this month's records:
@@ -28,11 +48,12 @@ toml and this month's records:
 | --- | --- | --- |
 | `api` | API-paid reviews today < `reviews_per_day` and API spend this month < `budget_month_usd` | `claude --bare -p`, the federation token through `apiKeyHelper`, cwd = the base checkout |
 | `subscription` | an API limit is reached, `[subscription] fallback = true`, the caller passed `claude_code_oauth_token`, and subscription reviews today < `[subscription] reviews_per_day` | `claude -p --safe-mode --strict-mcp-config`, the token in that process's env only, cwd = a fresh empty dir per call, with no `CLAUDE.md` or `.claude` above it |
-| none | neither may run, the budget could not be read, or the plan's own usage limit is reached | no paid call: `review skipped: budget (<the limits hit>)` |
+| none | neither may run, or the plan's own usage limit is reached | no paid call: `review skipped: budget (<the limits hit>)` |
+| none | the tier job could not read the budget | no paid call, and the verdict is ERROR: a read failure is no refusal |
 
 `--bare` reads no OAuth token, so the subscription call rebuilds its isolation; `tests/test_isolation.py` runs
 the pinned CLI on both routes against a fake API and checks that the head's config, the secret dir and the
-process env never reach the model, and that both routes send the same system prompt and tools, for the Bugs and the Spec call. An API call
+process env never reach the model, and that both routes send the same system prompt and tools, for the Bugs, the security and the Spec call. An API call
 refused by the spend limit or for credit is retried once on the subscription when that route may run. A
 rejected subscription token is an ERROR, never a budget skip. Both routes Read the base checkout by its own path,
 and the prompts name that path. The record's `refused` says when the API refused a call (`api spend limit` or

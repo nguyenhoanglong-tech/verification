@@ -103,6 +103,7 @@ jobs:
       code_lines: ${{ steps.t.outputs.code_lines }}
       reasons: ${{ steps.t.outputs.reasons }}
       review: ${{ steps.t.outputs.review }}
+      security: ${{ steps.t.outputs.security }}
       skip: ${{ steps.t.outputs.skip }}
       switch_spec: ${{ steps.t.outputs.switch_spec }}
       spec_text: ${{ steps.t.outputs.spec_text }}
@@ -230,6 +231,7 @@ jobs:
           model: ${{ needs.tier.outputs.review_model }}
           effort: ${{ needs.tier.outputs.review_effort }}
           level: ${{ needs.tier.outputs.review_level }}
+          security: ${{ needs.tier.outputs.security }}
           anthropic: ${{ needs.tier.outputs.anthropic }}
           base_sha: ${{ needs.tier.outputs.base_sha }}
           spec_text: ${{ needs.tier.outputs.spec_text }}

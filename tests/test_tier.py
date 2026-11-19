@@ -170,12 +170,12 @@ class GitHubMain(unittest.TestCase):
         self.assertEqual((code, out["review"], out["skip"]), (0, "false", "review skipped: budget"))
         self.assertEqual(json.loads(out["budget"])["reviews_today"], 5)
 
-    def test_budget_read_failure_skips_the_paid_review(self):
-        """Fix 8: fail closed, and say the read failed."""
+    def test_budget_read_failure_skips_the_paid_review_and_is_an_error(self):
+        """Fix 8: fail closed, and say the read failed. A read failure is not a refusal: the verdict is ERROR."""
         fake = fakes.GitHub(files=[f("a.py")], fail={"GET actions/workflows": [fakes.http_error(403)]})
         code, log, out = self.main(fake)
-        self.assertEqual((code, out["review"], out["skip"]), (0, "false", "review skipped: budget"))
-        self.assertIn("budget read failed", json.loads(out["budget"])["read_error"])
+        self.assertEqual((code, out["review"], out["skip"]), (0, "false", "budget unreadable"))
+        self.assertIn("budget read failed", out["error"])
 
     def test_issue_text_reaches_the_log_only_inside_stop_commands(self):
         """Fix 4: the outputs dump holds the done-when text."""

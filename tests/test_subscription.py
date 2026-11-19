@@ -106,7 +106,7 @@ class Judge(unittest.TestCase):
     def judge(self, review_result, prior=totals(3, 30.0, 4), budget_extra=None):
         budget = {**CAPS, "skipped": False, **(budget_extra or {})}
         tier_out = {"base_sha": "b", "mode": "shadow", "tiers": "T1", "has_checks": "false", "review": "true",
-                    "budget": json.dumps(budget), "switch_spec": "false", "reasons": "r"}
+                    "security": "false", "budget": json.dumps(budget), "switch_spec": "false", "reasons": "r"}
         needs = {"start": {"result": "success", "outputs": {"base_sha": "b"}},
                  "tier": {"result": "success", "outputs": tier_out},
                  "checks": {"result": "skipped", "outputs": {}},
@@ -118,8 +118,7 @@ class Judge(unittest.TestCase):
         return record, body, log
 
     def test_a_subscription_review_never_adds_to_month_usd(self):
-        record, body, log = self.judge({"findings": [], "spec": None, "cost_usd": 0.0, "subscription_cost_usd": 0.8,
-                                        "billing": "subscription", "error": None, "budget_refused": False})
+        record, body, log = self.judge(fakes.review_result(cost_usd=0.0, subscription_cost_usd=0.8, billing="subscription"))
         b = record["budget"]
         self.assertEqual((b["reviews_today"], b["month_usd"], b["subscription_today"]), (3, 30.0, 5))
         self.assertEqual((record["billing"], record["cost_usd"], record["subscription_cost_usd"]), ("subscription", 0.0, 0.8))
@@ -127,22 +126,19 @@ class Judge(unittest.TestCase):
         self.assertIn("5 subscription reviews today", body["output"]["summary"])
 
     def test_an_api_review_carries_the_subscription_count(self):
-        record, _, _ = self.judge({"findings": [], "spec": None, "cost_usd": 0.5, "billing": "api", "error": None,
-                                   "budget_refused": False})
+        record, _, _ = self.judge(fakes.review_result(cost_usd=0.5, billing="api"))
         b = record["budget"]
         self.assertEqual((b["reviews_today"], b["month_usd"], b["subscription_today"]), (4, 30.5, 4))
         self.assertEqual(record["billing"], "api")
 
     def test_a_mixed_run_counts_once_in_each(self):
-        record, _, _ = self.judge({"findings": [], "spec": None, "cost_usd": 0.5, "subscription_cost_usd": 0.3,
-                                   "billing": "api+subscription", "error": None, "budget_refused": False})
+        record, _, _ = self.judge(fakes.review_result(cost_usd=0.5, subscription_cost_usd=0.3, billing="api+subscription"))
         b = record["budget"]
         self.assertEqual((b["reviews_today"], b["month_usd"], b["subscription_today"]), (4, 30.5, 5))
 
     def test_the_record_says_the_api_refused(self):
-        record, body, _ = self.judge({"findings": [], "spec": None, "cost_usd": 0.0, "subscription_cost_usd": 0.4,
-                                      "billing": "subscription", "refused": "api spend limit", "error": None,
-                                      "budget_refused": False})
+        record, body, _ = self.judge(fakes.review_result(cost_usd=0.0, subscription_cost_usd=0.4, billing="subscription",
+                                                         refused="api spend limit"))
         self.assertEqual(record["refused"], "api spend limit")
         self.assertIn("billing: subscription (API refused: api spend limit)", body["output"]["summary"])
 
@@ -200,8 +196,8 @@ class TierRoute(unittest.TestCase):
 
     def test_a_budget_read_failure_stays_closed(self):
         out, budget, _ = self.main(self.ON, fail={"GET actions/workflows": [fakes.http_error(403)]})
-        self.assertEqual((out["review"], out["skip"], budget["route"]), ("false", "review skipped: budget", None))
-        self.assertIn("budget read failed", budget["read_error"])
+        self.assertEqual((out["review"], out["skip"], budget["route"]), ("false", "budget unreadable", None))
+        self.assertIn("budget read failed", out["error"])
 
     def test_a_bad_block_is_a_config_error(self):
         out, _, _ = self.main(self.ON.replace("reviews_per_day = 30", 'reviews_per_day = "30"'))
@@ -252,6 +248,7 @@ class MidRun(unittest.TestCase):
                 mock.patch.object(review, "claude", claude), \
                 mock.patch.object(fakes.github, "month_records", month_records, create=True):
             out, log = fakes.run(review.main)
+            assert not verdict.parse_review(json.dumps(out))[1], verdict.parse_review(json.dumps(out))[1]
             self.assertNotIn("SUBSCRIPTION_TOKEN", os.environ, "the token leaves the process env before any call")
         return calls, out, log
 
@@ -284,14 +281,18 @@ class MidRun(unittest.TestCase):
     def test_the_standards_file_is_readable_on_every_route(self):
         """The subscription call's cwd is empty, so the base's standards file is allowed by its own path."""
         seen = []
+        self.addCleanup(os.chdir, os.getcwd())
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {
                 "RUNNER_TEMP": tmp, "HEAD_DIR": tmp, "BASE_SHA": "b", "ANTHROPIC": "{}", "MODEL": "m", "EFFORT": "medium",
-                "STANDARDS": "/base/CODING_STANDARDS.md", "PACE": json.dumps({**CAPS, "route": "subscription"}),
+                "STANDARDS": "docs/CODING_STANDARDS.md", "PACE": json.dumps({**CAPS, "route": "subscription"}),
                 "SUBSCRIPTION_TOKEN": TOKEN}), mock.patch.object(review, "prepare"), \
                 mock.patch.object(review, "claude", lambda args, *a: seen.append(args) or (0, OK_BUGS, "")):
+            base = Path(tmp).resolve() / "base"
+            base.mkdir()
+            os.chdir(base)  # the review step runs in the base checkout
             fakes.run(review.main)
         allowed = seen[0][seen[0].index("--allowedTools") + 1]
-        self.assertIn("Read(//base/CODING_STANDARDS.md)", allowed)
+        self.assertIn(f"Read(/{base}/docs/CODING_STANDARDS.md)", allowed)
 
     def test_a_rejected_token_is_an_error_not_a_budget_skip(self):
         calls, out, _ = self.run_main([SPEND_LIMIT, REJECTED])
@@ -330,11 +331,12 @@ class MidRun(unittest.TestCase):
         self.assertEqual(calls, ["api", "subscription", "subscription"])
         self.assertEqual((out["error"], out["billing"], out["refused"]), (None, "subscription", "api spend limit"))
 
-    def test_the_refusal_survives_a_failed_budget_reread(self):
+    def test_a_failed_budget_reread_after_a_refusal_is_an_error_that_names_the_refusal(self):
+        """#77 round 3 (C2): a budget nobody could read is no refusal, so the run is an ERROR, not a budget skip."""
         _, out, _ = self.run_main([SPEND_LIMIT], reads=[RuntimeError("503")])
-        self.assertTrue(out["budget_refused"])
-        self.assertIn("API spend limit refused the call", out["limit"])
-        self.assertIn("budget read failed", out["limit"])
+        self.assertFalse(out["budget_refused"])
+        self.assertIn("API spend limit refused the call", out["error"])
+        self.assertIn("budget read failed", out["error"])
         self.assertEqual(out["refused"], "api spend limit")
         _, out, _ = self.run_main([CREDIT, OK_BUGS])
         self.assertEqual(out["refused"], "api credit")
@@ -353,7 +355,8 @@ class MidRun(unittest.TestCase):
         calls, out, _ = self.run_main([OK_BUGS], pace={**CAPS, "route": "subscription"}, prior=totals(5, 1.0, 30),
                                       spec=True)
         self.assertEqual(calls, ["subscription"])
-        self.assertIn("subscription daily pace 30/30", out["spec_skipped"])
+        self.assertTrue(out["budget_refused"])
+        self.assertIn("subscription daily pace 30/30", out["limit"])
 
 
 class Argv(unittest.TestCase):

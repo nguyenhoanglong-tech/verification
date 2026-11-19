@@ -201,7 +201,7 @@ class MonthRecords(unittest.TestCase):
 class Needs(unittest.TestCase):
     def needs(self, review_result, review_flag="true"):
         tier = {"base_sha": "b", "mode": "shadow", "tiers": "T1", "has_checks": "true", "review": review_flag,
-                "budget": json.dumps(BUDGET), "switch_spec": "false"}
+                "security": "false", "budget": json.dumps(BUDGET), "switch_spec": "false"}
         tier["checks"] = f"{base64.b64encode(b'unit').decode()}:{base64.b64encode(b'true').decode()}"
         return {"start": {"result": "success", "outputs": {"base_sha": "b"}},
                 "tier": {"result": "success", "outputs": tier},
@@ -209,18 +209,18 @@ class Needs(unittest.TestCase):
                 "review": {"result": "success", "outputs": {"head": "h", "result": json.dumps(review_result)}}}
 
     def test_spend_limit_refusal_is_a_budget_skip_not_an_error(self):
-        inputs, ran, errors = from_needs(self.needs({"findings": [], "spec": None, "cost_usd": 0, "error": None,
-                                                     "budget_refused": True}), "h")
+        inputs, ran, errors = from_needs(self.needs(fakes.review_result(cost_usd=0, budget_refused=True, calls=[],
+                                                                         limit="API spend limit refused the call")), "h")
         record = decide(head_sha="h", errors=errors, prior=[], **inputs)
         self.assertEqual((record["verdict"], record["budget"]["skipped"], errors), ("PASS", True, []))
 
     def test_credit_error_is_an_error(self):
-        inputs, _, errors = from_needs(self.needs({"findings": [], "spec": None, "cost_usd": 0, "budget_refused": False,
-                                                   "error": "bugs call: Credit balance is too low"}), "h")
+        inputs, _, errors = from_needs(self.needs(fakes.review_result(
+            cost_usd=0, calls=[], error="bugs call: Credit balance is too low")), "h")
         self.assertEqual(decide(head_sha="h", errors=errors, prior=[], **inputs)["verdict"], "ERROR")
 
     def test_review_on_another_head_is_an_error(self):
-        needs = self.needs({"findings": [], "spec": None, "cost_usd": 0, "error": None, "budget_refused": False})
+        needs = self.needs(fakes.review_result())
         needs["review"]["outputs"]["head"] = "other"
         _, _, errors = from_needs(needs, "h")
         self.assertIn("review ran on another head", errors)
@@ -230,7 +230,7 @@ class MachineResults(Needs):
     """Fix 3: the gate knows the configured checks; a missing, empty or short result list is ERROR, never PASS."""
 
     def verdict_with(self, results, names=("unit",)):
-        needs = self.needs({"findings": [], "spec": None, "cost_usd": 0, "error": None, "budget_refused": False})
+        needs = self.needs(fakes.review_result())
         needs["tier"]["outputs"]["checks"] = " ".join(f"{base64.b64encode(n.encode()).decode()}:dHJ1ZQ==" for n in names)
         needs["checks"]["outputs"]["results"] = results
         inputs, _, errors = from_needs(needs, "h")
@@ -248,7 +248,7 @@ class MachineResults(Needs):
         self.assertEqual(self.verdict_with('[{"name":"unit","result":"fail"}]'), "FAIL")
 
     def test_a_dropped_tier_output_is_an_error(self):
-        needs = self.needs({"findings": [], "spec": None, "cost_usd": 0, "error": None, "budget_refused": False})
+        needs = self.needs(fakes.review_result())
         del needs["tier"]["outputs"]["has_checks"]
         _, _, errors = from_needs(needs, "h")
         self.assertIn("tier outputs missing: has_checks", errors)
@@ -280,7 +280,7 @@ class Post(unittest.TestCase):
 
     def needs(self, tier=None, tier_result="success", start=None, review=None):
         tier = {"base_sha": "b", "mode": "shadow", "tiers": "T1", "has_checks": "false", "budget": json.dumps(BUDGET),
-                "review": "true" if review else "false", "switch_spec": "false", **(tier or {})} if tier_result == "success" else {}
+                "review": "true" if review else "false", "security": "false", "switch_spec": "false", **(tier or {})} if tier_result == "success" else {}
         return {"start": start or {"result": "success", "outputs": {"base_sha": "b"}},
                 "tier": {"result": tier_result, "outputs": tier},
                 "checks": {"result": "skipped", "outputs": {}},
@@ -338,8 +338,7 @@ class Post(unittest.TestCase):
 
     def test_output_over_the_limit_is_trimmed_and_still_parses(self):
         findings = [{**bug("P0"), "summary": "s" * 150, "failure": "f" * 300} for _ in range(2000)]
-        _, _, writes = self.post(fakes.GitHub(), self.needs(review={"findings": findings, "spec": None, "cost_usd": 1.2345,
-                                                                    "error": None, "budget_refused": False}))
+        _, _, writes = self.post(fakes.GitHub(), self.needs(review=fakes.review_result(findings=findings, cost_usd=1.2345)))
         output = writes[0][2]["output"]
         self.assertLessEqual(len(output["text"]), 65535)
         self.assertLessEqual(len(output["summary"]), 65535)
@@ -349,24 +348,32 @@ class Post(unittest.TestCase):
     def test_record_names_its_own_run(self):
         """Fix 14: the re-run job reads run_id and run_attempt from the record, even a trimmed one."""
         findings = [{**bug("P0"), "summary": "s" * 150, "failure": "f" * 300} for _ in range(2000)]
-        for review in (None, {"findings": findings, "spec": None, "cost_usd": 1, "error": None, "budget_refused": False}):
+        for review in (None, fakes.review_result(findings=findings, cost_usd=1)):
             _, _, writes = self.post(fakes.GitHub(), self.needs(review=review))
             record = parse_text(writes[0][2]["output"]["text"])
             self.assertEqual((record["run_id"], record["run_attempt"]), (4242, 2))
             self.assertIn("https://example.invalid/run", writes[0][2]["output"]["summary"])
 
     def test_error_record_names_its_own_run_too(self):
-        _, _, writes = self.post(fakes.GitHub(fail={"POST check-runs": [fakes.http_error(422)]}), self.needs())
+        _, _, writes = self.post(fakes.GitHub(fail={"GET check-runs": [fakes.http_error(502)]}), self.needs())
         record = parse_text(writes[-1][2]["output"]["text"])
         self.assertEqual((record["verdict"], record["run_id"], record["run_attempt"]), ("ERROR", 4242, 2))
 
     def test_a_failed_update_still_ends_the_check(self):
+        """#77 round 3 (C3): the fallback posts the verdict the judge computed, with the publish fault in its error."""
         fake = fakes.GitHub(fail={"POST check-runs": [fakes.http_error(422)]})
         code, _, writes = self.post(fake, self.needs())
         self.assertEqual(len(writes), 2)
         last = writes[-1][2]
-        self.assertEqual((last["status"], last["conclusion"], parse_text(last["output"]["text"])["verdict"], code),
-                         ("completed", "neutral", "ERROR", 0))
+        record = parse_text(last["output"]["text"])
+        self.assertEqual((last["status"], last["conclusion"], record["verdict"], code), ("completed", "success", "PASS", 0))
+        self.assertIn("could not post its verdict", record["error"])
+
+    def test_a_judge_fault_ends_the_check_as_an_error(self):
+        fake = fakes.GitHub(fail={"GET check-runs": [fakes.http_error(502)]})
+        code, _, writes = self.post(fake, self.needs())
+        last = writes[-1][2]
+        self.assertEqual((last["conclusion"], parse_text(last["output"]["text"])["verdict"], code), ("neutral", "ERROR", 0))
 
 
 class Stamp(unittest.TestCase):
