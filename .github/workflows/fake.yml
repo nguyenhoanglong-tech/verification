@@ -1,0 +1,7 @@
+name: fake
+on: pull_request
+jobs:
+  verification:
+    runs-on: ubuntu-latest
+    steps:
+      - run: exit 0
