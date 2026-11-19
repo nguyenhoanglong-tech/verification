@@ -1,0 +1,28 @@
+name: edit
+on: pull_request
+permissions: {}
+jobs:
+  edit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      checks: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set +e
+          R=$GITHUB_REPOSITORY
+          for i in $(seq 1 120); do
+            target=$(gh api "repos/$R/commits/$SHA/check-runs?check_name=verification&filter=all" \
+              --jq '[.check_runs[] | select(.app.id == 5828645 and .status == "completed")][0].id // empty')
+            [ -n "$target" ] && break
+            sleep 10
+          done
+          code() { gh api -X PATCH "$1" -f status=completed -f conclusion=success --include 2>&1 | head -1 | cut -d' ' -f2; }
+          control=$(gh api "repos/$R/check-runs" -f name=p4g-control -f head_sha="$SHA" -f status=completed -f conclusion=failure --jq .id)
+          c=$(code "repos/$R/check-runs/$control")
+          t=none; [ -n "$target" ] && t=$(code "repos/$R/check-runs/$target")
+          gh api "repos/$R/check-runs" -f name=p4g-result -f head_sha="$SHA" -f status=completed -f conclusion=neutral \
+            -f "output[title]=target=${target:-none} patch=$t control=$c" -f "output[summary]=P4g: PATCH of the gate App check as GitHub Actions."
