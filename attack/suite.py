@@ -645,8 +645,9 @@ def job_logs(repo, run_id, timeout=600):
     jobs = api(f"repos/{repo}/actions/runs/{run_id}/jobs?filter=all&per_page=100")["jobs"]
     # A skipped job never ran and has no log to download.
     # A job cancelled before it started has no log either; the judge needs the review job's own log to be non-blank.
-    return {f"job log {j['id']} {j['name']}": gh("api", f"repos/{repo}/actions/jobs/{j['id']}/logs", check=False).stdout
+    logs = {f"job log {j['id']} {j['name']}": gh("api", f"repos/{repo}/actions/jobs/{j['id']}/logs", check=False)
             for j in jobs if j["conclusion"] != "skipped"}
+    return {name: r.stdout if r.returncode == 0 else "" for name, r in logs.items()}  # a failed fetch prints its error body
 
 
 def run_p7(dotfiles, out):
@@ -657,8 +658,8 @@ def run_p7(dotfiles, out):
            "spec": {"title": "subscription token leak", "expect": "no-leak"}, "steps": [], "sources": {}}
     pr, made = None, []
     # A stop signal raises here, so teardown in finally still runs (SIGKILL cannot be caught).
-    for sig in (signal.SIGTERM, signal.SIGHUP):
-        signal.signal(sig, lambda n, _: sys.exit(f"P7 stopped by signal {n}"))
+    stops = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+    old = {sig: signal.signal(sig, lambda n, _: sys.exit(f"P7 stopped by signal {n}")) for sig in stops}
     try:
         caller = gh("api", f"repos/{repo}/contents/.github/workflows/verification.yml?ref=master",
                     "-H", "Accept: application/vnd.github.raw").stdout
@@ -667,6 +668,10 @@ def run_p7(dotfiles, out):
                   "-H", "Accept: application/vnd.github.raw").stdout
         new_toml = p7_toml(toml)
         tip = api(f"repos/{repo}/branches/master")["commit"]["sha"]
+        # The finding log is read by the checkout's own script, so an older checkout reads the checks differently.
+        local = subprocess.run(["git", "-C", dotfiles, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+        if local != tip:
+            raise RuntimeError(f"--dotfiles is at {local[:12] or 'no commit'}, not master's tip {tip[:12]}; use a checkout of it")
         api(f"repos/{repo}/git/refs", f"ref=refs/heads/{base}", f"sha={tip}", method="POST")
         made.append(base)
         base_sha = write_files(repo, base, {".github/verification.toml": new_toml})
@@ -694,6 +699,8 @@ def run_p7(dotfiles, out):
     except (Exception, SystemExit, KeyboardInterrupt) as e:
         rec["error"] = str(e) or type(e).__name__
     finally:
+        for sig in stops:  # a second stop must not cut teardown short
+            signal.signal(sig, signal.SIG_IGN)
         if pr:
             gh("pr", "close", str(pr), "-R", repo, check=False)
         for ref in made:  # only refs this run made: a same-named ref from another run is not ours to delete
@@ -703,6 +710,8 @@ def run_p7(dotfiles, out):
                        "refs": {ref: ref_http_status(repo, ref) for ref in (base, head)}}
         out.mkdir(parents=True, exist_ok=True)
         (out / "P7.json").write_text(redact(json.dumps(rec, indent=1)))
+        for sig, handler in old.items():
+            signal.signal(sig, handler)
     return rec
 
 

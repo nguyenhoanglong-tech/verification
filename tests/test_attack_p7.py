@@ -1,7 +1,12 @@
 import copy
 import json
+import os
+import signal
 import sys
+import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -125,6 +130,50 @@ class Judge(unittest.TestCase):
     def test_leaked(self):
         self.assertTrue(suite.leaked("x " + FAKE_TOKEN))
         self.assertFalse(suite.leaked("sk-ant-api03-xyz"))
+
+
+class Teardown(unittest.TestCase):
+    """run_p7 against recorded gh and api stubs: a stop mid-run still closes the PR and deletes only its own refs."""
+
+    def run_stopped(self, stop, write_files=lambda *a, **k: "s" * 40):
+        calls, tip = [], "m" * 40
+
+        def gh(*args, input=None, check=True):
+            calls.append(args)
+            out = {"pr create": "https://github.com/o/r/pull/5\n", "pr view": "CLOSED\n"}.get(" ".join(args[:2]), "")
+            if ".github/workflows/verification.yml" in args[1]:
+                out = 'app_id: "5828607"'
+            if ".github/verification.toml" in args[1]:
+                out = TOML
+            return SimpleNamespace(stdout=out or "HTTP/2.0 404 Not Found\n", stderr="", returncode=0 if out else 1)
+
+        git = SimpleNamespace(stdout=tip + "\n", stderr="", returncode=0)
+        with tempfile.TemporaryDirectory() as out, \
+                mock.patch.object(suite, "gh", gh), \
+                mock.patch.object(suite, "api", lambda path, *f, method=None: {"commit": {"sha": tip}}), \
+                mock.patch.object(suite, "write_files", write_files), \
+                mock.patch.object(suite, "wait_verification", lambda *a, **k: stop()), \
+                mock.patch.object(suite.subprocess, "run", lambda *a, **k: git):
+            rec = suite.run_p7("/dotfiles", Path(out))
+            saved = json.loads((Path(out) / "P7.json").read_text())
+        deleted = [c[3].rsplit("/heads/", 1)[1] for c in calls if c[:3] == ("api", "-X", "DELETE")]
+        return rec, saved, deleted, calls
+
+    def test_sigterm_mid_run_still_tears_down(self):
+        rec, saved, deleted, calls = self.run_stopped(lambda: os.kill(os.getpid(), signal.SIGTERM))
+        self.assertIn("signal", rec["error"])
+        self.assertTrue(any(c[:2] == ("pr", "close") for c in calls))
+        self.assertEqual(sorted(deleted), sorted([rec["base"], rec["head"]]))
+        self.assertEqual(saved["gone"]["pr_state"], "CLOSED")
+        self.assertEqual(set(saved["gone"]["refs"].values()), {404})
+        self.assertFalse(suite.judge(saved)[0])
+
+    def test_failure_before_the_head_deletes_only_the_base(self):
+        def refused(*a, **k):
+            raise RuntimeError("write refused")
+        rec, _, deleted, _ = self.run_stopped(lambda: None, write_files=refused)
+        self.assertEqual(rec["error"], "write refused")
+        self.assertEqual(deleted, [rec["base"]])
 
 
 class Toml(unittest.TestCase):
