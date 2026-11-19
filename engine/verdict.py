@@ -124,7 +124,7 @@ def unrun_security() -> dict:
 
 
 def decide(*, head_sha, base_sha, tiers, mode, switch_spec, machine, review, budget, errors, prior,
-           security_owed=False) -> dict:
+           security_owed=False, owed=(), done=()) -> dict:
     """Build the record. mode is "shadow" or "enforce"; post() settles it with fallback_mode when the tier job could not.
 
     machine: [{name, result: pass|fail}]. review: None when no review ran, else {findings, security, spec, cost_usd,
@@ -132,12 +132,20 @@ def decide(*, head_sha, base_sha, tiers, mode, switch_spec, machine, review, bud
     notional and kept apart. security_owed: the PR touches a risk path, so the record carries a security entry
     {ran, findings, cost_usd, subscription_cost_usd}; it is None when the pass is not owed.
     errors: why this run could not judge (job failures, review errors). prior: verdicts of earlier runs on this head.
+    owed: the calls the tier job owed (bugs, security, spec); done: the calls the review job ran and parsed.
+
+    The one verdict rule. FAIL: a machine check failed, a P0 was found, or an earlier run on this head failed. PASS:
+    only when nothing failed, nothing went wrong, and every owed call is in done, or the budget refused the review
+    (budget["skipped"] is True, set only from an explicit cap refusal). Everything else is ERROR.
     """
     findings = list((review or {}).get("findings", [])) + spec_findings((review or {}).get("spec"))
     security = (review or {}).get("security") or (unrun_security() if security_owed else None)
-    fail = (any(m["result"] != "pass" for m in machine) or "FAIL" in prior
-            or any(f["severity"] == "P0" for f in findings + (security or {}).get("findings", [])))
-    verdict = "FAIL" if fail else "ERROR" if errors else "PASS"
+    p0 = sum(f["severity"] == "P0" for f in findings + (security or {}).get("findings", []))
+    skipped = budget.get("skipped") is True
+    unran = [c for c in owed if c not in done]
+    errors = list(errors) + ([f"owed calls did not run: {', '.join(unran)}"] if unran and not skipped else [])
+    fail = any(m["result"] != "pass" for m in machine) or p0 > 0 or "FAIL" in prior
+    verdict = "FAIL" if fail else "PASS" if not errors else "ERROR"
     shadow = mode == "shadow"
     label = tiers or "tier unknown"
     if verdict == "PASS":
@@ -146,11 +154,12 @@ def decide(*, head_sha, base_sha, tiers, mode, switch_spec, machine, review, bud
         title = f"{label} would block (shadow trial)" if shadow else f"{label} blocked"
     else:
         title = f"{label} error" if shadow else f"{label} error: re-run"
-    if budget.get("skipped"):
+    if skipped:
         title += f" ({BUDGET_SKIPPED})"
     return {
         "schema": 1, "head_sha": head_sha, "base_sha": base_sha, "tier": tiers, "mode": mode,
-        "verdict": verdict, "title": title, "switch_spec": bool(switch_spec), "machine": machine,
+        "verdict": verdict, "p0": p0, "title": title, "switch_spec": bool(switch_spec), "machine": machine,
+        "calls_owed": sorted(owed), "calls_done": sorted(done),
         "findings": findings, "security": security, "spec": (review or {}).get("spec"),
         "cost_usd": float((review or {}).get("cost_usd") or 0),
         "billing": (review or {}).get("billing"), "refused": (review or {}).get("refused"),
@@ -188,9 +197,8 @@ def summary(record: dict, stamp_text: str, reasons: str, run_url: str) -> str:
              + (f" (API refused: {record['refused']})" if record.get("refused") else ""),
              f"cost_usd: {record['cost_usd']:.4f}" + (f" (subscription, notional: {record['subscription_cost_usd']:.4f})"
                                                        if record.get("subscription_cost_usd") else ""),
-             "budget: " + (BUDGET_SKIPPED + "".join(f" ({record['budget'][k]})" for k in ("limit", "read_error", "spec_skipped")
-                                                    if record["budget"].get(k))
-                           if record["budget"].get("skipped") else
+             "budget: " + (BUDGET_SKIPPED + (f" ({record['budget']['limit']})" if record["budget"].get("limit") else "")
+                           if record["budget"].get("skipped") is True else
                            f"{record['budget'].get('reviews_today', 0)} paid reviews today, "
                            f"${record['budget'].get('month_usd', 0):.2f} this month, "
                            f"{record['budget'].get('subscription_today', 0)} subscription reviews today"),
@@ -244,22 +252,80 @@ def fit(record: dict) -> tuple[dict, str]:
     return record, text
 
 
-def review_problem(review) -> str:
-    """Why the review job's result cannot be judged, or "" when it can. A result that is not an object, has no findings
-    list, or holds a security entry of the wrong shape is never read as "no findings"."""
-    def rows(items) -> bool:
-        return isinstance(items, list) and all(isinstance(x, dict) and x.get("severity") in ("P0", "P1") for x in items)
-    if not isinstance(review, dict) or not review:
-        return "empty or not an object"
-    if not rows(review.get("findings")):
-        return "has no findings list"
-    security = review.get("security")
-    costs = ("cost_usd", "subscription_cost_usd")
-    if security is not None and not (isinstance(security, dict) and isinstance(security.get("ran"), bool)
-                                     and rows(security.get("findings"))
-                                     and all(isinstance(security.get(k), (int, float)) for k in costs)):
-        return "has a malformed security entry"
-    return ""
+SEVERITIES = ("P0", "P1")
+STATUSES = ("Yes", "Partly", "No")
+CALLS = ("bugs", "security", "spec")
+REVIEW_KEYS = {"findings", "security", "spec", "cost_usd", "subscription_cost_usd", "billing", "error", "budget_refused",
+               "calls"}
+REVIEW_OPTIONAL = {"refused", "limit"}
+
+
+def _number(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0
+
+
+def _line(v) -> bool:
+    return v is None or (isinstance(v, int) and not isinstance(v, bool))
+
+
+def _rows(items, call: str) -> bool:
+    keys = {"call", "severity", "file", "line", "summary", "failure"}
+    return isinstance(items, list) and all(
+        isinstance(x, dict) and set(x) == keys and x["call"] == call and x["severity"] in SEVERITIES
+        and isinstance(x["file"], str) and _line(x["line"]) and isinstance(x["summary"], str)
+        and isinstance(x["failure"], str) for x in items)
+
+
+def _security(v) -> bool:
+    return v is None or (isinstance(v, dict) and set(v) == {"ran", "findings", "cost_usd", "subscription_cost_usd"}
+                         and isinstance(v["ran"], bool) and _rows(v["findings"], "security")
+                         and _number(v["cost_usd"]) and _number(v["subscription_cost_usd"]))
+
+
+def _spec(v) -> bool:
+    item = lambda i: (isinstance(i, dict) and set(i) == {"n", "item", "status", "evidence"} and _line(i["n"])
+                      and isinstance(i["item"], str) and i["status"] in STATUSES and isinstance(i["evidence"], str))
+    return v is None or (isinstance(v, dict) and set(v) == {"answer", "items", "sent"} and v["answer"] in STATUSES
+                         and isinstance(v["items"], list) and all(item(i) for i in v["items"])
+                         and isinstance(v["sent"], list) and all(isinstance(i, str) for i in v["sent"]))
+
+
+def parse_review(raw) -> tuple[dict | None, str]:
+    """(the review job's result, "") when it validates against the schema review.py writes, else (None, why).
+    Required keys present, no unknown key, booleans are bool, costs are numbers and never bool, every finding is a
+    full object with a valid severity, and the calls list agrees with what the result holds. Nothing that fails here
+    can count as "no findings"."""
+    try:
+        review = json.loads(raw)
+    except (TypeError, ValueError):
+        return None, "unreadable"
+    if not isinstance(review, dict):
+        return None, "not an object"
+    keys = set(review)
+    if not REVIEW_KEYS <= keys or keys - REVIEW_KEYS - REVIEW_OPTIONAL:
+        return None, (f"keys wrong: missing {sorted(REVIEW_KEYS - keys)}, "
+                      f"unknown {sorted(keys - REVIEW_KEYS - REVIEW_OPTIONAL)}")
+    calls = review["calls"]
+    shape = {"findings": _rows(review["findings"], "bugs"), "security": _security(review["security"]),
+             "spec": _spec(review["spec"]), "cost_usd": _number(review["cost_usd"]),
+             "subscription_cost_usd": _number(review["subscription_cost_usd"]),
+             "billing": review["billing"] is None or isinstance(review["billing"], str),
+             "error": review["error"] is None or (isinstance(review["error"], str) and review["error"] != ""),
+             "budget_refused": isinstance(review["budget_refused"], bool),
+             "calls": isinstance(calls, list) and all(c in CALLS for c in calls) and len(set(calls)) == len(calls),
+             **{k: isinstance(review[k], str) for k in REVIEW_OPTIONAL if k in review}}
+    bad = [k for k, ok in shape.items() if not ok]
+    if bad:
+        return None, "malformed: " + ", ".join(bad)
+    security, finished = review["security"], review["error"] is None and not review["budget_refused"]
+    agree = {"security": (security is not None and security["ran"]) == ("security" in calls),
+             "spec": (review["spec"] is not None) == ("spec" in calls),
+             "bugs": "bugs" in calls or not finished,
+             "budget_refused": not (review["budget_refused"] and review["error"] is not None)}
+    bad = [k for k, ok in agree.items() if not ok]
+    if bad:
+        return None, "calls disagree with the result: " + ", ".join(bad)
+    return review, ""
 
 
 def check_names(checks: str) -> list[str] | None:
@@ -282,10 +348,16 @@ def from_needs(needs: dict, head_sha: str) -> tuple[dict, list[str], list[str]]:
     if out.get("error"):
         errors.append(out["error"])
     tier_ok = tier.get("result") == "success" and not out.get("error")
-    # An output Actions dropped reads as empty. Each of these says what is owed, so a missing one is an ERROR.
-    missing = [k for k in ("mode", "has_checks", "review", "security", "budget") if not out.get(k)]
+    # An output Actions dropped reads as empty. Each of these says what is owed, so a missing one is an ERROR, and so
+    # is a flag that is not exactly "true" or "false".
+    flags = ("has_checks", "review", "security", "switch_spec")
+    missing = [k for k in ("mode", *flags, "budget") if not out.get(k)]
     if tier_ok and missing:
         errors.append("tier outputs missing: " + ", ".join(missing))
+        tier_ok = False
+    invalid = [k for k in flags if out.get(k) not in ("true", "false")]
+    if tier_ok and invalid:
+        errors.append("tier outputs invalid: " + ", ".join(invalid))
         tier_ok = False
 
     def owed(job: str, flag: str) -> dict | None:
@@ -315,38 +387,36 @@ def from_needs(needs: dict, head_sha: str) -> tuple[dict, list[str], list[str]]:
         expected = check_names(out.get("checks", ""))
         if not expected or [m.get("name") for m in machine] != expected:
             errors.append(f"machine results missing or short: expected {expected}, got {[m.get('name') for m in machine]}")
-    review = None
+    review, done = None, []
     review_out = owed("review", "review")
-    try:
-        budget = json.loads(out.get("budget") or "{}") if tier_ok else {}
-    except ValueError:
-        budget = {}
-    if review_out:
+    budget = {}
+    if tier_ok:
         try:
-            review = json.loads(review_out.get("result") or "")
-            problem = review_problem(review)
+            budget = json.loads(out["budget"])
         except ValueError:
-            problem = "unreadable"
+            budget = None
+        if not isinstance(budget, dict) or not isinstance(budget.get("skipped", False), bool):
+            errors.append("tier budget output unreadable")
+            budget = {}
+    flag = lambda k: tier_ok and out.get(k) == "true"
+    owed_calls = ["bugs"] + ["security"] * flag("security") + ["spec"] * flag("switch_spec") if flag("review") else []
+    if budget.get("skipped") is True and (flag("review") or out.get("skip") != BUDGET_SKIPPED):
+        errors.append("tier budget says skipped, but the tier job did not skip the review for budget")
+    if review_out:
+        review, problem = parse_review(review_out.get("result") or "")
         if problem:
             errors.append(f"review job output {problem}")
-            review = None
-        # The org's spend limit refused a call, or the pace was reached before the Spec call: that is the budget,
-        # not an error (coordinator, 2026-11-18).
-        if review and (review.get("budget_refused") or review.get("spec_skipped")):
-            budget["skipped"] = True
-            if review.get("limit"):
-                budget["limit"] = review["limit"]
-            if review.get("spec_skipped"):
-                budget["spec_skipped"] = f"Spec call: {review['spec_skipped']}"
-        if review and review.get("error"):
-            errors.append(f"review: {review['error']}")
-        elif (review and out.get("security") == "true" and not review.get("budget_refused")
-              and not (review.get("security") or {}).get("ran")):
-            errors.append("review: the security pass is owed but did not run")
+        else:
+            done = review["calls"]
+            # Only an explicit cap refusal is a budget skip (coordinator, 2026-11-18; #77 round 3).
+            if review["budget_refused"] is True:
+                budget.update(skipped=True, limit=review.get("limit") or "a budget cap refused a call")
+            if review["error"] is not None:
+                errors.append(f"review: {review['error']}")
     mode = out.get("mode") if out.get("mode") in ("shadow", "enforce") else None
     inputs = dict(tiers=out.get("tiers", ""), base_sha=out.get("base_sha", ""), mode=mode,
                   switch_spec=out.get("switch_spec") == "true", machine=machine, review=review, budget=budget,
-                  security_owed=out.get("security") == "true")
+                  security_owed=out.get("security") == "true", owed=owed_calls, done=done)
     return inputs, ran, errors
 
 
@@ -386,7 +456,9 @@ def judge(github, needs: dict, repo: str, head_sha: str, run_url: str, base_ref:
         try:
             totals = budget_base(github.month_records(repo, os.environ.get("GITHUB_WORKFLOW_REF", ""), now), now)
         except Exception as x:
+            # The record still carries the tier job's totals for the next run's pace, but this verdict is an ERROR.
             print(f"budget read failed: {x}; the totals carry on from the tier job's read")
+            errors.append(f"budget read failed while posting: {x}"[:300])
             totals = {k: budget.get(k) for k in ("reviews_today", "month_usd", "subscription_today")}
         if totals["month_usd"] is not None:
             # The subscription's cost is notional: it never adds to month_usd, which the API month cap reads.
@@ -395,7 +467,7 @@ def judge(github, needs: dict, repo: str, head_sha: str, run_url: str, base_ref:
                           subscription_today=int(totals["subscription_today"] or 0) + (1 if on_subscription else 0))
     record = {**decide(head_sha=head_sha, errors=errors, prior=prior_verdicts(runs), **inputs), **own_run()}
     out = needs.get("tier", {}).get("outputs") or {}
-    skip = out.get("skip") or (BUDGET_SKIPPED if record["budget"].get("skipped") else "")
+    skip = out.get("skip") or (BUDGET_SKIPPED if record["budget"].get("skipped") is True else "")
     fitted, text = fit(record)
     output = {"title": record["title"], "text": text,
               "summary": summary(fitted, stamp(record["tier"], ran, skip), out.get("reasons", ""), run_url)}
@@ -420,18 +492,21 @@ def post() -> int:
     except Exception as x:
         reason = f"the gate could not post its verdict: {type(x).__name__}: {x}"[:400]
         print(reason)
-    start = needs.get("start", {}).get("outputs") or {}
-    mode = (record or {}).get("mode") or fallback_mode(base_config(github, repo, start.get("base_sha") or base_ref), base_ref)
-    judged = record or {}
-    # What the judge already found stays: the fallback is never weaker than the record it could not post.
-    failed = decide(head_sha=head_sha, base_sha=start.get("base_sha", ""), tiers=judged.get("tier", ""), mode=mode,
-                    switch_spec=False, machine=[], budget=judged.get("budget", {}), errors=[reason], prior=[],
-                    review={k: judged.get(k) for k in ("cost_usd", "findings", "security") if judged.get(k) is not None},
-                    security_owed=((needs.get("tier") or {}).get("outputs") or {}).get("security") == "true")
+    if record is not None:
+        # The judge computed the verdict and the P0 count before the publish failed: post them as they are, never a
+        # verdict recomputed from a record whose findings may be trimmed.
+        failed = {**record, "error": "; ".join(filter(None, [record.get("error"), reason]))}
+    else:
+        start = needs.get("start", {}).get("outputs") or {}
+        mode = fallback_mode(base_config(github, repo, start.get("base_sha") or base_ref), base_ref)
+        failed = decide(head_sha=head_sha, base_sha=start.get("base_sha", ""), tiers="", mode=mode, switch_spec=False,
+                        machine=[], review=None, budget={}, errors=[reason], prior=[],
+                        security_owed=((needs.get("tier") or {}).get("outputs") or {}).get("security") == "true")
     failed.update(own_run())
     _, text = fit(failed)
     body = {"status": "completed", "conclusion": conclusion(failed),
-            "output": {"title": failed["title"], "text": text, "summary": f"verdict: {failed['verdict']}\nerror: {reason}\n\nrun: {run_url}"}}
+            "output": {"title": failed["title"], "text": text,
+                       "summary": f"verdict: {failed['verdict']}\nP0: {failed['p0']}\nerror: {reason}\n\nrun: {run_url}"}}
     write_check(github, repo, head_sha, body)
     return 1 if body["conclusion"] == "failure" else 0
 

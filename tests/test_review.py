@@ -117,7 +117,9 @@ class SpecBudget(unittest.TestCase):
                 mock.patch.object(fakes.github, "month_records", lambda *a: records, create=True):
             out, _ = fakes.run(review.main)
         self.assertEqual(len(calls), 1, "the Spec call did not run")
-        self.assertTrue(out.get("spec_skipped"))
+        self.assertNotIn("spec_skipped", out)
+        self.assertEqual((out["budget_refused"], out["calls"]), (True, ["bugs"]))
+        self.assertIn("Spec call: API daily pace 5/5", out["limit"])
         self.assertEqual((out["cost_usd"], out["spec"], out["error"]), (1.5, None, None))
 
 

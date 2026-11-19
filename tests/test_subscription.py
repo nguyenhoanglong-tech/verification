@@ -118,8 +118,7 @@ class Judge(unittest.TestCase):
         return record, body, log
 
     def test_a_subscription_review_never_adds_to_month_usd(self):
-        record, body, log = self.judge({"findings": [], "spec": None, "cost_usd": 0.0, "subscription_cost_usd": 0.8,
-                                        "billing": "subscription", "error": None, "budget_refused": False})
+        record, body, log = self.judge(fakes.review_result(cost_usd=0.0, subscription_cost_usd=0.8, billing="subscription"))
         b = record["budget"]
         self.assertEqual((b["reviews_today"], b["month_usd"], b["subscription_today"]), (3, 30.0, 5))
         self.assertEqual((record["billing"], record["cost_usd"], record["subscription_cost_usd"]), ("subscription", 0.0, 0.8))
@@ -127,22 +126,19 @@ class Judge(unittest.TestCase):
         self.assertIn("5 subscription reviews today", body["output"]["summary"])
 
     def test_an_api_review_carries_the_subscription_count(self):
-        record, _, _ = self.judge({"findings": [], "spec": None, "cost_usd": 0.5, "billing": "api", "error": None,
-                                   "budget_refused": False})
+        record, _, _ = self.judge(fakes.review_result(cost_usd=0.5, billing="api"))
         b = record["budget"]
         self.assertEqual((b["reviews_today"], b["month_usd"], b["subscription_today"]), (4, 30.5, 4))
         self.assertEqual(record["billing"], "api")
 
     def test_a_mixed_run_counts_once_in_each(self):
-        record, _, _ = self.judge({"findings": [], "spec": None, "cost_usd": 0.5, "subscription_cost_usd": 0.3,
-                                   "billing": "api+subscription", "error": None, "budget_refused": False})
+        record, _, _ = self.judge(fakes.review_result(cost_usd=0.5, subscription_cost_usd=0.3, billing="api+subscription"))
         b = record["budget"]
         self.assertEqual((b["reviews_today"], b["month_usd"], b["subscription_today"]), (4, 30.5, 5))
 
     def test_the_record_says_the_api_refused(self):
-        record, body, _ = self.judge({"findings": [], "spec": None, "cost_usd": 0.0, "subscription_cost_usd": 0.4,
-                                      "billing": "subscription", "refused": "api spend limit", "error": None,
-                                      "budget_refused": False})
+        record, body, _ = self.judge(fakes.review_result(cost_usd=0.0, subscription_cost_usd=0.4, billing="subscription",
+                                                         refused="api spend limit"))
         self.assertEqual(record["refused"], "api spend limit")
         self.assertIn("billing: subscription (API refused: api spend limit)", body["output"]["summary"])
 
@@ -334,11 +330,12 @@ class MidRun(unittest.TestCase):
         self.assertEqual(calls, ["api", "subscription", "subscription"])
         self.assertEqual((out["error"], out["billing"], out["refused"]), (None, "subscription", "api spend limit"))
 
-    def test_the_refusal_survives_a_failed_budget_reread(self):
+    def test_a_failed_budget_reread_after_a_refusal_is_an_error_that_names_the_refusal(self):
+        """#77 round 3 (C2): a budget nobody could read is no refusal, so the run is an ERROR, not a budget skip."""
         _, out, _ = self.run_main([SPEND_LIMIT], reads=[RuntimeError("503")])
-        self.assertTrue(out["budget_refused"])
-        self.assertIn("API spend limit refused the call", out["limit"])
-        self.assertIn("budget read failed", out["limit"])
+        self.assertFalse(out["budget_refused"])
+        self.assertIn("API spend limit refused the call", out["error"])
+        self.assertIn("budget read failed", out["error"])
         self.assertEqual(out["refused"], "api spend limit")
         _, out, _ = self.run_main([CREDIT, OK_BUGS])
         self.assertEqual(out["refused"], "api credit")
@@ -357,7 +354,8 @@ class MidRun(unittest.TestCase):
         calls, out, _ = self.run_main([OK_BUGS], pace={**CAPS, "route": "subscription"}, prior=totals(5, 1.0, 30),
                                       spec=True)
         self.assertEqual(calls, ["subscription"])
-        self.assertIn("subscription daily pace 30/30", out["spec_skipped"])
+        self.assertTrue(out["budget_refused"])
+        self.assertIn("subscription daily pace 30/30", out["limit"])
 
 
 class Argv(unittest.TestCase):
