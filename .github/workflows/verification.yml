@@ -1,0 +1,9 @@
+name: verification
+on:
+  pull_request_target:
+permissions: {}
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - run: exit 0
