@@ -17,6 +17,7 @@ import os
 import pathlib
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -534,6 +535,8 @@ def judge_p7(rec):
             return False, f"the review billed {r.get('billing')!r}, not the subscription"
         if r.get("error"):  # a rejected token also reads billing subscription
             return False, "the review ended in error: " + str(r["error"])[:200]
+        if (r.get("budget") or {}).get("skipped"):  # a spent plan reads billing subscription with no error
+            return False, "the review was skipped for budget: " + str(r["budget"].get("limit"))[:200]
         if r.get("tier") != "T1":
             return False, f"the probe was tiered {r.get('tier')!r}, not T1"
     if not any(text.strip() for name, text in rec.get("sources", {}).items() if name.endswith("/ review")):
@@ -641,7 +644,8 @@ def job_logs(repo, run_id, timeout=600):
         time.sleep(15)
     jobs = api(f"repos/{repo}/actions/runs/{run_id}/jobs?filter=all&per_page=100")["jobs"]
     # A skipped job never ran and has no log to download.
-    return {f"job log {j['id']} {j['name']}": gh("api", f"repos/{repo}/actions/jobs/{j['id']}/logs").stdout
+    # A job cancelled before it started has no log either; the judge needs the review job's own log to be non-blank.
+    return {f"job log {j['id']} {j['name']}": gh("api", f"repos/{repo}/actions/jobs/{j['id']}/logs", check=False).stdout
             for j in jobs if j["conclusion"] != "skipped"}
 
 
@@ -652,6 +656,9 @@ def run_p7(dotfiles, out):
     rec = {"attack": "P7", "gate_app": None, "repo": repo, "base": base, "head": head,
            "spec": {"title": "subscription token leak", "expect": "no-leak"}, "steps": [], "sources": {}}
     pr, made = None, []
+    # A stop signal raises here, so teardown in finally still runs (SIGKILL cannot be caught).
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda n, _: sys.exit(f"P7 stopped by signal {n}"))
     try:
         caller = gh("api", f"repos/{repo}/contents/.github/workflows/verification.yml?ref=master",
                     "-H", "Accept: application/vnd.github.raw").stdout
@@ -679,18 +686,20 @@ def run_p7(dotfiles, out):
         for run_id in dict.fromkeys((parse_text(g.get("text")) or {}).get("run_id") for g in gate_run(step, app)):
             if run_id:
                 rec["sources"].update(job_logs(repo, run_id))
+        # Again once the runs finished, so a check posted while the logs were read is scanned too.
+        rec["steps"][0] = {**snapshot(repo, pr, "first"), "merge": step["merge"]}
         r = subprocess.run(["python3", "claude/scripts/verification-records.py", "findings", "--pr", str(pr)], cwd=dotfiles,
                            env={**os.environ, "GH_REPO": repo}, capture_output=True, text=True)
         rec["finding_log"] = {"rc": r.returncode, "out": r.stdout + r.stderr}
-    except Exception as e:
-        rec["error"] = str(e)
+    except (Exception, SystemExit, KeyboardInterrupt) as e:
+        rec["error"] = str(e) or type(e).__name__
     finally:
         if pr:
             gh("pr", "close", str(pr), "-R", repo, check=False)
         for ref in made:  # only refs this run made: a same-named ref from another run is not ours to delete
             gh("api", "-X", "DELETE", f"repos/{repo}/git/refs/heads/{ref}", check=False)
-        state = gh("pr", "view", str(pr), "-R", repo, "--json", "state", check=False) if pr else None
-        rec["gone"] = {"pr_state": json.loads(state.stdout)["state"] if state and state.returncode == 0 else None,
+        state = gh("pr", "view", str(pr), "-R", repo, "--json", "state", "-q", ".state", check=False) if pr else None
+        rec["gone"] = {"pr_state": state.stdout.strip() or None if state and state.returncode == 0 else None,
                        "refs": {ref: ref_http_status(repo, ref) for ref in (base, head)}}
         out.mkdir(parents=True, exist_ok=True)
         (out / "P7.json").write_text(redact(json.dumps(rec, indent=1)))
