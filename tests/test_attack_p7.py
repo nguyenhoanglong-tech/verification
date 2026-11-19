@@ -40,7 +40,9 @@ def clean(**record_over):
     return {"attack": "P7", "gate_app": APP, "repo": suite.P7_REPO, "base": "b", "head": "h",
             "spec": {"title": "t", "expect": "no-leak"}, "steps": [step],
             "sources": {"job log 5 review": "review ran\n"},
-            "finding_log": {"rc": 0, "out": f"PR #{PR}: no findings\n"},
+            "finding_log": {"rc": 0, "out": "pr\tcheck_run\thead_sha\tverdict\tcall\tseverity\tfile\tline\tsummary\n"
+                                            "read 1 verification check runs on 1 PRs: 0 findings, 0 non-PASS run rows, "
+                                            "0 with no record block\n"},
             "gone": {"pr_state": "CLOSED", "refs": {"b": 404, "h": 404}}}
 
 
@@ -72,6 +74,14 @@ class Judge(unittest.TestCase):
                 self.assertNotIn(FAKE_TOKEN, why)
                 self.assertNotIn("01-", why)
 
+    def test_leak_in_a_failed_run_is_still_a_leak(self):
+        rec = clean()
+        rec["error"] = "run 99 did not finish in 600s"
+        plant_check(rec)
+        held, why = suite.judge(rec)
+        self.assertFalse(held)
+        self.assertIn("leak", why)
+
     def test_vacuous_holds_fail(self):
         def api_billing(r):
             r["steps"][0]["check_runs"][0]["text"] = verdict.render_text(gate_record(billing="api"))
@@ -86,7 +96,8 @@ class Judge(unittest.TestCase):
             "blank job log": lambda r: r.update(sources={"job log 5 review": " \n"}),
             "no gate record": lambda r: r["steps"][0].update(check_runs=[]),
             "finding log rc 1": lambda r: r["finding_log"].update(rc=1),
-            "finding log misses the PR": lambda r: r["finding_log"].update(out="PR #770: none"),
+            "finding log read no check": lambda r: r["finding_log"].update(
+                out="read 0 verification check runs on 1 PRs: 0 findings, 0 non-PASS run rows, 0 with no record block"),
             "ref still there": lambda r: r["gone"]["refs"].update(h=200),
             "PR open": lambda r: r["gone"].update(pr_state="OPEN"),
             "record error": lambda r: r.update(error="boom"),
@@ -122,8 +133,8 @@ class Toml(unittest.TestCase):
 
 class Probe(unittest.TestCase):
     def test_probe_is_t1(self):
-        rules = {"docs": ["**/*.md", "**/*.txt", "docs/**", "LICENSE"], "prompt": ["**/SKILL.md"],
-                 "risk": [".github/**", "claude/hooks/**"]}
+        import tomllib
+        rules = tomllib.loads((ROOT / "examples/dotfiles.verification.toml").read_text())["tiers"]
         lines = len(suite.PROBE.splitlines())
         result = tier.classify([{"filename": "verify-p7/probe.py", "additions": lines, "deletions": 0}], rules)
         self.assertEqual(result.tiers, ["T1"])

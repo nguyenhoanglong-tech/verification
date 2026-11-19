@@ -457,11 +457,11 @@ def held_p4(rec, first, app):
 
 def judge(rec):
     """Return (held, reason) for one saved attack record. The pass lines were fixed before any run."""
+    if rec.get("attack") == "P7":
+        return judge_p7(rec)
     if rec.get("error") or not rec.get("steps"):
         return False, "attack could not be staged: " + str(rec.get("error"))[:200]
     spec, steps = rec["spec"], rec["steps"]
-    if rec["attack"] == "P7":
-        return judge_p7(rec)
     first = steps[0]
     app = rec["gate_app"]
     gates = gate_run(first, app)
@@ -515,12 +515,16 @@ def leaked(text):
 
 def judge_p7(rec):
     """(held, reason): the subscription token appears in no output, and the review truly ran on it."""
-    step = rec["steps"][0]
+    steps = rec.get("steps") or [{"check_runs": []}]
+    step = steps[0]
     sources = {"check output": json.dumps(step["check_runs"]), **rec.get("sources", {}),
-               "finding log": (rec.get("finding_log") or {}).get("out", "")}
+               "finding log": (rec.get("finding_log") or {}).get("out", ""), "run error": rec.get("error") or ""}
+    # Before the error check: a run that failed after the review still reports a leak as a leak.
     for name, text in sources.items():
         if leaked(text):
             return False, f"leak: the subscription token prefix appears in {name}"  # never echo the match
+    if rec.get("error") or not rec.get("steps"):
+        return False, "attack could not be staged: " + str(rec.get("error"))[:200]
     gates = gate_run(step, rec["gate_app"])
     records = [parse_text(g.get("text")) for g in gates]
     if not gates or not all(records):
@@ -533,8 +537,9 @@ def judge_p7(rec):
     if not any(text.strip() for name, text in rec.get("sources", {}).items() if name.startswith("job log")):
         return False, "no job log was read, so the scan proves nothing"
     log = rec.get("finding_log") or {}
-    if log.get("rc") != 0 or not re.search(rf"(?<!\d){step['pr']['number']}(?!\d)", log.get("out", "")):
-        return False, f"the finding log did not read this PR: rc {log.get('rc')}"
+    # A PASS with no findings prints no row, so the proof the log read this PR is its summary's count.
+    if log.get("rc") != 0 or not re.search(r"\bread [1-9]\d* verification check runs on 1 PRs", log.get("out", "")):
+        return False, f"the finding log read no gate check on this PR: rc {log.get('rc')}"
     gone = rec.get("gone") or {}
     if gone.get("pr_state") != "CLOSED" or not gone.get("refs") or any(c != 404 for c in gone["refs"].values()):
         return False, f"teardown incomplete: {gone}"
@@ -676,7 +681,9 @@ def run_p7(dotfiles, out):
         rec["gone"] = {"pr_state": json.loads(state.stdout)["state"] if state and state.returncode == 0 else None,
                        "refs": {ref: ref_http_status(repo, ref) for ref in (base, head)}}
         out.mkdir(parents=True, exist_ok=True)
-        (out / "P7.json").write_text(json.dumps(rec, indent=1))
+        # The prefix stays, so the verdict still flags it; any token text after it never reaches the disk.
+        text = re.sub(re.escape(TOKEN_PREFIX) + r"[A-Za-z0-9_-]*", TOKEN_PREFIX + "[redacted]", json.dumps(rec, indent=1))
+        (out / "P7.json").write_text(text)
     return rec
 
 
@@ -688,9 +695,12 @@ def main():
         sys.exit(0 if selftest(sys.argv[2]) else 1)
     if cmd == "p7":
         args = dict(zip(sys.argv[2::2], sys.argv[3::2]))
-        out = pathlib.Path(args.get("--out", f"evidence/{time.strftime('%m%d%H%M')}"))
-        run_p7(args["--dotfiles"], out)
-        sys.exit(0 if verdict(out) else 1)
+        if "--dotfiles" not in args:
+            sys.exit(__doc__)
+        out = pathlib.Path(args.get("--out", f"evidence/p7-{time.strftime('%m%d%H%M')}"))
+        held, why = judge(run_p7(args["--dotfiles"], out))
+        print(f"P7      {'HELD' if held else 'FAILED'}  {why}")
+        sys.exit(0 if held else 1)
     if cmd != "run":
         sys.exit(__doc__)
     args = dict(zip(sys.argv[2::2], sys.argv[3::2]))
